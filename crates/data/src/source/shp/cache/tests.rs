@@ -46,10 +46,135 @@ fn cache_test_index_roots_are_scoped_and_thread_local() {
     assert_eq!(index_dir(), original);
 }
 fn ready(root: &Path, n: usize, bytes: u64, budget: u64) -> Lease {
-    let mut lease = reserve_index(root, &key(n), budget).unwrap();
+    ready_key(root, &key(n), bytes, budget)
+}
+fn ready_key(root: &Path, key: &str, bytes: u64, budget: u64) -> Lease {
+    let mut lease = reserve_index(root, key, budget).unwrap();
     File::options().write(true).open(lease.path()).unwrap().set_len(bytes).unwrap();
     lease.commit().unwrap();
     lease
+}
+/// Index `version` of source file `file`: the key's first half names the file (#1230).
+fn version(file: u64, version: u64) -> String {
+    format!("{file:016x}-{version:016x}")
+}
+
+/// A new index of a file replaces the idle indexes of its earlier versions; one in use stays,
+/// and so do other files' indexes (#1230).
+#[test]
+fn cache_commit_drops_earlier_versions_of_the_same_file() {
+    let root = Folder::new();
+    let old = ready_key(&root.0, &version(1, 1), 10, 4096);
+    let old_path = old.path().to_path_buf();
+    drop(old);
+    let held = ready_key(&root.0, &version(1, 2), 10, 4096);
+    let other = ready_key(&root.0, &version(2, 1), 10, 4096);
+    let other_path = other.path().to_path_buf();
+    drop(other);
+    assert!(!old_path.exists(), "the idle earlier version goes when a newer one is committed");
+    let newest = ready_key(&root.0, &version(1, 3), 10, 4096);
+    assert!(held.path().exists(), "an earlier version in use stays");
+    assert!(other_path.exists(), "another file's index stays");
+    let held_path = held.path().to_path_buf();
+    drop(held);
+    drop(newest);
+    let newer = ready_key(&root.0, &version(1, 4), 10, 4096);
+    assert!(!held_path.exists(), "released, it goes with the next version");
+    assert!(!index_path(&root.0, &version(1, 3)).unwrap().exists());
+    assert!(newer.path().exists());
+}
+
+/// An index unused for longer than the limit goes at the next sweep, within budget or not: its
+/// file may have been deleted or moved (#1230).
+#[test]
+fn cache_drops_indexes_unused_too_long() {
+    let root = Folder::new();
+    let stale = ready(&root.0, 1, 10, 4096);
+    let stale_path = stale.path().to_path_buf();
+    drop(stale);
+    let recent = ready(&root.0, 2, 10, 4096);
+    let recent_path = recent.path().to_path_buf();
+    drop(recent);
+    let long_ago = SystemTime::now() - index_max_idle() - Duration::from_secs(60);
+    File::options().write(true).open(lease_path(&stale_path)).unwrap().set_modified(long_ago).unwrap();
+    let stats = maintain(&root.0, 4096).unwrap();
+    assert_eq!(stats.removed, 1);
+    assert!(!stale_path.exists() && !lease_path(&stale_path).exists());
+    assert!(recent_path.exists(), "an index used recently stays");
+}
+
+/// Files a sweep never evicts (no readable lease) don't leave the folder marked, so releases
+/// don't keep sweeping over them (#1230).
+#[test]
+fn cache_files_without_a_lease_dont_keep_releases_sweeping() {
+    let root = Folder::new();
+    let stray = index_path(&root.0, &key(1)).unwrap();
+    std::fs::write(&stray, [0u8; 64]).unwrap();
+    let stats = maintain(&root.0, 10).unwrap();
+    assert!(stats.remaining_bytes > 10, "the stray file is counted");
+    assert!(!over_budget(&directory_lock(&root.0).unwrap().root), "but no release can free it");
+    assert!(stray.exists(), "and it is never deleted");
+
+    // An index in use when its commit sweeps doesn't change that: releasing it can't bring the
+    // cache within budget either, so the release doesn't sweep and the index stays.
+    let open = ready(&root.0, 2, 5, 10);
+    let open_path = open.path().to_path_buf();
+    let before = sweeps();
+    drop(open);
+    assert_eq!(sweeps(), before, "the release doesn't sweep");
+    assert!(open_path.exists(), "the released index stays until the next build");
+}
+
+/// Emptying the cache removes every index not in use, in each folder, and says what it freed
+/// and what stayed in use; a missing folder is skipped (#1259).
+#[test]
+fn cache_empty_removes_every_index_not_in_use() {
+    let (first, second) = (Folder::new(), Folder::new());
+    let idle = ready(&first.0, 1, 10, 4096);
+    let idle_path = idle.path().to_path_buf();
+    drop(idle);
+    let held = ready(&first.0, 2, 20, 4096);
+    let other = ready(&second.0, 3, 30, 4096);
+    let other_path = other.path().to_path_buf();
+    drop(other);
+    let missing = first.0.join("missing");
+    let emptied = empty_folders(&[first.0.clone(), second.0.clone(), missing.clone()]);
+    assert_eq!((emptied.removed, emptied.removed_bytes), (2, 40), "{emptied:?}");
+    assert_eq!((emptied.in_use, emptied.in_use_bytes, emptied.kept_bytes), (1, 20, 0), "{emptied:?}");
+    assert_eq!((emptied.folders, emptied.failed.len()), (2, 0), "{emptied:?}");
+    assert!(!idle_path.exists() && !other_path.exists());
+    assert!(held.path().exists(), "an index in use stays");
+    assert!(!missing.exists(), "a missing folder isn't created");
+}
+
+/// A root that isn't a folder is reported, not skipped as a missing one is (#1259).
+#[test]
+fn cache_empty_reports_a_root_that_is_not_a_folder() {
+    let root = Folder::new();
+    let file = root.0.join("not-a-folder");
+    std::fs::write(&file, b"keep").unwrap();
+    let emptied = empty_folders(std::slice::from_ref(&file));
+    assert_eq!((emptied.folders, emptied.failed.len()), (0, 1), "{emptied:?}");
+    assert!(emptied.failed[0].contains("not a folder"), "{emptied:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+}
+
+/// A folder the cache refuses (writable by others) is reported and doesn't stop the next one
+/// from being emptied: that is where the indexes are when the first is refused (#1259).
+#[cfg(unix)]
+#[test]
+fn cache_empty_goes_on_past_a_folder_it_refuses() {
+    use std::os::unix::fs::PermissionsExt;
+    let (refused, fallback) = (Folder::new(), Folder::new());
+    let idle = ready(&fallback.0, 1, 10, 4096);
+    let idle_path = idle.path().to_path_buf();
+    drop(idle);
+    std::fs::set_permissions(&refused.0, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let emptied = empty_folders(&[refused.0.clone(), fallback.0.clone()]);
+    assert_eq!((emptied.folders, emptied.removed), (1, 1), "{emptied:?}");
+    assert_eq!(emptied.failed.len(), 1, "{emptied:?}");
+    assert!(emptied.failed[0].contains(&*refused.0.to_string_lossy()), "{emptied:?}");
+    assert!(!idle_path.exists());
 }
 
 #[test]
@@ -59,7 +184,9 @@ fn cache_lru_touches_reopened_indexes_and_evicts_oldest_idle() {
         let lease = ready(&root.0, n, 10, 4096);
         let path = lease.path().to_path_buf();
         drop(lease);
-        File::options().write(true).open(lease_path(&path)).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(n as u64)).unwrap();
+        // Used minutes apart, in order, and recently enough to stay within the idle limit.
+        let used = SystemTime::now() - Duration::from_secs(600 - 60 * n as u64);
+        File::options().write(true).open(lease_path(&path)).unwrap().set_modified(used).unwrap();
     }
     let hot = pin_index(&root.0, &key(1), 4096).unwrap().unwrap();
     drop(hot);
@@ -125,7 +252,7 @@ fn cache_releases_sweep_only_a_cache_left_over_budget() {
 
     // A sweep that fails may have left the cache over budget: the next release sweeps again.
     let missing = root.0.join("missing");
-    assert!(prune_locked(&missing, 10).is_err());
+    assert!(prune_locked(&missing, 10, None).is_err());
     assert!(over_budget(&missing));
     note_budget(&missing, false);
 }

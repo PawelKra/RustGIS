@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 mod cache;
 mod index;
 
+#[doc(hidden)]
+pub use cache::use_temporary_index_dir;
+pub use cache::{Emptied, empty_index_cache};
+
 use super::{Batch, FeatureSource, Reproject, Request, SourceInfo, clamp_limit};
 use crate::io::group_rings;
 use crate::{DataError, Feature, Field, FieldType, Geometry, GeometryType, Result, Value};
@@ -145,7 +149,9 @@ impl ShpSource {
             fields,
             extent,
             count: Some(index.count),
-            crs: crs.and_then(|c| c.custom_def()).map(|d| d.proj4.clone()).unwrap_or_else(|| reproject.label()),
+            // A system the .prj defines, as one given, by its PROJ definition, so the layer keeps it
+            // (`SourceInfo::coordinate_system`) as a whole read does.
+            crs: reproject.crs.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| reproject.label()),
             indexed: index.indexed(),
             notes,
             zm_dropped: false,

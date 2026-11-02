@@ -11,6 +11,54 @@ use super::{b, f, ps};
 use crate::project::{Job, OfflineArea};
 use crate::{CmdResult, CommandSpec as C, Session};
 
+/// Removes every Shapefile index not in use and says what it freed, what stayed and why, and which
+/// cache folder it couldn't empty.
+fn empty_indexes(s: &mut Session, _p: &Value) -> CmdResult {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let e = rustgis_data::source::shp::empty_index_cache();
+        if e.folders == 0 && !e.failed.is_empty() {
+            return Err(format!("couldn't empty the Shapefile index cache: {}", e.failed.join("; ")));
+        }
+        for (text, error) in empty_notices(&e) {
+            s.notify(text, error);
+        }
+        Ok(json!({
+            "removed": e.removed, "freedBytes": e.removed_bytes, "inUse": e.in_use, "inUseBytes": e.in_use_bytes,
+            "keptBytes": e.kept_bytes, "failed": e.failed,
+        }))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = s;
+        Err("the browser keeps no Shapefile index cache".to_string())
+    }
+}
+
+/// What emptying the Shapefile index cache has to tell the user beyond its counts, each with
+/// whether it is an error: nothing when all went.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn empty_notices(e: &rustgis_data::source::shp::Emptied) -> Vec<(String, bool)> {
+    let size = |bytes: u64| {
+        if bytes < 1024 * 1024 { format!("{:.1} KB", bytes as f64 / 1024.0) } else { format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)) }
+    };
+    let mut notices: Vec<(String, bool)> = e.failed.iter().map(|f| (format!("Shapefile index cache: couldn't empty {f}"), true)).collect();
+    if e.in_use > 0 {
+        let what = if e.in_use == 1 { "1 index".to_string() } else { format!("{} indexes", e.in_use) };
+        notices.push((
+            format!("Shapefile index cache: {what} in use by open layers or another RustGIS window kept ({})", size(e.in_use_bytes)),
+            false,
+        ));
+    }
+    if e.kept_bytes > 0 {
+        notices.push((
+            format!("Shapefile index cache: {} of files not removed (no readable lease, or refused by the system)", size(e.kept_bytes)),
+            false,
+        ));
+    }
+    notices
+}
+
 fn now() -> f64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
@@ -252,6 +300,9 @@ pub fn commands() -> Vec<C> {
             Ok(json!({"emptied": n}))
         })
         .view(),
+        // The Shapefile index cache on disk, shared by every project (#1259). Command search,
+        // scripts and the CLI run it; it has no ribbon button.
+        C::new("cache.emptyIndexes", "Empty Index Cache", "Data › Shapefile Index Cache", empty_indexes).view(),
         // A fill runs to the end in one go (it's quick); cancelling stops the automatic fills
         // that follow projection changes.
         C::new("cache.cancel", "Cancel Caching", "Data › Feature Cache", |s, _| {
@@ -585,6 +636,9 @@ fn offline_fields_match(a: &[rustgis_data::Field], b: &[rustgis_data::Field]) ->
 
 /// Copies edits made to an offline area (in its offline map, if open) back to its source map by
 /// feature id: changed and new features update the source, deleted ones are removed from it.
+/// A feature changed in the source too since the last sync takes the area's version (or its
+/// deletion), and is reported with a warning, as is an offline edit to a feature since deleted
+/// from the source.
 /// Then the area is refreshed from the source.
 fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
     let n = ps(p, "name").ok_or("name is required")?;
@@ -600,6 +654,11 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
         .ok_or_else(|| format!("the source map '{}' is gone", area.map))?;
     crate::project::ensure_map_imports_complete(s.project.maps.get(si).ok_or("the source map is gone")?)?;
     let (mut updated, mut added, mut deleted, mut skipped) = (0, 0, 0, 0);
+    // Features changed in the source since the last sync whose changes the area's version (or its
+    // deletion) replaced, and features changed offline whose edits a deletion in the source
+    // dropped, as "layer #id".
+    let (mut conflicts, mut dropped) = (Vec::new(), Vec::new());
+    let tag = |layer: &str, id: u64| format!("{layer} #{id}");
     if let Some(src) = s.project.maps.get_mut(si) {
         for ol in &edited.layers {
             // Layers are matched by id (the snapshot keeps them), so same-named layers don't mix.
@@ -623,19 +682,32 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
                 baseline.map(|l| l.dataset.features.iter().map(|f| (f.id, f)).collect()).unwrap_or_default();
             // Deletions first, so a fresh id given to a new feature below can't be swept away.
             let before = sl.dataset.features.len();
-            sl.dataset.features.retain(|x| !had.contains(&x.id) || now_ids.contains(&x.id));
+            sl.dataset.features.retain(|x| {
+                let keep = !had.contains(&x.id) || now_ids.contains(&x.id);
+                // Deleted offline but changed in the source meanwhile.
+                if !keep && base.get(&x.id).is_some_and(|b| *b != x) {
+                    conflicts.push(tag(&sl.name, x.id));
+                }
+                keep
+            });
             deleted += before - sl.dataset.features.len();
             for f in &ol.dataset.features {
                 if had.contains(&f.id) {
                     let changed_offline = base.get(&f.id).is_none_or(|b| *b != f);
                     match sl.dataset.features.iter_mut().find(|x| x.id == f.id) {
                         Some(x) if changed_offline && x != f => {
+                            if base.get(&f.id).is_some_and(|b| *b != x) {
+                                conflicts.push(tag(&sl.name, f.id));
+                            }
                             *x = f.clone();
                             updated += 1;
                         }
                         // Changed offline but deleted from the source meanwhile: left deleted, and
                         // reported.
-                        None if changed_offline => skipped += 1,
+                        None if changed_offline => {
+                            skipped += 1;
+                            dropped.push(tag(&sl.name, f.id));
+                        }
                         _ => {}
                     }
                 } else {
@@ -660,5 +732,38 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
         a.data = fresh;
         a.synced = now();
     }
-    Ok(json!({"updated": updated, "added": added, "deleted": deleted, "skipped": skipped}))
+    // Never silent: say which features lost an edit, so they can be checked (Undo puts the
+    // source's versions back).
+    let listed = |ids: &[String]| {
+        let mut said: Vec<String> = ids.iter().take(20).cloned().collect();
+        if ids.len() > 20 {
+            said.push(format!("{} more", ids.len() - 20));
+        }
+        said.join(", ")
+    };
+    if !conflicts.is_empty() {
+        s.notify(
+            format!(
+                "Offline area '{}': {} feature(s) were changed in the map '{}' since the last sync and also edited or deleted in the area, so the area's version replaced the map's changes: {}. Undo restores the map's versions",
+                area.name,
+                conflicts.len(),
+                area.map,
+                listed(&conflicts)
+            ),
+            false,
+        );
+    }
+    if !dropped.is_empty() {
+        s.notify(
+            format!(
+                "Offline area '{}': {} feature(s) edited in the area were deleted from the map '{}' meanwhile, so those edits were dropped: {}",
+                area.name,
+                dropped.len(),
+                area.map,
+                listed(&dropped)
+            ),
+            false,
+        );
+    }
+    Ok(json!({"updated": updated, "added": added, "deleted": deleted, "skipped": skipped, "conflicts": conflicts.len()}))
 }
