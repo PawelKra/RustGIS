@@ -812,6 +812,154 @@ fn a_symbol_is_set_by_expressions() {
 }
 
 #[test]
+fn labels_are_set_by_expressions() {
+    let mut s = world();
+    let r = s
+        .run(
+            "labels.by",
+            &json!({"layer": "Cities", "text": "upper(name)", "size": "scale_linear(pop_max, 0, 2e7, 8, 20)", "color": "if(pop_max > 1e7, '#ff0000', NULL)", "angle": "30"}),
+        )
+        .unwrap();
+    assert_eq!((r["text"].as_str(), r["angle"].as_str()), (Some("upper(name)"), Some("30")));
+    let l = s.map().layer_by_name("Cities").unwrap();
+    assert!(l.labels.enabled, "a text expression turns the labels on");
+    assert_eq!(l.labels.default.by.color.as_deref(), Some("if(pop_max > 1e7, '#ff0000', NULL)"));
+    let depth = s.undo_depth();
+    for (bad, says) in [
+        (json!({"layer": "Cities", "text": "nosuch || 'x'"}), "text: "),
+        (json!({"layer": "Cities", "size": "("}), "size: "),
+        (json!({"layer": "Cities", "color": 3}), "color is an expression"),
+        (json!({"layer": "Cities", "class": "Nope", "angle": "4"}), "no label class named"),
+        (json!({"layer": "Cities"}), "give text, size, color or angle"),
+    ] {
+        let err = s.run("labels.by", &bad).unwrap_err();
+        assert!(err.contains(says), "{bad}: {err}");
+    }
+    assert_eq!(s.undo_depth(), depth);
+    // A class's own; a key left out is kept, null removes one, and undo brings it back.
+    s.run("labels.class.add", &json!({"layer": "Cities", "name": "Big", "where": "pop_max > 5000000"})).unwrap();
+    s.run("labels.by", &json!({"layer": "Cities", "class": "Big", "text": "name || '!'"})).unwrap();
+    s.run("labels.by", &json!({"layer": "Cities", "angle": null, "text": ""})).unwrap();
+    let l = s.map().layer_by_name("Cities").unwrap();
+    assert_eq!(l.labels.classes[0].by.text.as_deref(), Some("name || '!'"));
+    assert!(l.labels.default.by.text.is_none() && l.labels.default.by.angle.is_none() && l.labels.default.by.size.is_some());
+    s.undo();
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().labels.default.by.angle.as_deref(), Some("30"));
+    // A style shared to the web says its label expressions are left out.
+    let dir = std::env::temp_dir().join(format!("rustgis-labels-by-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    s.run("share.webStyle", &json!({"layer": "Cities", "path": dir.join("cities.json").display().to_string()})).unwrap();
+    assert!(s.notices.iter().any(|n| n.text.contains("label expressions aren't in it")), "{:?}", s.notices.last());
+    s.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 320, "height": 200})).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    // Converted, each label keeps its text, size and colour: the annotation draws by its fields.
+    s.run("labels.class.clear", &json!({"layer": "Cities"})).unwrap();
+    s.run("labels.by", &json!({"layer": "Cities", "text": "upper(name)", "angle": null})).unwrap();
+    s.run("labels.convert", &json!({"layer": "Cities"})).unwrap();
+    let a = s.map().layer_by_name("Cities Annotation").unwrap();
+    let names: Vec<&str> = a.dataset.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["TEXT", "SIZE", "COLOR"]);
+    let by = &a.labels.default.by;
+    assert_eq!(
+        (by.text.as_deref(), by.size.as_deref(), by.color.as_deref(), by.angle.as_deref()),
+        (None, Some("\"SIZE\""), Some("\"COLOR\""), None)
+    );
+    let fi = |n: &str| a.dataset.field_index(n).unwrap();
+    let paris = (0..a.dataset.features.len()).find(|r| a.dataset.value(*r, fi("TEXT")).to_string() == "PARIS").expect("upper-case text");
+    assert!(a.dataset.value(paris, fi("SIZE")).as_f64().is_some_and(|v| v > 8.0));
+    let red = (0..a.dataset.features.len()).filter(|r| a.dataset.value(*r, fi("COLOR")).to_string() == "255,0,0,255").count();
+    assert!(red > 0 && red < a.dataset.features.len(), "only the big cities' red, the rest the class's");
+    assert!(!s.notices.iter().any(|n| n.text.contains("cut to")), "short texts aren't cut");
+}
+
+/// What label expressions lose is said, and what's reported or kept follows what the map draws:
+/// a text cut by Convert To Annotation, the Web Style's notices, Project Info's labels, and the
+/// angle a converted label keeps, decided for each feature.
+#[test]
+fn label_expressions_say_what_they_lose() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+    let mut s = world();
+    let cities = s.map().layer_by_name("Cities").unwrap().id;
+    // A text past its most characters is cut, said once with a count.
+    let long = format!("name || '{}'", "x".repeat(rustgis_map::label_by::MAX_LABEL_TEXT));
+    s.run("labels.by", &json!({"layer": "Cities", "text": long})).unwrap();
+    let n = s.run("labels.convert", &json!({"layer": "Cities"})).unwrap()["annotations"].as_u64().unwrap();
+    let said = format!("Cities Annotation: {n} label texts cut to {} characters", rustgis_map::label_by::MAX_LABEL_TEXT);
+    assert!(s.notices.iter().any(|x| x.text == said), "{:?}", s.notices.last());
+    s.undo();
+    // Project Info names the text expression the labels draw by, and the field once it doesn't read.
+    s.map_mut().layer_mut(cities).unwrap().labels.default.field = "name".into();
+    s.run("labels.by", &json!({"layer": "Cities", "text": "upper(name)"})).unwrap();
+    let labels = |s: &mut Session| {
+        let info = s.run("info.project", &Value::Null).unwrap();
+        info["layers"].as_array().unwrap().iter().find(|l| l["name"] == "Cities").unwrap()["labels"].clone()
+    };
+    assert_eq!(labels(&mut s), json!("upper(name)"));
+    s.map_mut().layer_mut(cities).unwrap().labels.default.by.text = Some("upper(gone)".into());
+    assert_eq!(labels(&mut s), json!("name"));
+    // Deleting the field Default labels by keeps the labels while its text expression reads, and
+    // starts Default again (labels off) once it doesn't.
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "spare", "type": "text"})).unwrap();
+    for (text, on) in [("'#' || pop_max", true), ("upper(spare)", false)] {
+        let l = s.map_mut().layer_mut(cities).unwrap();
+        (l.labels.enabled, l.labels.default.field, l.labels.default.by.text) = (true, "spare".into(), Some(text.into()));
+        s.run("edit.deleteField", &json!({"layer": "Cities", "field": "spare"})).unwrap();
+        let l = s.map().layer(cities).unwrap();
+        assert_eq!(l.labels.enabled, on, "{text}");
+        assert_eq!(l.labels.default.by.text.is_some(), on, "{text}");
+        assert!(l.labels.default.field != "spare");
+        s.undo();
+    }
+    s.map_mut().layer_mut(cities).unwrap().labels.default.by.text = Some("upper(name)".into());
+    // Web Style: a Default class labelling by a text expression alone says only that its style has
+    // none, even with other classes; one with a size but no text or field says nothing of it.
+    let dir = std::env::temp_dir().join(format!("rustgis-labels-lose-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let share = |s: &mut Session| {
+        let before = s.notices.len();
+        s.run("share.webStyle", &json!({"layer": "Cities", "path": dir.join("c.json").display().to_string()})).unwrap();
+        s.notices[before..].iter().map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    let l = s.map_mut().layer_mut(cities).unwrap();
+    l.labels.default.field.clear();
+    l.labels.default.by.text = Some("upper(name)".into());
+    s.run("labels.class.add", &json!({"layer": "Cities", "name": "Big", "where": "pop_max > 5000000"})).unwrap();
+    // Project Info lists each class's text expression with its field.
+    s.run("labels.by", &json!({"layer": "Cities", "class": "Big", "text": "name || '!'"})).unwrap();
+    let info = s.run("info.project", &Value::Null).unwrap();
+    let classes = &info["layers"].as_array().unwrap().iter().find(|l| l["name"] == "Cities").unwrap()["labelClasses"];
+    assert_eq!(classes[0]["text"], json!("name || '!'"), "{classes}");
+    let said = share(&mut s);
+    assert!(said.iter().any(|t| t.contains("has no labels: its Default class's text is an expression")), "{said:?}");
+    assert!(!said.iter().any(|t| t.contains("labels every feature")), "{said:?}");
+    let l = s.map_mut().layer_mut(cities).unwrap();
+    (l.labels.default.by.text, l.labels.default.by.size) = (None, Some("8".into()));
+    let said = share(&mut s);
+    assert!(said.iter().any(|t| t.contains("has no labels: its Default class has no label field")), "{said:?}");
+    assert!(!said.iter().any(|t| t.contains("expression") || t.contains("labels every feature")), "{said:?}");
+    std::fs::remove_dir_all(&dir).ok();
+    // A converted label keeps its angle on a point, and none on a line it is placed along, in a
+    // layer of both; a layer of lines alone gets no ANGLE field.
+    let line = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(5.0, 0.0)]]);
+    let point = Geometry::Point(Coord::new(1.0, 1.0));
+    for (geoms, angles) in [(vec![line.clone(), point], Some(vec![Attr::Null, Attr::Float(30.0)])), (vec![line], None)] {
+        let mut ds = Dataset::new("ways", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        for g in geoms {
+            ds.push(Some(g), vec![Attr::Text("w".into())]);
+        }
+        let id = s.map_mut().add_dataset(ds);
+        let l = s.map_mut().layer_mut(id).unwrap();
+        (l.labels.enabled, l.labels.default.field, l.labels.default.placement) =
+            (true, "name".into(), rustgis_map::LabelPlacement::Parallel);
+        l.labels.default.by.angle = Some("30".into());
+        let a = s.run("labels.convert", &json!({"layer": id})).unwrap()["layer"].as_u64().unwrap() as u32;
+        let a = &s.map().layer(a).unwrap().dataset;
+        let got = a.field_index("ANGLE").map(|fi| (0..a.features.len()).map(|r| a.value(r, fi).clone()).collect::<Vec<_>>());
+        assert_eq!(got, angles);
+    }
+}
+
+#[test]
 fn a_qgis_styles_data_defined_settings_are_kept_where_they_read() {
     let mut s = world();
     // Size by a field Cities has; fill by a QGIS function RustGIS lacks; outline by a field it hasn't.
@@ -11209,6 +11357,75 @@ fn dropped_z_values_are_said_on_import_and_export() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A standalone table can hold geometry whose Z values were dropped when it was read (a plugin's
+/// output, a project file): exporting it says so, to every format, once the file is written, as
+/// `share.exportLayer` does. A table read without Z, and a write that fails, say nothing of it.
+#[test]
+fn exporting_a_table_says_its_dropped_z_values() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-table-zm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("wells.geojson");
+    std::fs::write(
+        &src,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"depth":30},"geometry":{"type":"Point","coordinates":[1,2,30]}}]}"#,
+    )
+    .unwrap();
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    let (wells, report) = rustgis_data::io::read_path(&src).unwrap();
+    assert!(wells.zm_dropped && report.messages.iter().any(|m| m.contains("Z or M")), "premise: the reader dropped Z");
+    s.project.add_table(wells);
+    let said = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("Z or M")).map(|n| n.text.clone()).collect()
+    };
+    for ext in ["geojson", "csv", "shp", "zip"] {
+        let out = dir.join(format!("wells.{ext}")).display().to_string();
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": "wells", "path": out})).unwrap();
+        assert_eq!(said(&s, mark), [format!("{out}: its geometry has no Z or M values, which were dropped when wells was read")], ".{ext}");
+    }
+    // The file holds x and y only.
+    assert!(std::fs::read_to_string(dir.join("wells.geojson")).unwrap().contains("[1.0,2.0]"));
+    // A project file keeps what the table's read lost, as it does a layer's (the Z or M values,
+    // the coordinate system, geometry lost to it), so a table opened from one says it too.
+    let crs = rustgis_data::raster::Crs::parse("EPSG:3857").unwrap();
+    {
+        let wells = s.project.tables.last_mut().unwrap();
+        wells.crs = Some(crs);
+        wells.crs_incomplete = true;
+    }
+    let project = dir.join("wells.rgis");
+    s.run("project.saveAs", &json!({"path": project.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": project.display().to_string()})).unwrap();
+    let opened = &t.project.tables.get(t.table_index(&json!({"table": "wells"})).unwrap()).unwrap().dataset;
+    assert!(opened.zm_dropped && opened.crs_incomplete && opened.crs == Some(crs), "{opened:?}");
+    let out = dir.join("opened.geojson").display().to_string();
+    let mark = t.notice_mark();
+    t.run("share.exportTable", &json!({"table": "wells", "path": out})).unwrap();
+    assert_eq!(said(&t, mark), [format!("{out}: its geometry has no Z or M values, which were dropped when wells was read")]);
+    // A write that fails says nothing of what the file would have lacked.
+    let missing = dir.join("missing").join("wells.geojson").display().to_string();
+    let mark = s.notice_mark();
+    assert!(s.run("share.exportTable", &json!({"table": "wells", "path": missing})).is_err());
+    assert!(said(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    // A table read without Z: no notice.
+    std::fs::write(
+        dir.join("flat.geojson"),
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"depth":30},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+    )
+    .unwrap();
+    let (flat, _) = rustgis_data::io::read_path(&dir.join("flat.geojson")).unwrap();
+    assert!(!flat.zm_dropped, "premise");
+    s.project.add_table(flat);
+    for ext in ["geojson", "shp"] {
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": "flat", "path": dir.join(format!("flat.{ext}"))})).unwrap();
+        assert!(said(&s, mark).is_empty(), ".{ext}: {:?}", s.notices_since(mark));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// What an import says about positions, an export says again: a NAD 27 Shapefile whose `.prj`
 /// has no shift to WGS 84 (read whole or in place, and after the project is saved and opened)
 /// exported to GeoJSON, but not written back to a Shapefile in NAD 27; and a Shapefile without a
@@ -17700,6 +17917,41 @@ fn ogc_refresh_reconciles_fields_and_preserves_compatible_settings() {
             let l = s.map().layer(layer).unwrap();
             assert_eq!(l.renderer, style);
             assert_eq!(l.labels, labels);
+            // Labels by a text expression that still reads stay on without their field.
+            s.map_mut().layer_mut(layer).unwrap().labels.default.by.text = Some("'#' || keep".into());
+            server.set(ITEMS, &features(json!({"replacement":"New", "keep":1})));
+            s.run("service.refresh", &target).unwrap();
+            let l = s.map().layer(layer).unwrap();
+            assert!(l.labels.enabled && l.labels.default.by.text.is_some(), "{:?}", l.labels.default);
+            assert!(l.labels.default.field.is_empty(), "the field the service dropped isn't kept");
+            let lost = |s: &Session| s.notices.iter().filter(|n| n.text.contains("label expressions that don't read")).count();
+            assert_eq!(lost(&s), 0, "every expression still reads");
+            s.run("edit.undo", &Value::Null).unwrap();
+            // A size by a field that goes is kept, said.
+            s.map_mut().layer_mut(layer).unwrap().labels.default.by.size = Some("value / 2".into());
+            s.run("service.refresh", &target).unwrap();
+            assert!(s.notices.iter().any(|n| n.text.ends_with("left out when drawing (1, in Places)")), "{:?}", s.notices.last());
+            assert_eq!(s.map().layer(layer).unwrap().labels.default.by.size.as_deref(), Some("value / 2"));
+            s.run("edit.undo", &Value::Null).unwrap();
+            let l = s.map_mut().layer_mut(layer).unwrap();
+            (l.labels.default.by.text, l.labels.default.by.size) = (None, None);
+            // Another class labelling by a text expression that still reads keeps the labels on.
+            let mut other = rustgis_map::LabelClass::default_for(&l.dataset);
+            (other.name, other.field, other.by.text) = ("Other".into(), "name".into(), Some("'#' || keep".into()));
+            l.labels.classes.push(other);
+            s.run("service.refresh", &target).unwrap();
+            let l = s.map().layer(layer).unwrap();
+            assert!(l.labels.enabled && l.labels.default.field.is_empty(), "{:?}", l.labels);
+            s.run("edit.undo", &Value::Null).unwrap();
+            // Hidden, or on a field that goes without a text, it doesn't.
+            for (visible, text) in [(false, Some("'#' || keep")), (true, None)] {
+                let c = &mut s.map_mut().layer_mut(layer).unwrap().labels.classes[0];
+                (c.visible, c.by.text) = (visible, text.map(String::from));
+                s.run("service.refresh", &target).unwrap();
+                assert!(!s.map().layer(layer).unwrap().labels.enabled, "visible {visible}, text {text:?}");
+                s.run("edit.undo", &Value::Null).unwrap();
+            }
+            s.map_mut().layer_mut(layer).unwrap().labels.classes.clear();
             // Numeric renderers cannot use a field which has become text; unique values can.
             server.set(ITEMS, &features(json!({"name":"Place", "value":"text", "keep":1})));
             s.run("service.refresh", &target).unwrap();
@@ -23358,5 +23610,96 @@ fn merge_distinguishes_case_sensitive_file_paths() {
         })
         .collect();
     assert_eq!(coordinates, [1.0, 2.0]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Exporting to a Shapefile says which field names it changed to fit dBase's 10 bytes, as the
+/// file has them, from a layer read whole or in place; names that fit, and other formats, give no
+/// such notice.
+#[test]
+fn shapefile_exports_say_which_field_names_they_changed() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-shp-names-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("sites.geojson");
+    std::fs::write(
+        &src,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"population_2020":1,"Population_2021":2,"id":3},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+    )
+    .unwrap();
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    let changed = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("changed to fit a Shapefile")).map(|n| n.text.clone()).collect()
+    };
+    for stream in [false, true] {
+        let id = s.run("layer.addData", &json!({"path": src, "stream": stream})).unwrap()["layer"].as_u64().unwrap();
+        for ext in ["shp", "zip"] {
+            let out = dir.join(format!("out-{stream}.{ext}")).display().to_string();
+            let mark = s.notice_mark();
+            s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
+            assert_eq!(
+                changed(&s, mark),
+                [format!(
+                    "{out}: 2 field names were changed to fit a Shapefile (10 bytes at most, unique ignoring case): \
+                     'Population_2021' → 'Population', 'population_2020' → 'populati_1'"
+                )],
+                "stream {stream}, .{ext}"
+            );
+            // The names the notice gives are the file's.
+            let back = s.run("layer.addData", &json!({"path": out})).unwrap()["layer"].as_u64().unwrap() as u32;
+            let names: Vec<&str> = s.map().layer(back).unwrap().dataset.fields.iter().map(|f| f.name.as_str()).collect();
+            // The reader orders the fields by name, capitals first.
+            assert_eq!(names, ["Population", "id", "populati_1"], "stream {stream}, .{ext}");
+        }
+        // Other formats keep the names and say nothing of them.
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": dir.join(format!("out-{stream}.geojson"))})).unwrap();
+        assert!(changed(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    }
+    // Names that fit: no notice.
+    let mut s = world();
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": "Countries", "path": dir.join("countries.shp")})).unwrap();
+    assert!(changed(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    // A standalone table can hold geometry (a plugin's output table is read from GeoJSON whole,
+    // and a project file keeps a table's geometry), so `share.exportTable` can write a Shapefile
+    // too, and says the same of its names.
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType};
+    use rustgis_geom::Coord;
+    let table = |name: &str, field: &str| {
+        let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new(field, FieldType::Integer)]);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![rustgis_data::Value::Int(1)]);
+        ds
+    };
+    s.project.add_table(table("Sites", "population_2020"));
+    for ext in ["shp", "zip"] {
+        let out = dir.join(format!("sites.{ext}")).display().to_string();
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": "Sites", "path": out})).unwrap();
+        assert_eq!(
+            changed(&s, mark),
+            [format!(
+                "{out}: 1 field name was changed to fit a Shapefile (10 bytes at most, unique ignoring case): \
+                 'population_2020' → 'population'"
+            )],
+            ".{ext}"
+        );
+        let back = s.run("layer.addData", &json!({"path": out})).unwrap()["layer"].as_u64().unwrap() as u32;
+        let names: Vec<&str> = s.map().layer(back).unwrap().dataset.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["population"], ".{ext}");
+    }
+    // To another format, or with names that fit: no notice.
+    s.project.add_table(table("Fits", "population"));
+    for (table, ext) in [("Sites", "geojson"), ("Fits", "shp")] {
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": table, "path": dir.join(format!("{table}.{ext}"))})).unwrap();
+        assert!(changed(&s, mark).is_empty(), "{table}.{ext}: {:?}", s.notices_since(mark));
+    }
+    // A table without geometry is never a Shapefile: an error, and nothing said of its names.
+    s.run("gp.run", &json!({"tool": "summaryStatistics", "params": {"input": "Countries", "field": "pop_est"}})).unwrap();
+    let stats = s.project.tables.last().unwrap().name.clone();
+    let mark = s.notice_mark();
+    assert!(s.run("share.exportTable", &json!({"table": stats, "path": dir.join("stats.shp")})).is_err());
+    assert!(changed(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
     std::fs::remove_dir_all(dir).unwrap();
 }
