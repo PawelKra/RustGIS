@@ -4654,8 +4654,8 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     if op_many && !merges.is_empty() {
         return Err("Merge rules apply to Join one to one (one to many keeps each match)".into());
     }
-    // For each merge rule, the targets whose sum went past the 64-bit range, and whose result came
-    // out rounded from a whole number past 2^53.
+    // For each merge rule, the targets whose sum went past the 64-bit range, the matched numbers it
+    // left out, and the targets whose result came out rounded from a whole number past 2^53.
     let mut overflowed = vec![0usize; merges.len()];
     let mut left_out = vec![0usize; merges.len()];
     let mut rounded = Rounded::new(merges.len());
@@ -4854,12 +4854,10 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         messages.push(format!("{total} {sums} in {names} {are} past the 64-bit integer range and {were} left empty"));
     }
     if let Some((total, names)) = counted(&left_out) {
-        let (values, are, numbers, were, sums) = if total == 1 {
-            ("value", "is", "a whole number", "was", "its sum")
-        } else {
-            ("values", "are", "whole numbers", "were", "their sums")
-        };
-        messages.push(format!("{total} {values} in {names} {are} not {numbers} in the 64-bit integer range and {were} left out of {sums}"));
+        let (numbers, were) = if total == 1 { ("number", "was") } else { ("numbers", "were") };
+        messages.push(format!(
+            "{total} matched {numbers} in {names} {were} left out: a whole-number sum takes whole numbers in the 64-bit range, the other rules numbers a decimal holds"
+        ));
     }
     messages.extend(rounded_notice(&rounded, &merged_fields));
     Ok(ToolResult { output: Output::Layer(out), messages })

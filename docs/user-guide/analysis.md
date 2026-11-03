@@ -462,7 +462,8 @@ values, except a `count` of 0. `mean` writes a decimal field, `count` a whole nu
 text. The `sum` of a whole-number field adds its whole numbers exactly, and is empty when too
 large for a 64-bit integer; the tool says how many sums were left empty, and in which fields. A
 decimal with a fraction, or a number past that range, isn't a whole number the field holds: the sum
-leaves it out, and the tool says how many it left out. Whole numbers written as text count as the
+leaves it out. The other numeric rules leave out a number too large for a decimal (text such as
+`1e309`). The tool says how many matched numbers were left out, and in which fields. Whole numbers written as text count as the
 numbers they are, however they are written (`12`, `12.0`, `1.2e1`). `min`
 and `max` compare whole numbers exactly, past 2^53 (9,007,199,254,740,992) too, where their decimals
 can be equal. The `mean` of whole numbers comes from their exact sum; a mean that is a whole number
