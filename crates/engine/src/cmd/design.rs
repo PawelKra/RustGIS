@@ -125,6 +125,8 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
         }
     }
     let rows: Vec<usize> = changes.iter().filter_map(|c| c.row).collect();
+    // What each calculation rule's whole-number field cut: (rule, field, fractions, past range).
+    let mut cuts: Vec<(String, String, usize, usize)> = Vec::new();
     // Calculation rules, in order.
     for rule in l.design.rules.iter().filter(|r| r.kind == RuleKind::Calculation) {
         let Some(fi) = l.dataset.field_index(&rule.field) else { continue };
@@ -132,11 +134,17 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
         // A rule that no longer reads (its field was removed, or a hand-edited file) is skipped
         // rather than blocking every edit.
         let Ok(calc) = super::edit::Calculation::parse(&rule.expression, &l.dataset) else { continue };
+        let (mut fractions, mut past) = (0usize, 0usize);
         for r in &rows {
-            let v = super::edit::coerce(calc.eval(&l.dataset, *r), ty);
+            let (v, cut) = super::edit::coerce_cut(calc.eval(&l.dataset, *r), ty);
+            fractions += usize::from(cut == super::edit::Cut::Fraction);
+            past += usize::from(cut == super::edit::Cut::Range);
             if let Some(cell) = l.dataset.features.get_mut(*r).and_then(|f| f.attrs.get_mut(fi)) {
                 *cell = v;
             }
+        }
+        if fractions + past > 0 {
+            cuts.push((rule.name.clone(), rule.field.clone(), fractions, past));
         }
     }
     // Validation. Domains and contingent values are checked on the fields an edit changed (all
@@ -217,6 +225,20 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
     e.added += counts.added;
     e.modified += counts.modified;
     e.deleted += counts.deleted;
+    // Said once the edit is kept: a rejected one changed nothing.
+    let results = |n: usize| if n == 1 { "1 result".to_string() } else { format!("{n} results") };
+    for (rule, field, fractions, past) in cuts {
+        if fractions > 0 {
+            let their = if fractions == 1 { "its" } else { "their" };
+            s.notify(
+                format!("Attribute rule {rule}: '{field}' holds whole numbers, so {} lost {their} fraction", results(fractions)),
+                false,
+            );
+        }
+        if past > 0 {
+            s.notify(format!("Attribute rule {rule}: '{field}' is null for {} past the 64-bit integer range", results(past)), false);
+        }
+    }
     Ok(())
 }
 
