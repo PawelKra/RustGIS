@@ -1002,6 +1002,22 @@ fn subtypes_say_what_is_past_their_classes() {
         2 * (100 - max)
     );
     assert_eq!(past(&s, mark), [said]);
+    // Only the features a definition query lets through are drawn, so only they are counted;
+    // the classes still come from every feature.
+    s.run("layer.definitionQuery", &json!({"layer": "Herds", "where": "n >= 600"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("data.subtypes", &json!({"layer": "Herds", "field": "n", "subtypes": subtypes})).unwrap();
+    assert_eq!(herd_classes(&s), first, "classes from every feature");
+    let said = format!(
+        "Herds: {} features whose value is past the first {max} values of n (by number) are drawn as <all other values>",
+        2 * (100 - 600 / 7 - 1)
+    );
+    assert_eq!(past(&s, mark), [said]);
+    s.run("layer.definitionQuery", &json!({"layer": "Herds", "where": "n < 300"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("data.subtypes", &json!({"layer": "Herds", "field": "n", "subtypes": subtypes})).unwrap();
+    assert!(past(&s, mark).is_empty(), "every drawn feature has a class");
+    s.run("layer.definitionQuery", &json!({"layer": "Herds", "where": ""})).unwrap();
     // Not drawn by them, or with fewer values: nothing to say.
     let mark = s.notice_mark();
     s.run("data.subtypes", &json!({"layer": "Herds", "field": "n", "subtypes": subtypes, "symbolize": false})).unwrap();

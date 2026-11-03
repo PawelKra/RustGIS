@@ -175,8 +175,13 @@ fn class_number(text: &str) -> Option<ClassNumber> {
         None => (body, ""),
     };
     if !mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-        // A word: inf, infinity or NaN.
-        return Some(if f.is_nan() { ClassNumber::NaN } else { ClassNumber::Infinite { negative: f < 0.0 } });
+        // A word: a number only as a float's display text writes it (`inf`, `-inf`, `NaN`), so a
+        // text value such as `Nan` (a name) or `Infinity` stays text.
+        return match text {
+            "NaN" => Some(ClassNumber::NaN),
+            "inf" | "-inf" => Some(ClassNumber::Infinite { negative: f < 0.0 }),
+            _ => None,
+        };
     }
     // (Rust read the text, so an exponent given has digits: one that doesn't parse is too large.)
     let size = |digits: &str| digits.parse::<i64>().unwrap_or(MAX_EXPONENT).min(MAX_EXPONENT);
@@ -485,6 +490,24 @@ mod tests {
             ["-1e-400", "0", tiny.as_str(), "1e-400", ".5", "5.", "1e400", huge.as_str()]
         );
         assert_eq!(sorted(&["-0.0", "0e5", "-0", "0.000"]), ["-0", "-0.0", "0.000", "0e5"], "zeros are one value");
+    }
+
+    /// Words are numbers only as a float's display text writes them: `Nan` (a name) and
+    /// `Infinity` are text, and keep text order.
+    #[test]
+    fn only_a_floats_words_are_numbers() {
+        for word in ["Nan", "nan", "NAN", "Inf", "INF", "infinity", "Infinity", "+inf", "-Infinity"] {
+            assert!(orders_as_text(word), "{word}");
+            let mut text_order = vec![word, "10", "9"];
+            text_order.sort();
+            assert_eq!(sorted(&[word, "10", "9"]), text_order, "{word}");
+        }
+        for word in ["NaN", "inf", "-inf"] {
+            assert!(!orders_as_text(word), "{word}");
+        }
+        assert_eq!(sorted(&["NaN", "10", "-inf", "9", "inf"]), ["-inf", "9", "10", "inf", "NaN"]);
+        let shown: Vec<String> = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].iter().map(|f| Value::Float(*f).to_string()).collect();
+        assert_eq!(shown, ["NaN", "inf", "-inf"], "as a float field's values are written");
     }
 
     #[test]

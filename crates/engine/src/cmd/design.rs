@@ -2,6 +2,7 @@
 //! Relationships, and Edit › Manage Edits, Snapping, Features (modify tools), Elevation and
 //! Corrections. Every feature edit goes through [`apply`], which enforces the layer's design.
 
+use rustgis_data::value::PastClasses;
 use rustgis_data::{Feature, FieldType, Geometry, GeometryType, Value};
 use rustgis_geom::{Coord, lonlat_to_merc, merc_to_lonlat};
 use rustgis_map::design::{
@@ -818,12 +819,15 @@ fn subtypes(s: &mut Session, p: &Json) -> CmdResult {
     let symbolize = b(p, "symbolize").unwrap_or(true);
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     // Unique values by subtype code.
-    let mut past = rustgis_data::value::PastClasses::default();
+    let mut past = PastClasses::default();
     if symbolize {
         let base = l.renderer.base_symbol();
+        // The classes come from every feature, so a definition query doesn't drop any; the
+        // features past them are counted among those it lets through, which are drawn.
         let (r, rest) = rustgis_map::Renderer::unique_counted(&l.dataset, &[], &fname, rustgis_map::Ramp::default(), base)?;
+        let rows = l.visible_rows();
+        past = PastClasses { features: drawn_past(&l.dataset, &r, &fname, &rows), ..rest };
         l.renderer = r;
-        past = rest;
     }
     let n = subs.len();
     let name = l.name.clone();
@@ -839,6 +843,20 @@ fn subtypes(s: &mut Session, p: &Json) -> CmdResult {
         );
     }
     Ok(json!({"subtypes": n}))
+}
+
+/// How many features `rows` keeps, with a geometry, have a value of `field` that is none of the
+/// Unique Values `renderer`'s classes: those drawn as `<all other values>`.
+fn drawn_past(ds: &rustgis_data::Dataset, renderer: &rustgis_map::Renderer, field: &str, rows: &[bool]) -> usize {
+    let (rustgis_map::Renderer::Unique { classes, .. }, Some(fi)) = (renderer, ds.field_index(field)) else { return 0 };
+    let classes: std::collections::HashSet<&str> = classes.iter().map(|(k, _)| k.as_str()).collect();
+    ds.features
+        .iter()
+        .enumerate()
+        .filter(|(r, f)| rows.get(*r).copied().unwrap_or(true) && f.geometry.is_some())
+        // (Each value's text as `Dataset::unique_values` writes it, a missing one empty.)
+        .filter(|(_, f)| !classes.contains(f.attrs.get(fi).map(|v| v.to_string()).unwrap_or_default().as_str()))
+        .count()
 }
 
 fn attribute_rule(s: &mut Session, p: &Json) -> CmdResult {
