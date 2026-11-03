@@ -361,11 +361,9 @@ fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
     let calc = Calculation::parse(&expr, &l.dataset)?;
     let rows: Vec<usize> = if l.selection.is_empty() { (0..l.dataset.features.len()).collect() } else { l.selection.clone() };
     let mut out = Vec::new();
-    // The results a whole-number field cut: by their fraction, or whole, past its range.
-    // The rows whose result was cut, with what was written: counted once the edit is kept, if a
-    // calculation rule on the same field hasn't written over it.
-    // What this calculation cut is said even when a calculation rule writes the field afterwards:
-    // the rule may read the cut value, and says what it cuts itself.
+    // The results a whole-number field cut (their fraction, or whole: past its range, or not a
+    // number), said even when a calculation rule writes the field afterwards: the rule may read
+    // the cut value, and says what it cuts itself.
     let mut cuts = Cuts::default();
     for r in &rows {
         let (v, cut) = coerce_cut(calc.eval(&l.dataset, *r), ty);
