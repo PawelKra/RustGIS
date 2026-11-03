@@ -981,6 +981,38 @@ fn unique_values_on_a_field_say_what_is_past_their_classes() {
     assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("past the first")), "{:?}", s.notices_since(mark));
 }
 
+/// Subtypes draw the layer by Unique Values of the subtype field: past 64 values, the features
+/// drawn as <all other values> are said too.
+#[test]
+fn subtypes_say_what_is_past_their_classes() {
+    let max = rustgis_map::symbology::MAX_UNIQUE;
+    let subtypes = json!([{"code": 0, "name": "None"}, {"code": 7, "name": "Seven"}]);
+    let past = |s: &Session, mark| {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("past the first")).map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    // 100 values, each on two features.
+    let values: Vec<i64> = (0..100).rev().chain(0..100).map(|i| i * 7).collect();
+    let mut s = numbered_points(&values);
+    let mark = s.notice_mark();
+    s.run("data.subtypes", &json!({"layer": "Herds", "field": "n", "subtypes": subtypes})).unwrap();
+    let first: Vec<String> = (0..max as i64).map(|i| (i * 7).to_string()).collect();
+    assert_eq!(herd_classes(&s), first);
+    let said = format!(
+        "Herds: {} features whose value is past the first {max} values of n (by number) are drawn as <all other values>",
+        2 * (100 - max)
+    );
+    assert_eq!(past(&s, mark), [said]);
+    // Not drawn by them, or with fewer values: nothing to say.
+    let mark = s.notice_mark();
+    s.run("data.subtypes", &json!({"layer": "Herds", "field": "n", "subtypes": subtypes, "symbolize": false})).unwrap();
+    assert!(past(&s, mark).is_empty());
+    let mut s = numbered_points(&[0, 7, 14, 7]);
+    let mark = s.notice_mark();
+    s.run("data.subtypes", &json!({"layer": "Herds", "field": "n", "subtypes": subtypes})).unwrap();
+    assert_eq!(herd_classes(&s), ["0", "7", "14"]);
+    assert!(past(&s, mark).is_empty());
+}
+
 #[test]
 fn unique_values_class_by_an_expression() {
     let mut s = world();

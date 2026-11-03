@@ -818,12 +818,26 @@ fn subtypes(s: &mut Session, p: &Json) -> CmdResult {
     let symbolize = b(p, "symbolize").unwrap_or(true);
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     // Unique values by subtype code.
+    let mut past = rustgis_data::value::PastClasses::default();
     if symbolize {
         let base = l.renderer.base_symbol();
-        l.renderer = rustgis_map::Renderer::unique(&l.dataset, &[], &fname, rustgis_map::Ramp::default(), base)?;
+        let (r, rest) = rustgis_map::Renderer::unique_counted(&l.dataset, &[], &fname, rustgis_map::Ramp::default(), base)?;
+        l.renderer = r;
+        past = rest;
     }
     let n = subs.len();
-    l.design.subtypes = Some(Subtypes { field: fname, subtypes: subs });
+    let name = l.name.clone();
+    l.design.subtypes = Some(Subtypes { field: fname.clone(), subtypes: subs });
+    if past.features > 0 {
+        let (max, order) = (rustgis_map::symbology::MAX_UNIQUE, if past.by_number { "by number" } else { "in text order" });
+        s.notify(
+            format!(
+                "{name}: {} features whose value is past the first {max} values of {fname} ({order}) are drawn as <all other values>",
+                past.features
+            ),
+            false,
+        );
+    }
     Ok(json!({"subtypes": n}))
 }
 

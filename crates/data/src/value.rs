@@ -137,92 +137,117 @@ impl PartialOrd for Value {
     }
 }
 
-/// A Unique Values class's value, given as its text, read as a number: a whole number (a sign,
-/// then digits, of any length) by its digits, so exactly; any other as a decimal.
+/// A Unique Values class's value, given as its text, read as a number exactly as written: any
+/// text Rust reads as a decimal (`9`, `-2.5`, `1e300`, `.5`, past 2^53 or i128), kept as its
+/// significant digits and the place of its point rather than rounded to an `f64`; or one of the
+/// words a decimal can be (infinity, NaN).
 #[derive(Clone, Copy, Debug)]
 enum ClassNumber {
-    /// Below zero or not, and where its digits start in the text, past the sign and any leading
-    /// zeros (none left for 0).
-    Whole {
+    /// `0.d…d × 10^point`: below zero or not, where its significant digits start and end in the
+    /// text (a point between them is skipped when they're read; none for zero), and `point`.
+    Finite {
         negative: bool,
         start: usize,
+        end: usize,
+        point: i64,
     },
-    Decimal(f64),
+    Infinite {
+        negative: bool,
+    },
+    NaN,
 }
 
+/// The largest exponent kept, so sums with it can't overflow: an exponent past it (past 2^61, as
+/// no value's display text has, only a text typed so) is taken as it, and numbers with two such
+/// exponents of one sign are ordered by their digits.
+const MAX_EXPONENT: i64 = i64::MAX / 4;
+
 fn class_number(text: &str) -> Option<ClassNumber> {
-    let (negative, unsigned) = match text.strip_prefix('-') {
+    // Only what Rust reads as a decimal is a number.
+    let f = text.parse::<f64>().ok()?;
+    let (negative, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text.strip_prefix('+').unwrap_or(text)),
     };
-    if !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit()) {
-        let digits = unsigned.trim_start_matches('0');
-        return Some(ClassNumber::Whole { negative: negative && !digits.is_empty(), start: text.len() - digits.len() });
+    let offset = text.len() - body.len();
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(i) => (body.get(..i).unwrap_or_default(), body.get(i + 1..).unwrap_or_default()),
+        None => (body, ""),
+    };
+    if !mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        // A word: inf, infinity or NaN.
+        return Some(if f.is_nan() { ClassNumber::NaN } else { ClassNumber::Infinite { negative: f < 0.0 } });
     }
-    text.parse::<f64>().ok().map(ClassNumber::Decimal)
+    // (Rust read the text, so an exponent given has digits: one that doesn't parse is too large.)
+    let size = |digits: &str| digits.parse::<i64>().unwrap_or(MAX_EXPONENT).min(MAX_EXPONENT);
+    let exponent = match exponent.strip_prefix('-') {
+        _ if exponent.is_empty() => 0,
+        Some(digits) => -size(digits),
+        None => size(exponent.strip_prefix('+').unwrap_or(exponent)),
+    };
+    let dot = mantissa.find('.').unwrap_or(mantissa.len());
+    let significant = |b: &u8| b.is_ascii_digit() && *b != b'0';
+    let (Some(first), Some(last)) = (mantissa.bytes().position(|b| significant(&b)), mantissa.bytes().rposition(|b| significant(&b)))
+    else {
+        return Some(ClassNumber::Finite { negative: false, start: offset, end: offset, point: 0 });
+    };
+    // Digits from the first significant one to the point, or minus the zeros between them.
+    let point = if first < dot { (dot - first) as i64 } else { -((first - dot - 1) as i64) };
+    Some(ClassNumber::Finite { negative, start: offset + first, end: offset + last + 1, point: point.saturating_add(exponent) })
 }
 
-/// A whole number's sign and digits (past leading zeros) in `text`.
-fn whole_digits(text: &str, negative: bool, start: usize) -> (bool, &str) {
-    (negative, text.get(start..).unwrap_or_default())
+/// The significant digits of a number between `start` and `end` in `text`, past any point.
+fn significant_digits(text: &str, start: usize, end: usize) -> impl Iterator<Item = u8> + '_ {
+    text.get(start..end).unwrap_or_default().bytes().filter(|b| *b != b'.')
 }
 
-/// Orders two whole numbers given by their sign and digits (without leading zeros).
-fn cmp_wholes((negative_a, a): (bool, &str), (negative_b, b): (bool, &str)) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let size = a.len().cmp(&b.len()).then_with(|| a.cmp(b));
-    match (negative_a, negative_b) {
-        (false, false) => size,
-        (true, true) => size.reverse(),
-        (false, true) => Ordering::Greater,
-        (true, false) => Ordering::Less,
-    }
-}
-
-/// Orders the whole number written `text` (its sign and digits `whole`) against the decimal `f`,
-/// exactly: NaN after it.
-fn cmp_whole_decimal(text: &str, whole: (bool, &str), f: f64) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    if f.is_nan() {
-        return Ordering::Less;
-    }
-    if f.is_infinite() {
-        return if f > 0.0 { Ordering::Less } else { Ordering::Greater };
-    }
-    // As decimals first: rounding keeps order, so where the whole number's decimal is above or
-    // below `f`, the whole number is too.
-    match text.parse::<f64>().ok().and_then(|w| w.partial_cmp(&f)) {
-        Some(Ordering::Equal) | None => {}
-        Some(o) => return o,
-    }
-    // Equal as decimals, `f` is a whole number (one a whole number rounds to): written out in
-    // full, its digits are compared exactly (2^53 + 1 against 2^53, i128::MAX against 2^127).
-    let full = format!("{f:.0}");
-    match class_number(&full) {
-        Some(ClassNumber::Whole { negative, start }) => cmp_wholes(whole, whole_digits(&full, negative, start)),
-        _ => Ordering::Equal,
-    }
-}
-
-/// Orders two class numbers, read from the texts `a` and `b`, by value: whole numbers exactly,
-/// decimals as `f64`, NaN after every other number. Two decimals' texts that round to the same
-/// `f64` compare equal here (and then by text in [`cmp_numeric_classes`]); a numeric field's never
-/// do, as its display text reads back as the same `f64`, so only a text field of decimals past
-/// 15 or so digits can be ordered by text.
+/// Orders two class numbers, read from the texts `a` and `b`, exactly by value: NaN after every
+/// other number. Numbers equal in value (`1`, `1.0`, `1e0`) compare equal here, and then by text
+/// in [`cmp_numeric_classes`].
 fn cmp_class_numbers(a: &str, x: ClassNumber, b: &str, y: ClassNumber) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    // -1, 0 or 1, and for a finite number other than 0, its size against another of its sign.
+    let sign = |n: ClassNumber| match n {
+        ClassNumber::Finite { start, end, .. } if start == end => 0,
+        ClassNumber::Finite { negative, .. } | ClassNumber::Infinite { negative } => {
+            if negative {
+                -1
+            } else {
+                1
+            }
+        }
+        ClassNumber::NaN => 2,
+    };
     match (x, y) {
-        (ClassNumber::Whole { negative: na, start: sa }, ClassNumber::Whole { negative: nb, start: sb }) => {
-            cmp_wholes(whole_digits(a, na, sa), whole_digits(b, nb, sb))
+        (ClassNumber::NaN, ClassNumber::NaN) => Ordering::Equal,
+        (ClassNumber::NaN, _) => Ordering::Greater,
+        (_, ClassNumber::NaN) => Ordering::Less,
+        (ClassNumber::Infinite { negative: n }, ClassNumber::Infinite { negative: m }) => m.cmp(&n),
+        (ClassNumber::Infinite { negative }, _) => {
+            if negative {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
         }
-        (ClassNumber::Whole { negative, start }, ClassNumber::Decimal(f)) => cmp_whole_decimal(a, whole_digits(a, negative, start), f),
-        (ClassNumber::Decimal(f), ClassNumber::Whole { negative, start }) => {
-            cmp_whole_decimal(b, whole_digits(b, negative, start), f).reverse()
+        (_, ClassNumber::Infinite { negative }) => {
+            if negative {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
         }
-        (ClassNumber::Decimal(f), ClassNumber::Decimal(g)) => match (f.is_nan(), g.is_nan()) {
-            (false, false) => f.partial_cmp(&g).unwrap_or(Ordering::Equal),
-            (nan_f, nan_g) => nan_f.cmp(&nan_g),
-        },
+        (ClassNumber::Finite { negative, start: sa, end: ea, point: pa }, ClassNumber::Finite { start: sb, end: eb, point: pb, .. }) => {
+            sign(x).cmp(&sign(y)).then_with(|| {
+                if sign(x) == 0 {
+                    return Ordering::Equal;
+                }
+                // The same sign: the larger size has its point further on, or the same and larger
+                // digits (shorter ones as if ended with zeros).
+                let size = pa.cmp(&pb).then_with(|| significant_digits(a, sa, ea).cmp(significant_digits(b, sb, eb)));
+                if negative { size.reverse() } else { size }
+            })
+        }
     }
 }
 
@@ -413,9 +438,13 @@ mod tests {
         let past_max = "170141183460469231731687303715884105729";
         let further_past = "170141183460469231731687303715884105730";
         assert_eq!(sorted(&[further_past, past_max]), [past_max, further_past]);
-        // i128::MAX is below 2^127, which reads as one decimal with it.
+        // i128::MAX against decimals that read as one f64 with it (2^127): by what is written.
         let max = i128::MAX.to_string();
-        assert_eq!(sorted(&["1.7014118346046923e38", &max]), [max.as_str(), "1.7014118346046923e38"]);
+        assert_eq!(sorted(&["1.7014118346046923e38", &max]), ["1.7014118346046923e38", max.as_str()]);
+        assert_eq!(
+            sorted(&["170141183460469231731687303715884105728.0", &max]),
+            [max.as_str(), "170141183460469231731687303715884105728.0"]
+        );
         assert_eq!(
             sorted(&["170141183460469231731687303715884105728.0", past_max]),
             ["170141183460469231731687303715884105728.0", past_max]
@@ -431,11 +460,31 @@ mod tests {
         // zeros): neighbouring floats' texts are in the floats' order.
         for v in [1e300, -1e300, 1.2345678901234568e20, 9.007199254740994e15] {
             let (a, b) = (Value::Float(v).to_string(), Value::Float(v.next_up()).to_string());
-            assert!(matches!(class_number(&a), Some(ClassNumber::Whole { .. })), "{a}");
+            assert!(!a.contains(['.', 'e']), "{a}");
             assert_eq!(cmp_numeric_classes(&a, &b), std::cmp::Ordering::Less, "{a} {b}");
         }
         // Signs and leading zeros: one number, ordered by text.
         assert_eq!(sorted(&["7", "007", "+7", "-0", "0", "-00", "+0"]), ["+0", "-0", "-00", "0", "+7", "007", "7"]);
+    }
+
+    /// Decimals are ordered by what is written, not by the f64 they read as: two that read as
+    /// one f64, a decimal against a whole number it rounds to, and exponents.
+    #[test]
+    fn decimals_are_ordered_exactly_as_written() {
+        assert_eq!(sorted(&["10000000000000000.5", "9999999999999999.9"]), ["9999999999999999.9", "10000000000000000.5"]);
+        assert_eq!(cmp_numeric_classes("-9007199254740992", "-9007199254740991.9"), std::cmp::Ordering::Less);
+        assert_eq!(cmp_numeric_classes("9007199254740992", "9007199254740992.1"), std::cmp::Ordering::Less);
+        assert_eq!(sorted(&["0.30000000000000001", "0.3", "0.29999999999999999"]), ["0.29999999999999999", "0.3", "0.30000000000000001"]);
+        // One value written five ways: equal, then by text.
+        assert_eq!(sorted(&["1e2", "100", "100.0", "0.1e3", "+1E+2"]), ["+1E+2", "0.1e3", "100", "100.0", "1e2"]);
+        // Small and large exponents, and ones past what an i64 holds.
+        let tiny = format!("1e-{}", "9".repeat(30));
+        let huge = format!("1e{}", "9".repeat(30));
+        assert_eq!(
+            sorted(&[&huge, "1e400", "0", &tiny, "1e-400", "-1e-400", ".5", "5."]),
+            ["-1e-400", "0", tiny.as_str(), "1e-400", ".5", "5.", "1e400", huge.as_str()]
+        );
+        assert_eq!(sorted(&["-0.0", "0e5", "-0", "0.000"]), ["-0", "-0.0", "0.000", "0e5"], "zeros are one value");
     }
 
     #[test]
@@ -467,6 +516,13 @@ mod tests {
             "1.7014118346046923e38",
             "170141183460469231731687303715884105729",
             "-170141183460469231731687303715884105730",
+            "10000000000000000.5",
+            "9999999999999999.9",
+            "-9007199254740991.9",
+            "1e2",
+            "0.1e3",
+            "1e-400",
+            "-1e-400",
             "2.5",
             "",
             "<Null>",
