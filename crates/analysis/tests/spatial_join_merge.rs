@@ -132,6 +132,18 @@ fn min_and_max_pick_whole_numbers_exactly_in_any_order() {
     assert_eq!(column(&out, "join_n")[1..], [Value::Text("9007199254740993".into()), Value::Int(TWO_53 + 1), Value::Int(3)]);
     let out = layer(join(&layers, json!([{"field": "n", "rule": "min"}])));
     assert_eq!(column(&out, "join_n")[1..], [Value::Text(" 9007199254740992 ".into()), Value::Int(TWO_53 + 1), Value::Float(2.5)]);
+    // Text written with a decimal point or an exponent is read from its digits too: 2^53 + 1 as
+    // "9007199254740993.0", after 2^53, is the max, though their decimals are equal.
+    let mut pts = points();
+    let n = field(&pts, "n");
+    pts.features[1].attrs[n] = Value::Text("9007199254740993.0".into());
+    pts.features[2].attrs[n] = Value::Text("90071992547409930e-1".into());
+    pts.features[3].attrs[n] = Value::Int(TWO_53 + 2);
+    let layers = Layers::default().with(zones()).with(pts);
+    let out = layer(join(&layers, json!([{"field": "n", "rule": "max"}])));
+    assert_eq!(column(&out, "join_n")[..2], [Value::Text("9007199254740993.0".into()), Value::Int(TWO_53 + 2)]);
+    let out = layer(join(&layers, json!([{"field": "n", "rule": "min"}])));
+    assert_eq!(column(&out, "join_n")[..2], [Value::Int(TWO_53), Value::Text("90071992547409930e-1".into())]);
 }
 
 #[test]
@@ -162,6 +174,54 @@ fn an_integer_sum_past_the_64_bit_range_is_empty_and_said_so() {
     let layers = Layers::default().with(zones()).with(pts);
     let out = layer(join(&layers, json!([{"field": "m", "rule": "sum"}])));
     assert_eq!(column(&out, "join_m")[3], Value::Int(TWO_53 + 5));
+    // In any form a number is written: "9007199254740993.0" is 2^53 + 1, not its decimal, 2^53.
+    let mut pts = points();
+    pts.features[6].attrs[m] = Value::Text("9007199254740993.0".into());
+    let layers = Layers::default().with(zones()).with(pts);
+    let out = layer(join(&layers, json!([{"field": "m", "rule": "sum"}])));
+    assert_eq!(column(&out, "join_m")[3], Value::Int(TWO_53 + 5));
+}
+
+#[test]
+fn an_integer_sum_is_checked_once_and_says_what_it_leaves_out() {
+    let mut pts = points();
+    let m = field(&pts, "m");
+    // A: i64::MAX, 1 and -1. The total, i64::MAX, fits, though i64::MAX + 1 doesn't.
+    let mut third = pts.features[1].clone();
+    third.attrs[m] = Value::Int(-1);
+    pts.push(third.geometry, third.attrs);
+    // B: a decimal with a fraction and a whole number past the range written as text, which the
+    // field's whole numbers can't hold: both are left out, and the sum is empty. 2^63 as a decimal
+    // is past it too (the unit test in `join.rs`).
+    pts.features[2].attrs[m] = Value::Float(2.5);
+    pts.features[3].attrs[m] = Value::Text("9223372036854775808".into());
+    // D: "1e309", a number past the range written as text, too large for a decimal, is left out of
+    // 4. Text that isn't a number is no value, as for every numeric rule, and isn't counted.
+    pts.features[6].attrs[m] = Value::Text("1e309".into());
+    let mut fourth = pts.features[7].clone();
+    fourth.attrs[m] = Value::Text("n/a".into());
+    pts.push(fourth.geometry, fourth.attrs);
+    let layers = Layers::default().with(zones()).with(pts);
+    let res = join(&layers, json!([{"field": "n", "rule": "first"}, {"field": "m", "rule": "sum"}]));
+    assert_eq!(
+        res.messages,
+        [
+            "Spatial Join: 4 features joined (10 matches)",
+            "1 sum in join_m is past the 64-bit integer range and was left empty",
+            "3 values in join_m are not whole numbers in the 64-bit integer range and were left out of their sums"
+        ]
+    );
+    assert_eq!(column(&layer(res), "join_m"), [Value::Int(i64::MAX), Value::Null, Value::Null, Value::Int(4)]);
+    // One left out: D alone.
+    let layers = layers.select("points", &[6, 7]);
+    let p = json!({"target": "zones", "join": "points", "merge": [{"field": "m", "rule": "sum"}]});
+    assert_eq!(
+        rustgis_analysis::run("spatialJoin", &layers, &p).unwrap().messages,
+        [
+            "Spatial Join: 4 features joined (2 matches)",
+            "1 value in join_m is not a whole number in the 64-bit integer range and was left out of its sum"
+        ]
+    );
 }
 
 #[test]
@@ -199,10 +259,14 @@ fn a_whole_mean_a_decimal_cant_hold_is_said_to_be_rounded() {
     pts.features[2].attrs[n] = Value::Int(TWO_53 + 1);
     pts.features[3].attrs[n] = Value::Int(TWO_53 + 2);
     let third = pts.features[4].clone();
-    pts.push(third.geometry, third.attrs);
+    pts.push(third.geometry.clone(), third.attrs.clone());
+    // Text that isn't a number is no value, and leaves C's mean exact.
+    let mut fourth = third;
+    fourth.attrs[n] = Value::Text("n/a".into());
+    pts.push(fourth.geometry, fourth.attrs);
     let layers = Layers::default().with(zones()).with(pts);
     let res = join(&layers, json!([{"field": "n", "rule": "mean"}]));
-    assert_eq!(res.messages, ["Spatial Join: 4 features joined (9 matches)".to_string(), rounded("1 result", "join_n")]);
+    assert_eq!(res.messages, ["Spatial Join: 4 features joined (10 matches)".to_string(), rounded("1 result", "join_n")]);
     let out = layer(res);
     assert_eq!(column(&out, "join_n")[1..3], [Value::Float(9_007_199_254_740_994.0), Value::Float(9_007_199_254_740_992.0)]);
     // Means within 2^53: no notice.

@@ -671,6 +671,12 @@ fn whole_text(t: &str) -> Option<WholeText> {
     Some(WholeText { digits: if negative { format!("-{whole}") } else { whole }, plain })
 }
 
+/// The whole number text stands for, exactly, when it is one within the i64 range, in any of the
+/// forms [`whole_text`] reads ("12", "12.0", "1.2e1").
+pub(crate) fn text_i64(t: &str) -> Option<i64> {
+    whole_text(t).and_then(|w| w.to_i64())
+}
+
 /// How many distinct values sorted `s` holds.
 fn distinct<T: PartialEq>(s: &[T]) -> usize {
     s.windows(2).filter(|w| matches!(w, [a, b] if a != b)).count() + usize::from(!s.is_empty())

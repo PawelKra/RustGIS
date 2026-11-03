@@ -4657,6 +4657,7 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     // For each merge rule, the targets whose sum went past the 64-bit range, and whose result came
     // out rounded from a whole number past 2^53.
     let mut overflowed = vec![0usize; merges.len()];
+    let mut left_out = vec![0usize; merges.len()];
     let mut rounded = Rounded::new(merges.len());
 
     if mode == JoinMatch::LargestOverlap
@@ -4822,6 +4823,9 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
                 if let Some(n) = overflowed.get_mut(k) {
                     *n += usize::from(lost.overflowed);
                 }
+                if let Some(n) = left_out.get_mut(k) {
+                    *n += lost.left_out;
+                }
                 if let Some(n) = rounded.results.get_mut(k) {
                     *n += usize::from(lost.rounded);
                 }
@@ -4839,11 +4843,23 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         })
         .collect();
     let mut messages = vec![format!("Spatial Join: {written_features} features joined ({total_matches} matches)")];
-    let total: usize = overflowed.iter().sum();
-    if total > 0 {
-        let names: Vec<&str> = overflowed.iter().zip(&merged_fields).filter(|(n, _)| **n > 0).map(|(_, f)| f.name.as_str()).collect();
+    // The total of `counts` and the output fields with some, or None without any.
+    let counted = |counts: &[usize]| -> Option<(usize, String)> {
+        let total: usize = counts.iter().sum();
+        let names: Vec<&str> = counts.iter().zip(&merged_fields).filter(|(n, _)| **n > 0).map(|(_, f)| f.name.as_str()).collect();
+        (total > 0).then(|| (total, names.join(", ")))
+    };
+    if let Some((total, names)) = counted(&overflowed) {
         let (sums, are, were) = if total == 1 { ("sum", "is", "was") } else { ("sums", "are", "were") };
-        messages.push(format!("{total} {sums} in {} {are} past the 64-bit integer range and {were} left empty", names.join(", ")));
+        messages.push(format!("{total} {sums} in {names} {are} past the 64-bit integer range and {were} left empty"));
+    }
+    if let Some((total, names)) = counted(&left_out) {
+        let (values, are, numbers, were, sums) = if total == 1 {
+            ("value", "is", "a whole number", "was", "its sum")
+        } else {
+            ("values", "are", "whole numbers", "were", "their sums")
+        };
+        messages.push(format!("{total} {values} in {names} {are} not {numbers} in the 64-bit integer range and {were} left out of {sums}"));
     }
     messages.extend(rounded_notice(&rounded, &merged_fields));
     Ok(ToolResult { output: Output::Layer(out), messages })
