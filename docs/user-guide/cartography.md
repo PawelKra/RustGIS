@@ -12,7 +12,11 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
 - **Single Symbol**: one fill, outline and marker for every feature.
 - **Unique Values**: one colour per distinct value of a field. If no field is chosen, the current
   renderer's field is kept when available; otherwise the first available field is used, including
-  text fields. The Layers pane and layout legends list only the
+  text fields. The classes and the legend are in numeric order when every value is a number
+  (9, 10, 100, as on a numeric field or a text field of codes), otherwise in text order; a class
+  renamed by hand keeps its value's place among numbers. There are up to 64 classes, the first in
+  that order; features with a value past them draw as `<all other values>`, and a notice says how
+  many. The Layers pane and layout legends list only the
   classes that drawn features use (after the definition query and display filters);
   `<all other values>` appears only when a drawn feature falls outside the classes and its symbol
   is not fully transparent. A layout legend can leave it out with **Hide other values** (see
