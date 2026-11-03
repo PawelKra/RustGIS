@@ -137,73 +137,196 @@ impl PartialOrd for Value {
     }
 }
 
-/// A Unique Values class's value, given as its text, read as a number: a whole number exactly
-/// (past 2^53 too), any other as a decimal.
-#[derive(Clone, Copy)]
+/// A Unique Values class's value, given as its text, read as a number: a whole number (a sign,
+/// then digits, of any length) by its digits, so exactly; any other as a decimal.
+#[derive(Clone, Copy, Debug)]
 enum ClassNumber {
-    Whole(i128),
+    /// Below zero or not, and where its digits start in the text, past the sign and any leading
+    /// zeros (none left for 0).
+    Whole {
+        negative: bool,
+        start: usize,
+    },
     Decimal(f64),
 }
 
 fn class_number(text: &str) -> Option<ClassNumber> {
-    match text.parse::<i128>() {
-        Ok(i) => Some(ClassNumber::Whole(i)),
-        Err(_) => text.parse::<f64>().ok().map(ClassNumber::Decimal),
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    if !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit()) {
+        let digits = unsigned.trim_start_matches('0');
+        return Some(ClassNumber::Whole { negative: negative && !digits.is_empty(), start: text.len() - digits.len() });
+    }
+    text.parse::<f64>().ok().map(ClassNumber::Decimal)
+}
+
+/// A whole number's sign and digits (past leading zeros) in `text`.
+fn whole_digits(text: &str, negative: bool, start: usize) -> (bool, &str) {
+    (negative, text.get(start..).unwrap_or_default())
+}
+
+/// Orders two whole numbers given by their sign and digits (without leading zeros).
+fn cmp_wholes((negative_a, a): (bool, &str), (negative_b, b): (bool, &str)) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let size = a.len().cmp(&b.len()).then_with(|| a.cmp(b));
+    match (negative_a, negative_b) {
+        (false, false) => size,
+        (true, true) => size.reverse(),
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
     }
 }
 
-/// Orders two class numbers by value, exactly: NaN after every other number.
-fn cmp_class_numbers(a: ClassNumber, b: ClassNumber) -> std::cmp::Ordering {
+/// Orders the whole number written `text` (its sign and digits `whole`) against the decimal `f`,
+/// exactly: NaN after it.
+fn cmp_whole_decimal(text: &str, whole: (bool, &str), f: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    // A whole number against a decimal: as decimals, and where they're equal (as a whole number
-    // past 2^53 can be to the decimal it rounds to), exactly. A decimal equal to a whole
-    // number's is itself whole and within i128, so the cast is exact.
-    let whole_to_decimal = |i: i128, f: f64| match (i as f64).partial_cmp(&f) {
-        Some(Ordering::Equal) => i.cmp(&(f as i128)),
-        Some(o) => o,
-        None => Ordering::Less,
-    };
-    match (a, b) {
-        (ClassNumber::Whole(x), ClassNumber::Whole(y)) => x.cmp(&y),
-        (ClassNumber::Whole(x), ClassNumber::Decimal(y)) => whole_to_decimal(x, y),
-        (ClassNumber::Decimal(x), ClassNumber::Whole(y)) => whole_to_decimal(y, x).reverse(),
-        (ClassNumber::Decimal(x), ClassNumber::Decimal(y)) => match (x.is_nan(), y.is_nan()) {
-            (false, false) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-            (nan_x, nan_y) => nan_x.cmp(&nan_y),
+    if f.is_nan() {
+        return Ordering::Less;
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { Ordering::Less } else { Ordering::Greater };
+    }
+    // As decimals first: rounding keeps order, so where the whole number's decimal is above or
+    // below `f`, the whole number is too.
+    match text.parse::<f64>().ok().and_then(|w| w.partial_cmp(&f)) {
+        Some(Ordering::Equal) | None => {}
+        Some(o) => return o,
+    }
+    // Equal as decimals, `f` is a whole number (one a whole number rounds to): written out in
+    // full, its digits are compared exactly (2^53 + 1 against 2^53, i128::MAX against 2^127).
+    let full = format!("{f:.0}");
+    match class_number(&full) {
+        Some(ClassNumber::Whole { negative, start }) => cmp_wholes(whole, whole_digits(&full, negative, start)),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Orders two class numbers, read from the texts `a` and `b`, by value: whole numbers exactly,
+/// decimals as `f64`, NaN after every other number. Two decimals' texts that round to the same
+/// `f64` compare equal here (and then by text in [`cmp_numeric_classes`]); a numeric field's never
+/// do, as its display text reads back as the same `f64`, so only a text field of decimals past
+/// 15 or so digits can be ordered by text.
+fn cmp_class_numbers(a: &str, x: ClassNumber, b: &str, y: ClassNumber) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (x, y) {
+        (ClassNumber::Whole { negative: na, start: sa }, ClassNumber::Whole { negative: nb, start: sb }) => {
+            cmp_wholes(whole_digits(a, na, sa), whole_digits(b, nb, sb))
+        }
+        (ClassNumber::Whole { negative, start }, ClassNumber::Decimal(f)) => cmp_whole_decimal(a, whole_digits(a, negative, start), f),
+        (ClassNumber::Decimal(f), ClassNumber::Whole { negative, start }) => {
+            cmp_whole_decimal(b, whole_digits(b, negative, start), f).reverse()
+        }
+        (ClassNumber::Decimal(f), ClassNumber::Decimal(g)) => match (f.is_nan(), g.is_nan()) {
+            (false, false) => f.partial_cmp(&g).unwrap_or(Ordering::Equal),
+            (nan_f, nan_g) => nan_f.cmp(&nan_g),
         },
     }
+}
+
+/// Orders two class values, each a text and the number it reads as, as [`cmp_numeric_classes`].
+fn cmp_read_classes(a: &str, x: Option<ClassNumber>, b: &str, y: Option<ClassNumber>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (x, y) {
+        (Some(x), Some(y)) => cmp_class_numbers(a, x, b, y).then_with(|| a.cmp(b)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
+/// Whether a value's text is a missing value's: the empty text or `<Null>`.
+fn missing(text: &str) -> bool {
+    text.is_empty() || text == "<Null>"
 }
 
 /// Whether a class value's text keeps Unique Values classes from being ordered by number: text
 /// that reads as no number, other than the empty text and `<Null>` (a missing value's).
 pub fn orders_as_text(text: &str) -> bool {
-    !text.is_empty() && text != "<Null>" && class_number(text).is_none()
+    !missing(text) && class_number(text).is_none()
+}
+
+/// [`numeric_classes`] over texts already read as numbers.
+fn numeric_read<'a>(values: impl IntoIterator<Item = (&'a str, Option<ClassNumber>)>) -> bool {
+    let mut number = false;
+    for (text, n) in values {
+        if missing(text) {
+            continue;
+        }
+        if n.is_none() {
+            return false;
+        }
+        number = true;
+    }
+    number
 }
 
 /// Whether Unique Values classes with these values, given as their text, are ordered by number:
 /// when one reads as a number and every other does too, or is the empty text or `<Null>`. A
 /// numeric field's values always are; a text field's when it holds only numbers, such as codes.
 pub fn numeric_classes<'a>(values: impl IntoIterator<Item = &'a str>) -> bool {
-    let mut number = false;
-    for v in values {
-        if orders_as_text(v) {
-            return false;
-        }
-        number |= !v.is_empty() && v != "<Null>";
-    }
-    number
+    numeric_read(values.into_iter().map(|v| (v, class_number(v))))
 }
 
 /// Orders two Unique Values classes' values, given as their text, when [`numeric_classes`]: by
 /// number (9 before 10), then the rest (the empty text, `<Null>`) after them by text. Values equal
 /// in number are ordered by text (1 before 1.0), so this is a total order on texts.
 pub fn cmp_numeric_classes(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (class_number(a), class_number(b)) {
-        (Some(x), Some(y)) => cmp_class_numbers(x, y).then_with(|| a.cmp(b)),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => a.cmp(b),
+    cmp_read_classes(a, class_number(a), b, class_number(b))
+}
+
+/// A class value's text, read as a number once: ordered as [`cmp_numeric_classes`] orders texts,
+/// without reading them again on every comparison.
+#[derive(Clone, Debug)]
+pub struct ClassText {
+    text: String,
+    number: Option<ClassNumber>,
+}
+
+impl ClassText {
+    pub fn new(text: String) -> Self {
+        let number = class_number(&text);
+        ClassText { text, number }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// [`orders_as_text`] for this value.
+    pub fn orders_as_text(&self) -> bool {
+        !missing(&self.text) && self.number.is_none()
+    }
+
+    /// [`numeric_classes`] over these values.
+    pub fn numeric<'a>(values: impl IntoIterator<Item = &'a ClassText>) -> bool {
+        numeric_read(values.into_iter().map(|c| (c.text.as_str(), c.number)))
+    }
+}
+
+impl PartialEq for ClassText {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for ClassText {}
+
+impl Ord for ClassText {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_read_classes(&self.text, self.number, &other.text, other.number)
+    }
+}
+
+impl PartialOrd for ClassText {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -219,12 +342,14 @@ pub struct PastClasses {
 
 /// Sorts Unique Values classes' values, given as their text: by number when
 /// [`numeric_classes`], else by text.
-pub fn sort_class_values(values: &mut [String]) {
-    if numeric_classes(values.iter().map(String::as_str)) {
-        values.sort_by(|a, b| cmp_numeric_classes(a, b));
+pub fn sort_class_values(values: &mut Vec<String>) {
+    let mut read: Vec<ClassText> = std::mem::take(values).into_iter().map(ClassText::new).collect();
+    if ClassText::numeric(&read) {
+        read.sort();
     } else {
-        values.sort();
+        read.sort_by(|a, b| a.text.cmp(&b.text));
     }
+    values.extend(read.into_iter().map(ClassText::into_text));
 }
 
 #[cfg(test)]
@@ -278,6 +403,41 @@ mod tests {
         assert_eq!(cmp_numeric_classes("9007199254740993", "9007199254740992.5"), std::cmp::Ordering::Greater);
     }
 
+    /// Whole numbers of any length are ordered by their digits: past i128 too, and against a
+    /// decimal at i128's limit.
+    #[test]
+    fn whole_numbers_past_i128_are_ordered_exactly() {
+        let below_min = "-170141183460469231731687303715884105729";
+        let further_below = "-170141183460469231731687303715884105730";
+        assert_eq!(sorted(&[below_min, further_below]), [further_below, below_min]);
+        let past_max = "170141183460469231731687303715884105729";
+        let further_past = "170141183460469231731687303715884105730";
+        assert_eq!(sorted(&[further_past, past_max]), [past_max, further_past]);
+        // i128::MAX is below 2^127, which reads as one decimal with it.
+        let max = i128::MAX.to_string();
+        assert_eq!(sorted(&["1.7014118346046923e38", &max]), [max.as_str(), "1.7014118346046923e38"]);
+        assert_eq!(
+            sorted(&["170141183460469231731687303715884105728.0", past_max]),
+            ["170141183460469231731687303715884105728.0", past_max]
+        );
+        // Hundreds of digits: above every decimal but infinity.
+        let huge = format!("1{}", "0".repeat(400));
+        let below_huge = format!("-{huge}");
+        assert_eq!(
+            sorted(&["inf", &huge, "1e308", &below_huge, "-inf", "-1e308"]),
+            ["-inf", below_huge.as_str(), "-1e308", "1e308", huge.as_str(), "inf"]
+        );
+        // A large float's display text is a whole number in full (its shortest digits, then
+        // zeros): neighbouring floats' texts are in the floats' order.
+        for v in [1e300, -1e300, 1.2345678901234568e20, 9.007199254740994e15] {
+            let (a, b) = (Value::Float(v).to_string(), Value::Float(v.next_up()).to_string());
+            assert!(matches!(class_number(&a), Some(ClassNumber::Whole { .. })), "{a}");
+            assert_eq!(cmp_numeric_classes(&a, &b), std::cmp::Ordering::Less, "{a} {b}");
+        }
+        // Signs and leading zeros: one number, ordered by text.
+        assert_eq!(sorted(&["7", "007", "+7", "-0", "0", "-00", "+0"]), ["+0", "-0", "-00", "0", "+7", "007", "7"]);
+    }
+
     #[test]
     fn numbers_equal_in_value_and_not_a_number_have_a_place() {
         // Equal in number: by text, so the order is total and repeatable.
@@ -289,7 +449,28 @@ mod tests {
 
     #[test]
     fn the_numeric_order_is_total() {
-        let values = ["NaN", "-inf", "inf", "1", "1.0", "-0", "0", "9007199254740993", "9007199254740992.5", "2.5", "", "<Null>"];
+        let values = [
+            "NaN",
+            "-inf",
+            "inf",
+            "1",
+            "1.0",
+            "+1",
+            "01",
+            "-0",
+            "0",
+            "9007199254740993",
+            "9007199254740992.5",
+            "-9007199254740993",
+            "-9007199254740992.5",
+            "170141183460469231731687303715884105727",
+            "1.7014118346046923e38",
+            "170141183460469231731687303715884105729",
+            "-170141183460469231731687303715884105730",
+            "2.5",
+            "",
+            "<Null>",
+        ];
         for a in values {
             assert_eq!(cmp_numeric_classes(a, a), std::cmp::Ordering::Equal, "{a}");
             for b in values {

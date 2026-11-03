@@ -957,7 +957,7 @@ impl Renderer {
         // The first values by text, and while every value reads as a number, by number too: the
         // order is known only once every feature is classed (`rustgis_data::value::numeric_classes`).
         let mut by_text: FirstValues<String> = FirstValues::new(max);
-        let mut by_number: FirstValues<NumericClass> = FirstValues::new(max);
+        let mut by_number: FirstValues<rustgis_data::value::ClassText> = FirstValues::new(max);
         let mut text_seen = false;
         for r in (0..ds.features.len()).filter(|r| rows.get(*r).copied().unwrap_or(true)) {
             let v = match rustgis_data::query::value(&e, ds, r, &env) {
@@ -967,16 +967,18 @@ impl Renderer {
             };
             // (A feature without a geometry draws nothing, so it isn't counted.)
             let drawn = usize::from(ds.features.get(r).is_some_and(|f| f.geometry.is_some()));
-            text_seen = text_seen || rustgis_data::value::orders_as_text(&v);
+            // Read as a number once.
+            let read = rustgis_data::value::ClassText::new(v);
+            text_seen = text_seen || read.orders_as_text();
             if !text_seen {
-                by_number.add(NumericClass(v.clone()), drawn);
+                by_number.add(read.clone(), drawn);
             }
-            by_text.add(v, drawn);
+            by_text.add(read.into_text(), drawn);
         }
         // (Numbers come before the empty text and `<Null>`, so with any number, one is kept.)
-        let numeric = !text_seen && rustgis_data::value::numeric_classes(by_number.kept.keys().map(|k| k.0.as_str()));
+        let numeric = !text_seen && rustgis_data::value::ClassText::numeric(by_number.kept.keys());
         let (vals, features): (Vec<String>, usize) = if numeric {
-            (by_number.kept.into_keys().map(|k| k.0).collect(), by_number.rest)
+            (by_number.kept.into_keys().map(rustgis_data::value::ClassText::into_text).collect(), by_number.rest)
         } else {
             (by_text.kept.into_keys().collect(), by_text.rest)
         };
@@ -1484,8 +1486,8 @@ impl Renderer {
         let Renderer::Unique { classes, class_labels, .. } = self else { return Vec::new() };
         let mut order: Vec<usize> = (0..classes.len()).collect();
         if self.classes_by_number() {
-            let value = |i: &usize| classes.get(*i).map_or("", |(k, _)| k.as_str());
-            order.sort_by(|a, b| rustgis_data::value::cmp_numeric_classes(value(a), value(b)));
+            // (Each value read as a number once; the sort is stable.)
+            order.sort_by_cached_key(|i| rustgis_data::value::ClassText::new(classes.get(*i).map(|(k, _)| k.clone()).unwrap_or_default()));
         } else {
             order.sort_by_cached_key(|i| classes.get(*i).map(|(k, _)| unique_label(class_labels, k).to_lowercase()));
         }
@@ -1504,7 +1506,7 @@ impl Renderer {
         match self {
             Renderer::Single(_) => Vec::new(),
             Renderer::Unique { classes, other, class_labels, other_label, .. } => {
-                // Keep symbols attached to their sorted labels and the fallback at the end.
+                // Keep symbols attached to their classes in `class_order` and the fallback at the end.
                 let mut v: Vec<LegendEntry> = self
                     .class_order()
                     .into_iter()
@@ -1816,22 +1818,6 @@ impl<K: Ord> FirstValues<K> {
         if self.kept.len() > self.max {
             self.rest += self.kept.pop_last().map_or(0, |(_, n)| n);
         }
-    }
-}
-
-/// A class value's text ordered as [`rustgis_data::value::cmp_numeric_classes`] has it.
-#[derive(PartialEq, Eq)]
-struct NumericClass(String);
-
-impl Ord for NumericClass {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        rustgis_data::value::cmp_numeric_classes(&self.0, &other.0)
-    }
-}
-
-impl PartialOrd for NumericClass {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 

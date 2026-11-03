@@ -513,12 +513,20 @@ impl Dataset {
             let text = f.attrs.get(field).map(|x| x.to_string()).unwrap_or_default();
             *drawn.entry(text).or_insert(0) += usize::from(f.geometry.is_some());
         }
-        let mut v: Vec<String> = drawn.keys().cloned().collect();
-        let by_number = value::numeric_classes(v.iter().map(String::as_str));
-        value::sort_class_values(&mut v);
-        let features = v.get(limit..).unwrap_or_default().iter().filter_map(|k| drawn.get(k)).sum();
+        // Each value read as a number once, not on every comparison.
+        let mut v: Vec<(value::ClassText, usize)> = drawn.into_iter().map(|(t, n)| (value::ClassText::new(t), n)).collect();
+        let by_number = value::ClassText::numeric(v.iter().map(|(t, _)| t));
+        let order = |a: &(value::ClassText, usize), b: &(value::ClassText, usize)| {
+            if by_number { a.0.cmp(&b.0) } else { a.0.text().cmp(b.0.text()) }
+        };
+        // Only the first `limit` need sorting: the rest are set apart in linear time.
+        if limit < v.len() {
+            v.select_nth_unstable_by(limit, order);
+        }
+        let features = v.get(limit..).unwrap_or_default().iter().map(|(_, n)| n).sum();
         v.truncate(limit);
-        (v, value::PastClasses { features, by_number })
+        v.sort_by(order);
+        (v.into_iter().map(|(t, _)| t.into_text()).collect(), value::PastClasses { features, by_number })
     }
 }
 
