@@ -273,7 +273,7 @@ fn cmp_key(x: &Value, y: &Value) -> Ordering {
 
 /// Orders two numbers (true and false as 1 and 0) by value, exactly: a whole number against a
 /// decimal without rounding it to f64. Every NaN is one value, above all others; −0 is 0.
-fn cmp_number(x: &Value, y: &Value) -> Ordering {
+pub(crate) fn cmp_number(x: &Value, y: &Value) -> Ordering {
     /// A number as a whole number or a decimal.
     enum N {
         I(i64),

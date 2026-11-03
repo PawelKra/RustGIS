@@ -4654,6 +4654,10 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     if op_many && !merges.is_empty() {
         return Err("Merge rules apply to Join one to one (one to many keeps each match)".into());
     }
+    // For each merge rule, the targets whose sum went past the 64-bit range, and whose result came
+    // out rounded from a whole number past 2^53.
+    let mut overflowed = vec![0usize; merges.len()];
+    let mut rounded = Rounded::new(merges.len());
 
     if mode == JoinMatch::LargestOverlap
         && (join.geometry_type != GeometryType::Polygon || !matches!(target.geometry_type, GeometryType::Polygon | GeometryType::Polyline))
@@ -4805,21 +4809,44 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         } else {
             let Some(&(first, d)) = matches.first() else { continue };
             let mut values = values_of(first);
-            for m in &merges {
+            for (k, m) in merges.iter().enumerate() {
                 let column: Vec<&Value> = matches
                     .iter()
                     .map(|(jr, _)| join.features.get(*jr).and_then(|f| f.attrs.get(m.field)).unwrap_or(&Value::Null))
                     .collect();
                 let ty = join.fields.get(m.field).map_or(FieldType::Text, |f| f.ty);
+                let (merged, lost) = m.apply(ty, &column);
                 if let Some(slot) = join_field_indices.iter().position(|&ji| ji == m.field).and_then(|k| values.get_mut(k)) {
-                    *slot = m.apply(ty, &column);
+                    *slot = merged;
+                }
+                if let Some(n) = overflowed.get_mut(k) {
+                    *n += usize::from(lost.overflowed);
+                }
+                if let Some(n) = rounded.results.get_mut(k) {
+                    *n += usize::from(lost.rounded);
                 }
             }
             push_row(m_count as i64, Some(values), d);
         }
     }
 
-    result(out, format!("Spatial Join: {written_features} features joined ({total_matches} matches)"))
+    // The output field of each merge rule, for the notices.
+    let merged_fields: Vec<Field> = merges
+        .iter()
+        .map(|m| {
+            let at = join_field_indices.iter().position(|&ji| ji == m.field).map(|k| target_fields_len + 1 + k);
+            at.and_then(|i| out.fields.get(i)).cloned().unwrap_or_else(|| Field::new("", FieldType::Text))
+        })
+        .collect();
+    let mut messages = vec![format!("Spatial Join: {written_features} features joined ({total_matches} matches)")];
+    let total: usize = overflowed.iter().sum();
+    if total > 0 {
+        let names: Vec<&str> = overflowed.iter().zip(&merged_fields).filter(|(n, _)| **n > 0).map(|(_, f)| f.name.as_str()).collect();
+        let (sums, are, were) = if total == 1 { ("sum", "is", "was") } else { ("sums", "are", "were") };
+        messages.push(format!("{total} {sums} in {} {are} past the 64-bit integer range and {were} left empty", names.join(", ")));
+    }
+    messages.extend(rounded_notice(&rounded, &merged_fields));
+    Ok(ToolResult { output: Output::Layer(out), messages })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -459,8 +459,12 @@ rule), `last`, `sum` and `mean` (numeric fields), `min` and `max` (numbers or te
 matches with a value) and `join` (the values as text, separated by `delimiter`, `, ` by default).
 Every rule but `first` and `last` skips empty values. A target without matches gets empty
 values, except a `count` of 0. `mean` writes a decimal field, `count` a whole number and `join`
-text. The `sum` of a whole-number field adds its whole numbers, and is empty when too large to
-hold. For example, the total units permitted in each district:
+text. The `sum` of a whole-number field adds its whole numbers exactly, and is empty when too
+large for a 64-bit integer; the tool says how many sums were left empty, and in which fields. `min`
+and `max` compare whole numbers exactly, past 2^53 (9,007,199,254,740,992) too, where their decimals
+can be equal. The `mean` of whole numbers comes from their exact sum; a mean that is a whole number
+past 2^53, which a decimal can't hold, is rounded, and the tool says how many were. For example, the
+total units permitted in each district:
 
 ```text
 gp.run={"tool":"spatialJoin","params":{"target":"districts","join":"permits","merge":[{"field":"units","rule":"sum"}]}}
