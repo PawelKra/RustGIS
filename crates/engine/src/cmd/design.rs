@@ -125,8 +125,9 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
         }
     }
     let rows: Vec<usize> = changes.iter().filter_map(|c| c.row).collect();
-    // What each calculation rule's whole-number field cut: (rule, field, fractions, past range).
-    let mut cuts: Vec<(String, String, usize, usize)> = Vec::new();
+    // What each calculation rule's whole-number field cut: the rule and the field's name. Each
+    // rule's cuts are said, even when a later rule writes the same field: it may read them.
+    let mut cuts: Vec<(String, String, super::edit::Cuts)> = Vec::new();
     // Calculation rules, in order.
     for rule in l.design.rules.iter().filter(|r| r.kind == RuleKind::Calculation) {
         let Some(fi) = l.dataset.field_index(&rule.field) else { continue };
@@ -134,18 +135,16 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
         // A rule that no longer reads (its field was removed, or a hand-edited file) is skipped
         // rather than blocking every edit.
         let Ok(calc) = super::edit::Calculation::parse(&rule.expression, &l.dataset) else { continue };
-        let (mut fractions, mut past) = (0usize, 0usize);
+        let mut cut = super::edit::Cuts::default();
         for r in &rows {
-            let (v, cut) = super::edit::coerce_cut(calc.eval(&l.dataset, *r), ty);
-            fractions += usize::from(cut == super::edit::Cut::Fraction);
-            past += usize::from(cut == super::edit::Cut::Range);
+            let (v, c) = super::edit::coerce_cut(calc.eval(&l.dataset, *r), ty);
+            cut.add(c);
             if let Some(cell) = l.dataset.features.get_mut(*r).and_then(|f| f.attrs.get_mut(fi)) {
                 *cell = v;
             }
         }
-        if fractions + past > 0 {
-            cuts.push((rule.name.clone(), rule.field.clone(), fractions, past));
-        }
+        let name = l.dataset.fields.get(fi).map(|f| f.name.clone()).unwrap_or_default();
+        cuts.push((rule.name.clone(), name, cut));
     }
     // Validation. Domains and contingent values are checked on the fields an edit changed (all
     // of a new feature's), so a value set before the domain doesn't block unrelated edits.
@@ -226,17 +225,9 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
     e.modified += counts.modified;
     e.deleted += counts.deleted;
     // Said once the edit is kept: a rejected one changed nothing.
-    let results = |n: usize| if n == 1 { "1 result".to_string() } else { format!("{n} results") };
-    for (rule, field, fractions, past) in cuts {
-        if fractions > 0 {
-            let their = if fractions == 1 { "its" } else { "their" };
-            s.notify(
-                format!("Attribute rule {rule}: '{field}' holds whole numbers, so {} lost {their} fraction", results(fractions)),
-                false,
-            );
-        }
-        if past > 0 {
-            s.notify(format!("Attribute rule {rule}: '{field}' is null for {} past the 64-bit integer range", results(past)), false);
+    for (rule, field, cut) in cuts {
+        for notice in cut.notices(&format!("Attribute rule {rule}"), &field) {
+            s.notify(notice, false);
         }
     }
     Ok(())
