@@ -10671,6 +10671,247 @@ pub(crate) fn serve(body: &'static [u8], n: usize) -> String {
     format!("http://{addr}")
 }
 
+/// Serves each file by its exact path and query (others are 404) on a local port, keeping the
+/// paths asked for; returns the base address and them.
+fn serve_files(files: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let read = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..read]);
+            let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+            log.lock().unwrap().push(path.clone());
+            match files.iter().find(|(p, _)| *p == path) {
+                Some((_, body)) => {
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = s.write_all(body);
+                }
+                // A missing file under `/signed/` or `/s3/` is forbidden, as S3 answers a
+                // signature that doesn't cover it, or a missing object to those who can't list.
+                None if path.starts_with("/signed/") || path.starts_with("/s3/") => {
+                    let _ = write!(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+                None => {
+                    let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            }
+        }
+    });
+    (base, asked)
+}
+
+/// A Shapefile published as loose files is added by its `.shp` address (#1238): its `.dbf`,
+/// `.shx`, `.prj` and `.cpg` are fetched beside it with the address's query, and its `.prj` places
+/// it; the parts that aren't there are done without, said, but not its `.dbf`, nor a part a
+/// signed address is refused. An address answering with a zip is read as one. Left to the app (a
+/// plugin's command), the address waits for the app, which fetches the parts the same way.
+#[test]
+fn shapefile_by_its_shp_address() {
+    use rustgis_data::raster::Crs;
+    // A point in UTM 23S (Teresina), written as a Shapefile's parts.
+    let (utm, _) = rustgis_data::io::read_geojson(
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"nome":"rio"},"geometry":{"type":"Point","coordinates":[742000,9390000]}}]}"#,
+        "rios",
+    )
+    .unwrap();
+    let (parts, _) = rustgis_data::io::shapefile_parts_in(&utm, Crs::from_epsg(31983).unwrap()).unwrap();
+    let mut files: Vec<(String, Vec<u8>)> =
+        parts.iter().map(|(e, b)| (format!("/PI/TERESINA/HIDROGRAFIA/PI_2211001_RIOS.{e}?token=1"), b.clone())).collect();
+    // The same without its .prj and .cpg, and one without its .dbf.
+    files.extend(parts.iter().filter(|(e, _)| !matches!(*e, "prj" | "cpg")).map(|(e, b)| (format!("/plain/rios.{e}"), b.clone())));
+    files.extend(parts.iter().filter(|(e, _)| *e != "dbf").map(|(e, b)| (format!("/nodbf/rios.{e}"), b.clone())));
+    files.extend(parts.iter().filter(|(e, _)| *e != "shx").map(|(e, b)| (format!("/noshx/rios.{e}"), b.clone())));
+    // One whose signature doesn't cover its .prj, and one whose address answers with its parts zipped.
+    files.extend(parts.iter().filter(|(e, _)| *e != "prj").map(|(e, b)| (format!("/signed/rios.{e}?sig=1"), b.clone())));
+    files.extend(parts.iter().filter(|(e, _)| *e != "prj").map(|(e, b)| (format!("/s3/rios.{e}"), b.clone())));
+    files.extend(parts.iter().filter(|(e, _)| *e != "prj").map(|(e, b)| (format!("/s3/v.{e}?v=2"), b.clone())));
+    // A site that answers any address with its page: the .prj and .cpg come back as HTML.
+    let page = b"\n<!doctype html><html><body>app</body></html>".to_vec();
+    files.extend(parts.iter().filter(|(e, _)| !matches!(*e, "prj" | "cpg")).map(|(e, b)| (format!("/spa/rios.{e}"), b.clone())));
+    files.extend(["prj", "cpg"].map(|e| (format!("/spa/rios.{e}"), page.clone())));
+    files.extend(parts.iter().filter(|(e, _)| *e == "shp").map(|(e, b)| (format!("/spa/sem_dbf.{e}"), b.clone())));
+    files.push(("/spa/sem_dbf.dbf".into(), page.clone()));
+    files.extend(parts.iter().filter(|(e, _)| *e == "shp").map(|(e, b)| (format!("/spa/tk.{e}?token=1"), b.clone())));
+    files.push(("/spa/tk.dbf?token=1".into(), page.clone()));
+    files.extend(parts.iter().filter(|(e, _)| *e == "shp").map(|(e, b)| (format!("/bad/tk.{e}?token=1"), b.clone())));
+    files.push(("/bad/tk.dbf?token=1".into(), b"not a dbf".to_vec()));
+    files.push(("/spa/pagina.shp".into(), page.clone()));
+    files.extend(parts.iter().filter(|(e, _)| *e == "shp").map(|(e, b)| (format!("/s3/sem_dbf.{e}"), b.clone())));
+    let shp = parts.iter().find(|(e, _)| *e == "shp").unwrap().1.clone();
+    let others = parts.iter().filter(|(e, _)| *e != "shp").map(|(e, b)| (*e, b.clone())).collect();
+    files.push(("/zipped/rios.shp".into(), rustgis_data::io::zip_shapefile_parts("rios.shp", shp.clone(), others).unwrap()));
+    // A zip of two Shapefiles: a complete, b without its .prj.
+    let two: Vec<(String, Vec<u8>)> = parts
+        .iter()
+        .map(|(e, b)| (format!("a.{e}"), b.clone()))
+        .chain(parts.iter().filter(|(e, _)| *e != "prj").map(|(e, b)| (format!("b.{e}"), b.clone())))
+        .collect();
+    files.push(("/zipped/dois.shp".into(), rustgis_data::zip::write(&two).unwrap()));
+    let (base, asked) = serve_files(files);
+    let mut s = Session::new(Project::default());
+    let r = s.run("layer.addUrl", &json!({"url": format!("{base}/PI/TERESINA/HIDROGRAFIA/PI_2211001_RIOS.shp?token=1")})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    assert!(!s.notices.iter().any(|n| n.text.contains("optional files")), "{:?}", s.notices);
+    let e = s.map().layer_by_name("PI_2211001_RIOS").unwrap().extent();
+    assert!((-43.0..-42.6).contains(&e.min_x) && (-5.7..-5.3).contains(&e.min_y), "placed by its .prj: {e:?}");
+    let asked_for = asked.lock().unwrap().clone();
+    for ext in ["shp", "dbf", "shx", "prj", "cpg"] {
+        assert!(asked_for.contains(&format!("/PI/TERESINA/HIDROGRAFIA/PI_2211001_RIOS.{ext}?token=1")), "{ext}: {asked_for:?}");
+    }
+    // Without a .prj or .cpg (404), it is read as a local Shapefile without them.
+    let r = s.run("layer.addUrl", &json!({"url": format!("{base}/plain/rios.shp"), "name": "Sem prj"})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    let said = &s.notices.last().unwrap().text;
+    assert!(said.contains("no .prj, .cpg found or readable beside it (2 of 3") && said.contains("longitude/latitude"), "{said}");
+    // Their 404s are expected: noted once for the server, not recorded as failed requests.
+    let records = s.diagnostics.records();
+    let failed = |r: &&rustgis_data::diagnostics::Record| {
+        r.severity == rustgis_data::diagnostics::Severity::Error && r.network.as_ref().is_some_and(|n| n.url.contains("/plain/rios."))
+    };
+    assert!(!records.iter().any(|r| failed(&r)), "{records:?}");
+    assert!(records.iter().any(|r| r.message.starts_with("expected absences are omitted")), "{records:?}");
+    // With its coordinate system given, nothing is assumed of the missing .prj.
+    s.run("layer.addUrl", &json!({"url": format!("{base}/plain/rios.shp"), "name": "Com crs", "crs": "EPSG:31983"})).unwrap();
+    let said = &s.notices.last().unwrap().text;
+    assert!(said.contains("no .prj, .cpg found or readable beside it") && !said.contains("longitude/latitude"), "{said}");
+    // A long name keeps its extension (and is still a .shp's zip).
+    let long = crate::cmd::layer::url_file_name(&format!("https://x.org/{}.shp", "a".repeat(200)), b"PK\x03\x04").unwrap();
+    assert!(long.ends_with(".zip") && long.chars().count() <= 120, "{long}");
+    let long_json = crate::cmd::layer::url_file_name(&format!("https://x.org/{}.geojson", "a".repeat(200)), b"{}").unwrap();
+    assert!(long_json.ends_with(".geojson") && long_json.chars().count() <= 120, "{long_json}");
+    // A part a signed address is refused (403) fails it, named: the signature may not cover it.
+    // It names the part without the signature.
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/signed/rios.shp?sig=1")})).unwrap_err();
+    assert!(e.contains("/signed/rios.prj") && e.contains("403") && !e.contains("sig=1"), "{e}");
+    assert!(
+        e.contains("may also mean the file isn't there")
+            && e.contains(
+                "keys or signature don't cover it: a presigned address signs one file, so a Shapefile's parts need addresses of their own"
+            ),
+        "{e}"
+    );
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/signed/gone.shp?sig=1")})).unwrap_err();
+    assert!(e.contains("/signed/gone.shp") && e.contains("403") && !e.contains("sig=1"), "{e}");
+    // An unsigned address answered 403 for a part (S3, for a missing object) is done without.
+    let r = s.run("layer.addUrl", &json!({"url": format!("{base}/s3/rios.shp"), "name": "S3"})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    assert!(s.notices.last().unwrap().text.contains("no .prj found or readable beside it (1 of 3"), "{:?}", s.notices.last());
+    // So with a query that carries no key (a version, a download flag).
+    let r = s.run("layer.addUrl", &json!({"url": format!("{base}/s3/v.shp?v=2"), "name": "S3 v2"})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    // And with a fragment, which carries no key either.
+    let r = s.run("layer.addUrl", &json!({"url": format!("{base}/s3/rios.shp#parte"), "name": "S3 frag"})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    // Parts answered with a web page are done without, and said; a .dbf answered so is refused.
+    let r = s.run("layer.addUrl", &json!({"url": format!("{base}/spa/rios.shp"), "name": "SPA"})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    assert!(s.notices.last().unwrap().text.contains("no .prj, .cpg found or readable beside it"), "{:?}", s.notices.last());
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/spa/sem_dbf.shp")})).unwrap_err();
+    assert!(e.contains("/spa/sem_dbf.dbf: a web page answered, not a .dbf"), "{e}");
+    // A page answering for the .shp itself fails at once, its parts not asked for.
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/spa/pagina.shp")})).unwrap_err();
+    assert!(e.contains("/spa/pagina.shp: a web page answered, not a .shp"), "{e}");
+    assert!(!asked.lock().unwrap().iter().any(|a| a.starts_with("/spa/pagina.dbf")));
+    // A keyed address is named once, without its token.
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/spa/tk.shp?token=1")})).unwrap_err();
+    assert!(e.matches("/spa/tk.dbf").count() == 1 && e.contains("a web page answered") && !e.contains("token=1"), "{e}");
+    // One whose parts download but don't read is named without its token too.
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/bad/tk.shp?token=1")})).unwrap_err();
+    assert!(e.contains("/bad/tk.shp") && !e.contains("token=1"), "{e}");
+    // An address refused before anything is fetched is named without its token too.
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/a.tif?token=1"), "cellSize": 10})).unwrap_err();
+    assert!(e.contains("\"cellSize\" goes with \"bbox\"") && !e.contains("token=1"), "{e}");
+    // Its .dbf answered so is refused, saying what the 403 may mean.
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/s3/sem_dbf.shp")})).unwrap_err();
+    assert!(e.contains("/s3/sem_dbf.dbf") && e.contains("S3 also answers this for a file that isn't there"), "{e}");
+    // An address answering with the parts zipped is read as it is, its parts not asked for.
+    let r = s.run("layer.addUrl", &json!({"url": format!("{base}/zipped/rios.shp"), "name": "Zipado"})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    assert!(!asked.lock().unwrap().iter().any(|a| a.starts_with("/zipped/rios.dbf")));
+    // With `layer`, the notice speaks of the Shapefile added only.
+    let mark = s.notice_mark();
+    s.run("layer.addUrl", &json!({"url": format!("{base}/zipped/dois.shp"), "layer": "a", "name": "So a"})).unwrap();
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("optional files")), "{:?}", s.notices_since(mark));
+    let mark = s.notice_mark();
+    s.run("layer.addUrl", &json!({"url": format!("{base}/zipped/dois.shp"), "layer": "b", "name": "So b"})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("b.shp: no .prj")), "{:?}", s.notices_since(mark));
+    // Without its .shx, it is read, and the notice names the .shx.
+    let r = s.run("layer.addUrl", &json!({"url": format!("{base}/noshx/rios.shp"), "name": "Sem shx"})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    assert!(s.notices.last().unwrap().text.contains("no .shx found or readable beside it (1 of 3"), "{:?}", s.notices.last());
+    // Without its .dbf, it is refused, naming the .dbf's address.
+    let e = s.run("layer.addUrl", &json!({"url": format!("{base}/nodbf/rios.shp")})).unwrap_err();
+    assert!(e.contains("/nodbf/rios.dbf") && e.contains("404"), "{e}");
+    // Left to the app, it is asked for as it was given; the app's download brings the parts.
+    let url = format!("{base}/PI/TERESINA/HIDROGRAFIA/PI_2211001_RIOS.shp?token=1");
+    s.leave_downloads = true;
+    assert_eq!(s.run("layer.addUrl", &json!({"url": url, "name": "Pela janela"})).unwrap()["pending"], true);
+    s.leave_downloads = false;
+    assert_eq!(s.take_url_requests()[0]["url"], json!(url));
+    // The app's download, waited for here (failing rather than hanging past 30 s).
+    let fetch = |url: &str, max: usize| {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let land = slot.clone();
+        crate::cmd::layer::download_data(url, max, Box::new(move |r| *land.lock().unwrap() = Some(r)));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(r) = slot.lock().unwrap().take() {
+                break r;
+            }
+            assert!(std::time::Instant::now() < until, "{url}: the download didn't land");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    // The app's download of a signed .shp refused says what the 403 may mean, without the signature.
+    let e = fetch(&format!("{base}/signed/gone.shp?sig=1"), 1 << 20).unwrap_err();
+    assert!(e.contains("403") && e.contains("may also mean the file isn't there") && !e.contains("sig=1"), "{e}");
+    // A .shp address answering with a zip lands as it is, its parts not asked for.
+    let zipped = fetch(&format!("{base}/zipped/rios.shp"), 1 << 20).unwrap();
+    assert!(zipped.starts_with(b"PK\x03\x04"));
+    assert!(!asked.lock().unwrap().iter().any(|a| a.starts_with("/zipped/rios.dbf")));
+    let id = s.download_started();
+    assert!(s.download_landed(id, fetch(&url, 1 << 20).unwrap()));
+    let mark = s.notice_mark();
+    let r = s.run("layer.addDownload", &json!({"id": id, "url": url, "name": "Pela janela"})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    assert!(s.map().layer_by_name("Pela janela").is_some());
+    let said = s.notices_since(mark);
+    assert!(!said.iter().any(|n| n.text.contains("optional files")), "{said:?}");
+    // Through the app too, what was left out is said.
+    let plain = format!("{base}/plain/rios.shp");
+    let id = s.download_started();
+    assert!(s.download_landed(id, fetch(&plain, 1 << 20).unwrap()));
+    let mark = s.notice_mark();
+    s.run("layer.addDownload", &json!({"id": id, "url": plain, "name": "Sem prj pela janela"})).unwrap();
+    let said = s.notices_since(mark);
+    assert!(said.iter().any(|n| n.text.contains("no .prj, .cpg found or readable beside it (2 of 3")), "{said:?}");
+    // A download too large for the budget together is refused: the .shp and .dbf land, and the
+    // .shx goes over the 2 bytes left, named without the address's token.
+    let e = fetch(&url, 200).unwrap_err();
+    assert!(
+        e.contains("/PI_2211001_RIOS.shx")
+            && e.ends_with(": larger than 2 bytes, what the .shp and the parts before it left of the download limit")
+            && !e.contains("token=1"),
+        "{e}"
+    );
+    // Within the parts' own size, the zip's records go over.
+    let exact: usize = parts.iter().map(|(_, b)| b.len()).sum();
+    assert_eq!(fetch(&url, exact).unwrap_err(), format!("larger than {exact} bytes, zipped"));
+    // The app's parts too: a page answering for a part leaves it out, and a keyed part refused
+    // fails, named without its signature.
+    assert_eq!(fetch(&format!("{base}/spa/pagina.shp"), 1 << 20).unwrap_err(), "a web page answered, not a .shp");
+    let zip = fetch(&format!("{base}/spa/rios.shp"), 1 << 20).unwrap();
+    assert_eq!(rustgis_data::io::shapefile_zip_lacks(&zip), [("rios.shp".to_string(), vec!["prj", "cpg"])]);
+    let e = fetch(&format!("{base}/signed/rios.shp?sig=1"), 1 << 20).unwrap_err();
+    assert!(e.contains("/signed/rios.prj") && e.contains("403") && !e.contains("sig=1"), "{e}");
+}
+
 /// Data added by its web address: the format from the address or, without one, the contents; a
 /// page that isn't data, a missing file and a forbidden address are refused.
 #[test]
@@ -25966,6 +26207,140 @@ fn a_pdf_says_which_frames_and_pages_it_draws_as_pictures() {
     );
 }
 
+/// Calculate Field keeps a decimal result as it is in a decimal field, rather than rounding it to
+/// the six places its text shows, and says what a whole-number field cuts: a fraction, or a number
+/// past the 64-bit range (null). Results the field holds give no notice.
+#[test]
+fn calculate_field_keeps_decimals_and_says_what_whole_numbers_cut() {
+    use rustgis_data::Value as V;
+    let mut s = Session::new(Project::default());
+    let points = json!({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"y": 2020, "t": "2.7"}, "geometry": {"type": "Point", "coordinates": [0, 0]}},
+        {"type": "Feature", "properties": {"y": 14, "t": "12"}, "geometry": {"type": "Point", "coordinates": [1, 0]}},
+        {"type": "Feature", "properties": {"y": -15, "t": "n/a"}, "geometry": {"type": "Point", "coordinates": [2, 0]}}]});
+    s.run("layer.addDataText", &json!({"fileName": "calc.geojson", "text": points.to_string()})).unwrap();
+    s.run("edit.addField", &json!({"layer": "calc", "name": "d", "type": "double"})).unwrap();
+    s.run("edit.addField", &json!({"layer": "calc", "name": "i", "type": "long"})).unwrap();
+    // Each run's notices, and the field's values after it.
+    fn calc(s: &mut Session, field: &str, expression: &str) -> (Vec<String>, Vec<V>) {
+        let mark = s.notice_mark();
+        s.run("edit.calculateField", &json!({"layer": "calc", "field": field, "expression": expression})).unwrap();
+        let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        let ds = &s.map().layer_by_name("calc").unwrap().dataset;
+        let fi = ds.field_index(field).unwrap();
+        (notices, (0..3).map(|r| ds.value(r, fi).clone()).collect::<Vec<V>>())
+    }
+    let none: Vec<String> = Vec::new();
+    // Decimals as they are: a third, a billionth, and one past what six places times a million hold.
+    let third = 1.0 / 3.0;
+    assert_eq!(calc(&mut s, "d", "1 / 3"), (none.clone(), vec![V::Float(third); 3]));
+    let billionths = [2020.0, 14.0, -15.0].map(|y: f64| V::Float(y * 0.000000001)).to_vec();
+    assert_eq!(calc(&mut s, "d", "y * 0.000000001"), (none.clone(), billionths));
+    assert_eq!(calc(&mut s, "d", "y * 1e300").1[0], V::Float(2020.0 * 1e300), "not infinite");
+    assert_eq!(calc(&mut s, "d", "y / 2"), (none.clone(), vec![V::Float(1010.0), V::Float(7.0), V::Float(-7.5)]));
+    // A whole-number field: 2020 / 7 and -15 / 7 lose their fraction (toward zero); 14 / 7 is 2.
+    let cut = |n: &str| {
+        let their = if n.starts_with("1 ") { "its" } else { "their" };
+        format!("Calculate Field: 'i' holds whole numbers, so {n} lost {their} fraction")
+    };
+    assert_eq!(calc(&mut s, "i", "y / 7"), (vec![cut("2 results")], vec![V::Int(288), V::Int(2), V::Int(-2)]));
+    assert_eq!(calc(&mut s, "i", "y * 2"), (none.clone(), vec![V::Int(4040), V::Int(28), V::Int(-30)]));
+    // Past the 64-bit range: null, and said; 14e17 and -15e17 fit, exactly.
+    let past = |n: &str| format!("Calculate Field: 'i' is null for {n} past the 64-bit integer range");
+    let (notices, values) = calc(&mut s, "i", "y * 1e17");
+    assert_eq!(notices, [past("1 result")]);
+    assert_eq!(values, [V::Null, V::Int(1_400_000_000_000_000_000), V::Int(-1_500_000_000_000_000_000)]);
+    assert_eq!(calc(&mut s, "i", "y * 1e18").0, [past("3 results")]);
+    // The range's ends: -2^63 is i64::MIN; 2^63 is one past i64::MAX.
+    assert_eq!(calc(&mut s, "i", "y * 0 - 9223372036854775808"), (none.clone(), vec![V::Int(i64::MIN); 3]));
+    assert_eq!(calc(&mut s, "i", "y * 0 + 9223372036854775808"), (vec![past("3 results")], vec![V::Null; 3]));
+    // Text written as a number: a decimal loses its fraction, a whole number is exact; text that
+    // isn't a number is null, as before.
+    assert_eq!(calc(&mut s, "i", "t"), (vec![cut("1 result")], vec![V::Int(2), V::Int(12), V::Null]));
+    // Decimal text at the range's ends is read from its digits: i64::MAX written with ".0" fits,
+    // and a fraction on i64::MIN is cut, not taken as one past the range.
+    s.run("edit.addField", &json!({"layer": "calc", "name": "t2", "type": "text"})).unwrap();
+    let texts = |s: &mut Session, values: [&str; 3]| {
+        for (row, v) in values.iter().enumerate() {
+            s.run("edit.setValue", &json!({"layer": "calc", "row": row, "field": "t2", "value": v})).unwrap();
+        }
+    };
+    texts(&mut s, ["9223372036854775807.0", "-9223372036854775808.9", "-.5"]);
+    assert_eq!(calc(&mut s, "i", "t2"), (vec![cut("2 results")], vec![V::Int(i64::MAX), V::Int(i64::MIN), V::Int(0)]));
+    texts(&mut s, ["9223372036854775808.0", "12.000", "1.5e3"]);
+    assert_eq!(calc(&mut s, "i", "t2"), (vec![past("1 result")], vec![V::Null, V::Int(12), V::Int(1500)]));
+    // Whole-number text past the range is read from its digits too: just below i64::MIN is past
+    // it, though as a decimal it rounds to -2^63, which is i64::MIN.
+    texts(&mut s, ["-9223372036854775809", "-9223372036854775900", "+9223372036854775808"]);
+    assert_eq!(calc(&mut s, "i", "t2"), (vec![past("3 results")], vec![V::Null; 3]));
+    // Words the decimal reader takes aren't numbers written as text: null, said as not numbers,
+    // not as past the range; a number too large for a decimal is past it.
+    texts(&mut s, ["NaN", "inf", "1e400"]);
+    let not_numbers = "Calculate Field: 'i' is null for 2 results that aren't numbers".to_string();
+    assert_eq!(calc(&mut s, "i", "t2"), (vec![past("1 result"), not_numbers], vec![V::Null; 3]));
+    // With an exponent, text is read as a decimal: 0.25 loses its fraction, 3 is whole.
+    texts(&mut s, ["2.5e-1", "3e0", "-"]);
+    assert_eq!(calc(&mut s, "i", "t2"), (vec![cut("1 result")], vec![V::Int(0), V::Int(3), V::Null]));
+    // Other commands that write a number into a whole-number field keep their earlier conversion
+    // past the range (the range's end): only Calculate Field and calculation rules say what they
+    // cut, and make such a result null.
+    s.run("edit.setValue", &json!({"layer": "calc", "row": 2, "field": "i", "value": 1e30})).unwrap();
+    s.run("edit.setValue", &json!({"layer": "calc", "row": 1, "field": "d", "value": third})).unwrap();
+    let ds = &s.map().layer_by_name("calc").unwrap().dataset;
+    assert_eq!(ds.value(2, ds.field_index("i").unwrap()), &V::Int(i64::MAX));
+    assert_eq!(ds.value(1, ds.field_index("d").unwrap()), &V::Float(third), "a decimal set as it is");
+    // One fraction: the singular.
+    s.run("select.byAttributes", &json!({"layer": "calc", "where": "y = 2020"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("edit.calculateField", &json!({"layer": "calc", "field": "i", "expression": "y / 7"})).unwrap();
+    let notices: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    assert_eq!(notices, ["Calculate Field: 'i' holds whole numbers, so 1 result lost its fraction"]);
+
+    // A data-design calculation rule writes through the same conversion, and says so on each edit
+    // it cuts, once the edit is kept.
+    s.run("select.clear", &json!({})).unwrap();
+    let rule = json!({"layer": "calc", "name": "Seventh", "kind": "calculation", "field": "i", "expression": "y / 7"});
+    s.run("data.attributeRule", &rule).unwrap();
+    let edit = |s: &mut Session, y: i64| {
+        let mark = s.notice_mark();
+        s.run("edit.setValue", &json!({"layer": "calc", "row": 1, "field": "y", "value": y})).map(|_| ())?;
+        let ds = &s.map().layer_by_name("calc").unwrap().dataset;
+        let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        Ok::<_, String>((notices, ds.value(1, ds.field_index("i").unwrap()).clone()))
+    };
+    let rule_cut = "Attribute rule Seventh: 'i' holds whole numbers, so 1 result lost its fraction".to_string();
+    assert_eq!(edit(&mut s, 15), Ok((vec![rule_cut], V::Int(2))));
+    assert_eq!(edit(&mut s, 21), Ok((none.clone(), V::Int(3))));
+    let rule = json!({"layer": "calc", "name": "Huge", "kind": "calculation", "field": "d", "expression": "y / 3"});
+    s.run("data.attributeRule", &rule).unwrap();
+    let d = |s: &Session| {
+        let ds = &s.map().layer_by_name("calc").unwrap().dataset;
+        ds.value(1, ds.field_index("d").unwrap()).clone()
+    };
+    edit(&mut s, 22).unwrap();
+    assert_eq!(d(&s), V::Float(22.0 / 3.0), "a decimal rule's result as it is");
+    // Each step says what it cut, even when a later rule writes the same field: the later rule may
+    // read the cut value (here `i * 2` reads Seventh's 2, from 15 / 7).
+    let rule = json!({"layer": "calc", "name": "Double", "kind": "calculation", "field": "i", "expression": "i * 2"});
+    s.run("data.attributeRule", &rule).unwrap();
+    let seventh = |n: &str| {
+        let their = if n.starts_with("1 ") { "its" } else { "their" };
+        format!("Attribute rule Seventh: 'i' holds whole numbers, so {n} lost {their} fraction")
+    };
+    assert_eq!(edit(&mut s, 15), Ok((vec![seventh("1 result")], V::Int(4))));
+    // Calculate Field says what it cut too, after the rules that ran in its edit.
+    let (notices, values) = calc(&mut s, "i", "y / 7");
+    assert_eq!((notices, values[1].clone()), (vec![seventh("3 results"), cut("3 results")], V::Int(4)));
+    s.run("data.attributeRule", &json!({"layer": "calc", "name": "Double", "remove": true})).unwrap();
+    s.run("data.attributeRule", &json!({"layer": "calc", "name": "Seventh", "remove": true})).unwrap();
+    // A rejected edit changes nothing, and says nothing of the rule.
+    let limit = json!({"layer": "calc", "name": "Small", "kind": "constraint", "expression": "y < 100"});
+    s.run("data.attributeRule", &limit).unwrap();
+    let mark = s.notice_mark();
+    assert!(s.run("edit.setValue", &json!({"layer": "calc", "row": 1, "field": "y", "value": 101})).is_err());
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.starts_with("Attribute rule")), "{:?}", s.notices_since(mark));
+}
+
 /// Viewshed and Interpolate made on another thread, as the Analysis pane runs them (#1291 step 3):
 /// the raster handed over (`ran`) is the one the command makes here, a cancelled run is an error
 /// saying so, and a run whose project was closed meanwhile adds nothing.
@@ -26041,6 +26416,76 @@ fn analysis_workflows_run_on_another_thread() {
     s.run("project.new", &Value::Null).unwrap();
     assert_eq!(raster_land(&mut s, id, made), Ok(false));
     assert!(raster_start(&mut s, "analysis.lineOfSight", &p).is_err());
+}
+
+/// The Analysis pane's single-pass raster tools made on another thread (#1291 step 3): each raster
+/// handed over (`ran`) is the one its command makes here, bit for bit and with what the command
+/// says of it besides, and a cancelled run is an error saying so.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn raster_tools_run_on_another_thread() {
+    use crate::cmd::workflows::{raster_land, raster_start, runs_in_background};
+    use rustgis_analysis::control::Control;
+    let mut s = world();
+    s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+    let dem = s.map().layers.iter().find(|l| l.is_raster()).unwrap().name.clone();
+    s.run("raster.function", &json!({"layer": dem, "function": "bandMath", "expression": "b1 + 10", "name": "dem_later"})).unwrap();
+    s.run("layer.template", &json!({"template": "polygons", "name": "Training"})).unwrap();
+    for (name, x) in [("low", 10.002), ("high", 10.018)] {
+        s.run("edit.addFeature", &json!({"layer": "Training", "geometry": {"type": "Polygon", "coordinates": [[[x, 45.018], [x + 0.004, 45.018], [x + 0.004, 45.022], [x, 45.022], [x, 45.018]]]}, "attributes": {"name": name}})).unwrap();
+    }
+    s.run("imagery.workspace", &json!({"kind": "ortho", "name": "Valley", "images": [dem, "dem_later"], "cellSize": 0.002})).unwrap();
+    let pixels = |s: &Session, v: &Value| -> Vec<u32> {
+        let l = s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap();
+        l.raster.as_ref().unwrap().data.as_ref().unwrap().bands.iter().flat_map(|b| b.data.iter().map(|x| x.to_bits())).collect()
+    };
+    let ranges = json!([[f64::MIN, 300.0, 1], [300.0, f64::MAX, 10]]);
+    for (command, p) in [
+        ("raster.function", json!({"layer": dem, "function": "hillshade"})),
+        ("raster.function", json!({"layer": dem, "function": "resample", "target": "dem_later"})),
+        ("raster.functionChain", json!({"layer": dem, "steps": [{"function": "slope"}, {"function": "threshold", "value": 5}]})),
+        (
+            "analysis.suitability",
+            json!({"criteria": [{"layer": dem, "ranges": ranges, "weight": 2}, {"layer": "dem_later", "ranges": ranges}]}),
+        ),
+        ("raster.change", json!({"before": dem, "after": "dem_later", "method": "percent"})),
+        ("raster.classifySupervised", json!({"layer": dem, "training": "Training", "classField": "name"})),
+        ("raster.index", json!({"layer": dem, "index": "ndvi", "nir": 1, "red": 1})),
+        ("raster.process", json!({"layer": dem, "operation": "clip", "polygon": "Training"})),
+        ("raster.process", json!({"layer": dem, "operation": "clip", "extent": [10.005, 45.005, 10.02, 45.02]})),
+        ("raster.process", json!({"layer": dem, "operation": "resample", "factor": 4})),
+        ("imagery.mosaic", json!({"name": "Valley"})),
+    ] {
+        assert!(runs_in_background(command).is_some(), "{command}");
+        let here = s.run(command, &p).unwrap();
+        let run = raster_start(&mut s, command, &p).unwrap();
+        let id = run.id;
+        let made = std::thread::spawn(move || run.run(&Control::new())).join().unwrap().unwrap();
+        assert_eq!(raster_land(&mut s, id, made), Ok(true));
+        let mut with = p.clone();
+        with["ran"] = json!(id);
+        let there = s.run(command, &with).unwrap();
+        assert_eq!(pixels(&s, &here), pixels(&s, &there), "{command} {p}");
+        let besides = |v: &Value| {
+            v.as_object().map(|o| o.iter().filter(|(k, _)| *k != "layer").map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())
+        };
+        assert_eq!(besides(&here), besides(&there), "{command} {p}");
+        // The answer is the added layer's, whatever else the command says.
+        assert!(there["width"].is_u64() && there["bands"].is_u64(), "{command}: {there}");
+        let run = raster_start(&mut s, command, &p).unwrap();
+        let control = Control::new();
+        control.cancel();
+        let e = run.run(&control).err().unwrap();
+        assert!(e.contains("was cancelled"), "{command}: {e}");
+    }
+    // Their inputs are read when they start: a missing one is refused then.
+    assert!(raster_start(&mut s, "raster.change", &json!({"before": dem, "after": "nowhere"})).err().unwrap().contains("nowhere"));
+    assert!(raster_start(&mut s, "imagery.mosaic", &json!({"name": "Hill"})).err().unwrap().contains("Hill"));
+    assert!(raster_start(&mut s, "raster.change", &json!({"before": dem, "after": "dem_later", "band": 2})).is_err());
+    let none = json!({"layer": dem, "training": "Training", "classField": "name", "bands": []});
+    assert!(raster_start(&mut s, "raster.classifySupervised", &none).err().unwrap().contains("at least one band"));
+    // Pixels edited by hand stay immediate.
+    assert!(runs_in_background("raster.editPixels").is_none());
 }
 
 /// k-means classes and a deep learning classification made on another thread, as the Analysis pane
