@@ -196,11 +196,12 @@ fn whole(f: f64) -> (Value, Cut, Option<f64>) {
     (Value::Int(t as i64), if t == f { Cut::None } else { Cut::Fraction }, None)
 }
 
-/// Text written as a decimal without an exponent ("-12.50", ".5"), as a whole number toward zero
-/// read from its digits, exactly up to the 64-bit range's ends, and what that took. None for
-/// other text.
+/// Text written as a whole number or as a decimal without an exponent ("-12.50", ".5"), as a
+/// whole number toward zero read from its digits, exactly up to the 64-bit range's ends, and what
+/// that took. None for other text. A whole number just past i64::MIN is past the range here, where
+/// read as a decimal it would round to -2^63, which is i64::MIN.
 fn decimal_text(t: &str) -> Option<(Value, Cut)> {
-    let (int, frac) = t.split_once('.')?;
+    let (int, frac) = t.split_once('.').unwrap_or((t, ""));
     let digits = int.strip_prefix(['-', '+']).unwrap_or(int);
     if !digits.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) || digits.len() + frac.len() == 0 {
         return None;
@@ -517,6 +518,12 @@ mod tests {
         assert_eq!(coerce_cut(Value::Float(f64::INFINITY), FieldType::Integer), (Value::Null, Cut::Range));
         assert_eq!(coerce(Value::Float(-1e30), FieldType::Integer), Value::Int(i64::MIN));
         assert_eq!(coerce(Value::Float(0.1 + 0.2), FieldType::Double), Value::Float(0.1 + 0.2));
+        // Text past the range, whole or decimal: null where it's said, at the range's end elsewhere.
+        let text = |t: &str| Value::Text(t.into());
+        assert_eq!(coerce_cut(text("-9223372036854775809"), FieldType::Integer), (Value::Null, Cut::Range));
+        assert_eq!(coerce(text("-9223372036854775809"), FieldType::Integer), Value::Int(i64::MIN));
+        assert_eq!(coerce(text("9223372036854775808"), FieldType::Integer), Value::Int(i64::MAX));
+        assert_eq!(coerce(text("9223372036854775808.0"), FieldType::Integer), Value::Int(i64::MAX));
         // One notice per kind, singular or plural.
         let mut cuts = Cuts::default();
         assert!(cuts.notices("Calculate Field", "n").is_empty());

@@ -25791,6 +25791,10 @@ fn calculate_field_keeps_decimals_and_says_what_whole_numbers_cut() {
     assert_eq!(calc(&mut s, "i", "t2"), (vec![cut("2 results")], vec![V::Int(i64::MAX), V::Int(i64::MIN), V::Int(0)]));
     texts(&mut s, ["9223372036854775808.0", "12.000", "1.5e3"]);
     assert_eq!(calc(&mut s, "i", "t2"), (vec![past("1 result")], vec![V::Null, V::Int(12), V::Int(1500)]));
+    // Whole-number text past the range is read from its digits too: just below i64::MIN is past
+    // it, though as a decimal it rounds to -2^63, which is i64::MIN.
+    texts(&mut s, ["-9223372036854775809", "-9223372036854775900", "+9223372036854775808"]);
+    assert_eq!(calc(&mut s, "i", "t2"), (vec![past("3 results")], vec![V::Null; 3]));
     // Words the decimal reader takes aren't numbers written as text: null, said as not numbers,
     // not as past the range; a number too large for a decimal is past it.
     texts(&mut s, ["NaN", "inf", "1e400"]);
