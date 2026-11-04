@@ -854,7 +854,7 @@ features were checked.
 | `rings_intersect` | Two rings of one polygon overlap or touch along a line |
 | `disconnected_interior` | Rings of one polygon touch at points so that they cut its interior into pieces, such as a hole touching the exterior ring at two points, or three holes each touching the next |
 | `parts_overlap` | Two polygons of one multipart feature overlap or touch along a line |
-| `too_complex` | The feature couldn't be checked fully for crossings and overlaps: it needs more work than the tool spends on one feature, or the geo library's relate operation failed on some of its rings or parts (`detail` says which of the two, not which rings or parts). The tool says how many features each reason left out |
+| `too_complex` | Some of the feature's checks were left out: it needs more work than the tool spends on one feature, there wasn't enough memory to check it, or the geo library's relate operation failed on some of its rings or parts (`detail` says which of the three, not which rings or parts). The checks of each ring's points still run. The tool says how many features each reason left out |
 
 Codes are listed in this order, and are never translated. The checks work in stored
 coordinates, without projection. Lines may cross themselves, so only polygon rings are checked

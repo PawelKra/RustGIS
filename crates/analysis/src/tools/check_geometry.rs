@@ -1,7 +1,7 @@
 //! Check Geometry: a new layer of the features whose geometry breaks the OGC Simple Features rules,
 //! each with what is wrong ([`crate::validity`]), in stored coordinates.
 use super::*;
-use crate::validity::{self, Code, Limit, Problem};
+use crate::validity::{self, Checked, Code, Limit, Problem};
 
 const TOOL: &str = "Check Geometry";
 /// The most problems one feature's `detail` describes; the rest are counted.
@@ -11,7 +11,7 @@ const MAX_DETAILS: usize = 20;
 /// their attributes and two text fields: the problem codes and their description. A geometry
 /// with non-finite coordinates is written without geometry, so it can't spoil the layer's extent.
 pub(super) fn run(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
-    run_with_room(inp, p, web_has_room)
+    run_with_room(inp, p, web_has_room, |g| validity::check(g, validity::MAX_WORK))
 }
 
 /// A checked feature with problems, before it is copied to the output.
@@ -33,6 +33,8 @@ struct Tally {
     counts: [usize; Code::ALL.len()],
     /// Features not checked fully because they needed more than the work limit.
     work_limit: usize,
+    /// Features not checked fully because the memory for their checks couldn't be had.
+    memory: usize,
     /// Features not checked fully because geo's relate failed on some of their rings or parts.
     relate_failed: usize,
     /// Features whose rings or parts weren't all checked against each other.
@@ -42,8 +44,13 @@ struct Tally {
 }
 
 /// [`run`], asking `has_room` whether the browser can give the output's memory (see
-/// [`web_has_room`]) before any feature is copied.
-fn run_with_room(inp: &dyn Inputs, p: &Json, has_room: impl FnOnce(u64) -> bool) -> Result<ToolResult, String> {
+/// [`web_has_room`]) before any feature is copied, and checking each geometry with `check`.
+fn run_with_room(
+    inp: &dyn Inputs,
+    p: &Json,
+    has_room: impl FnOnce(u64) -> bool,
+    check: impl Fn(Option<&Geometry>) -> Checked,
+) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
         return Err(format!("{TOOL} needs a layer with geometry: '{}' is a table", ds.name));
@@ -69,15 +76,16 @@ fn run_with_room(inp: &dyn Inputs, p: &Json, has_room: impl FnOnce(u64) -> bool)
         out.fields.push(Field::new(&name, FieldType::Text));
     }
 
-    // The checks first, keeping only what the output needs of the features with problems.
+    // The checks first, keeping only what the output needs of the features with problems, in
+    // memory allocated fallibly as the copies below are.
     let mut tally = Tally { checked: rows.len(), ..Tally::default() };
-    let mut found = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
     crate::control::begin(rows.len());
     for (i, row) in rows.iter().enumerate() {
         crate::control::check()?;
         crate::control::reached(i);
         let Some(f) = ds.features.get(*row) else { continue };
-        let checked = validity::check(f.geometry.as_ref(), validity::MAX_WORK);
+        let checked = check(f.geometry.as_ref());
         tally.unrelated += usize::from(checked.unrelated);
         let codes = checked.codes();
         if codes.is_empty() {
@@ -91,14 +99,16 @@ fn run_with_room(inp: &dyn Inputs, p: &Json, has_room: impl FnOnce(u64) -> bool)
         }
         let limit = |limit: Limit| checked.problems.contains(&Problem::TooComplex { limit });
         tally.work_limit += usize::from(limit(Limit::Work));
+        tally.memory += usize::from(limit(Limit::Memory));
         tally.relate_failed += usize::from(limit(Limit::Relate));
         tally.extra += usize::from(f.attrs.len() > width);
-        found.push(Found {
-            row: *row,
-            problem: codes.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
-            detail: details(&checked.problems),
-            non_finite: codes.contains(&Code::NonFiniteCoordinate),
-        });
+        let no_memory =
+            |e: TryReserveError| format!("{TOOL}: not enough memory for the {} with problems found so far: {e}", features(tally.found));
+        let names: Vec<&str> = codes.iter().map(|c| c.as_str()).collect();
+        let problem = joined(&names, ", ").map_err(no_memory)?;
+        let detail = details(&checked.problems).map_err(no_memory)?;
+        found.try_reserve(1).map_err(no_memory)?;
+        found.push(Found { row: *row, problem, detail, non_finite: codes.contains(&Code::NonFiniteCoordinate) });
     }
 
     // Then the copies, once the memory for them is known to be there: in the browser, whose memory
@@ -183,9 +193,17 @@ fn notices(t: &Tally, problem: &str) -> Vec<String> {
     }
     if t.work_limit > 0 {
         messages.push(format!(
-            "{TOOL}: {} could not be checked fully for crossings and overlaps (too complex for the work limit); {} in the output as too_complex",
+            "{TOOL}: {} could not be checked fully (too complex for the work limit); {} in the output as too_complex",
             features(t.work_limit),
             they(t.work_limit)
+        ));
+    }
+    if t.memory > 0 {
+        messages.push(format!(
+            "{TOOL}: {} could not be checked fully, because there wasn't enough memory to check {}; {} in the output as too_complex",
+            features(t.memory),
+            if t.memory == 1 { "it" } else { "them" },
+            they(t.memory)
         ));
     }
     if t.relate_failed > 0 {
@@ -229,18 +247,49 @@ fn summary(found: usize, checked: usize, counts: &[usize]) -> String {
 
 /// The descriptions of a feature's problems, joined with "; ": the first [`MAX_DETAILS`], then how
 /// many more there are.
-fn details(problems: &[validity::Problem]) -> String {
+fn details(problems: &[validity::Problem]) -> Result<String, TryReserveError> {
     let mut parts: Vec<String> = problems.iter().take(MAX_DETAILS).map(validity::Problem::describe).collect();
     let more = problems.len().saturating_sub(MAX_DETAILS);
     if more > 0 {
         parts.push(format!("and {more} more problem{}", if more == 1 { "" } else { "s" }));
     }
-    parts.join("; ")
+    joined(&parts, "; ")
+}
+
+/// `parts` joined with `sep`, in a string allocated fallibly at its exact length: it is kept until
+/// the output is copied.
+fn joined<S: AsRef<str>>(parts: &[S], sep: &str) -> Result<String, TryReserveError> {
+    let seps = sep.len().saturating_mul(parts.len().saturating_sub(1));
+    let len = parts.iter().map(|p| p.as_ref().len()).fold(seps, usize::saturating_add);
+    let mut s = String::new();
+    s.try_reserve_exact(len)?;
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            s.push_str(sep);
+        }
+        s.push_str(part.as_ref());
+    }
+    Ok(s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check(g: Option<&Geometry>) -> Checked {
+        validity::check(g, validity::MAX_WORK)
+    }
+
+    /// The inputs: one layer, with nothing selected.
+    struct One(Dataset);
+    impl Inputs for One {
+        fn dataset(&self, _: &str) -> Option<&Dataset> {
+            Some(&self.0)
+        }
+        fn selection(&self, _: &str) -> &[usize] {
+            &[]
+        }
+    }
 
     fn too_complex(work_limit: usize, relate_failed: usize, both: usize) -> Tally {
         let mut counts = [0; Code::ALL.len()];
@@ -265,10 +314,22 @@ mod tests {
             notices(&too_complex(2, 3, 1), "problem"),
             [
                 "Check Geometry: 4 of 9 features have problems (too_complex: 4)",
-                "Check Geometry: 2 features could not be checked fully for crossings and overlaps (too complex for the work limit); they are in the output as too_complex",
+                "Check Geometry: 2 features could not be checked fully (too complex for the work limit); they are in the output as too_complex",
                 "Check Geometry: some rings or parts of 3 features could not be checked against each other, because geo's relate operation failed on them; they are in the output as too_complex",
             ]
         );
+        let mut memory = too_complex(0, 0, 0);
+        for n in [1, 2] {
+            memory.memory = n;
+            assert_eq!(
+                notices(&memory, "problem").get(1).map(String::as_str),
+                Some(if n == 1 {
+                    "Check Geometry: 1 feature could not be checked fully, because there wasn't enough memory to check it; it is in the output as too_complex"
+                } else {
+                    "Check Geometry: 2 features could not be checked fully, because there wasn't enough memory to check them; they are in the output as too_complex"
+                })
+            );
+        }
         let t = Tally { checked: 2, found: 2, unrelated: 2, ..Tally::default() };
         assert_eq!(
             notices(&t, "problem_2").last().map(String::as_str),
@@ -286,22 +347,18 @@ mod tests {
         let bowtie = vec![Coord::new(0., 0.), Coord::new(2., 2.), Coord::new(2., 0.), Coord::new(0., 2.), Coord::new(0., 0.)];
         ds.push_next(Some(Geometry::Polygon(vec![vec![bowtie]])), vec![Value::Text("x".repeat(1 << 21))]);
         ds.push_next(Some(Geometry::Point(Coord::new(1., 1.))), vec![Value::Text("fine".into())]);
-        struct One(Dataset);
-        impl Inputs for One {
-            fn dataset(&self, _: &str) -> Option<&Dataset> {
-                Some(&self.0)
-            }
-            fn selection(&self, _: &str) -> &[usize] {
-                &[]
-            }
-        }
         let inp = One(ds);
         let p = serde_json::json!({"input": "input"});
         let mut asked = 0;
-        let r = run_with_room(&inp, &p, |need| {
-            asked = need;
-            true
-        })
+        let r = run_with_room(
+            &inp,
+            &p,
+            |need| {
+                asked = need;
+                true
+            },
+            check,
+        )
         .unwrap();
         let Output::Layer(out) = &r.output else { panic!("a layer") };
         assert_eq!(out.features.len(), 1);
@@ -313,10 +370,60 @@ mod tests {
             + 3 * ALLOCATION_OVERHEAD;
         assert!(row > 1 << 21);
         assert_eq!(asked, row + added + 2 * geometry);
-        let e = run_with_room(&inp, &p, |_| false).err().unwrap();
+        let e = run_with_room(&inp, &p, |_| false, check).err().unwrap();
         assert_eq!(
             e,
             "Check Geometry: the 1 feature with problems would need about 3 MiB, more than the browser can give now: select fewer features"
         );
+    }
+
+    /// A feature whose checks couldn't have the memory they need is in the output as too_complex,
+    /// with that reason and its own notice, and with what the checks that copy nothing found.
+    #[test]
+    fn features_without_memory_for_their_checks_are_too_complex_never_valid() {
+        let ring = |pts: &[(f64, f64)]| pts.iter().map(|&(x, y)| Coord::new(x, y)).collect::<Vec<_>>();
+        let mut ds = Dataset::new("input", GeometryType::Polygon, vec![]);
+        let square = ring(&[(0., 0.), (1., 0.), (1., 1.), (0., 1.), (0., 0.)]);
+        let open = ring(&[(0., 0.), (1., 0.), (1., 0.), (1., 1.)]);
+        ds.push_next(Some(Geometry::Polygon(vec![vec![square.clone()]])), vec![]);
+        ds.push_next(Some(Geometry::Polygon(vec![vec![open]])), vec![]);
+        ds.push_next(Some(Geometry::Point(Coord::new(1., 1.))), vec![]);
+        let inp = One(ds);
+        let p = serde_json::json!({"input": "input"});
+        let refused = |g: Option<&Geometry>| validity::check_with(g, validity::MAX_WORK, &|_| false);
+        let r = run_with_room(&inp, &p, |_| true, refused).unwrap();
+        let Output::Layer(out) = &r.output else { panic!("a layer") };
+        let rows: Vec<(String, String)> = out.features.iter().map(|f| (f.attrs[0].to_string(), f.attrs[1].to_string())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("too_complex".to_string(), "not checked fully: not enough memory to check it".to_string()),
+                (
+                    "ring_not_closed, repeated_vertex, too_complex".to_string(),
+                    "exterior ring of part 1 is not closed; 1 repeated vertex in exterior ring of part 1; not checked fully: not enough memory to check it".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            r.messages,
+            [
+                "Check Geometry: 2 of 3 features have problems (ring_not_closed: 1, repeated_vertex: 1, too_complex: 2)",
+                "Check Geometry: 2 features could not be checked fully, because there wasn't enough memory to check them; they are in the output as too_complex",
+            ]
+        );
+        // With the memory, the square is fine.
+        let r = run_with_room(&inp, &p, |_| true, check).unwrap();
+        let Output::Layer(out) = &r.output else { panic!("a layer") };
+        assert_eq!(out.features.len(), 1);
+    }
+
+    /// The strings kept for the output are joined at their exact length.
+    #[test]
+    fn joined_strings_are_reserved_at_their_length() {
+        let s = joined(&["self_intersection", "too_complex"], ", ").unwrap();
+        assert_eq!(s, "self_intersection, too_complex");
+        assert_eq!(s.capacity(), s.len());
+        assert_eq!(joined::<&str>(&[], "; ").unwrap(), "");
+        assert_eq!(joined(&["one".to_string()], "; ").unwrap(), "one");
     }
 }

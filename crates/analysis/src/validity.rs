@@ -19,7 +19,8 @@
 //!   checked: GeoJSON and Shapefile wind rings in opposite directions.
 //!
 //! The work for one feature is bounded ([`MAX_WORK`]): a feature that needs more is reported as
-//! [`Code::TooComplex`], never taken for valid.
+//! [`Code::TooComplex`], never taken for valid. So is one whose copies for the checks can't be
+//! had: they are reserved fallibly, since in the browser a failed allocation stops the app.
 
 use geo::Relate;
 use geo::coordinate_position::{CoordPos, coord_pos_relative_to_ring};
@@ -151,6 +152,8 @@ pub(crate) enum Contact {
 pub(crate) enum Limit {
     /// It needs more than the work bound.
     Work,
+    /// The memory for its rings' copies, or for the sweep over them, couldn't be had.
+    Memory,
     /// geo's relate failed on two of its rings or parts (only natively: in the browser a failure
     /// can't be caught, and only simple rings are related to keep it from failing).
     Relate,
@@ -180,7 +183,7 @@ pub(crate) enum Problem {
     DisconnectedInterior { part: usize },
     /// Two parts sharing an area or touching along a line (`area` false).
     PartsOverlap { a: usize, b: usize, area: bool },
-    /// Not checked fully for crossings and overlaps.
+    /// Not checked fully: some of the checks of its rings and parts were left out.
     TooComplex { limit: Limit },
 }
 
@@ -255,7 +258,8 @@ impl Problem {
                 format!("the interior of part {} is split into pieces by rings touching at points", part.saturating_add(1))
             }
             Problem::PartsOverlap { a, b, area } => format!("parts {} and {} {}", a.saturating_add(1), b.saturating_add(1), meet(*area)),
-            Problem::TooComplex { limit: Limit::Work } => "too complex to check for crossings and overlaps within the work limit".into(),
+            Problem::TooComplex { limit: Limit::Work } => "not checked fully: too complex for the work limit".into(),
+            Problem::TooComplex { limit: Limit::Memory } => "not checked fully: not enough memory to check it".into(),
             Problem::TooComplex { limit: Limit::Relate } => "some rings or parts couldn't be checked against each other".into(),
         }
     }
@@ -283,6 +287,12 @@ impl Checked {
 /// Checks one geometry in stored coordinates, spending at most `budget` work (see [`MAX_WORK`])
 /// on crossings and overlaps.
 pub(crate) fn check(g: Option<&Geometry>, budget: u64) -> Checked {
+    check_with(g, budget, &|_| true)
+}
+
+/// [`check`], asking `allow` before each reservation of a buffer (with its number of elements)
+/// whether to try it: tests refuse some to stand in for running out of memory.
+pub(crate) fn check_with(g: Option<&Geometry>, budget: u64, allow: &dyn Fn(usize) -> bool) -> Checked {
     let mut out = Checked::default();
     let Some(g) = g else {
         out.problems.push(Problem::Null { missing: true });
@@ -313,7 +323,7 @@ pub(crate) fn check(g: Option<&Geometry>, budget: u64) -> Checked {
             }
             non_finite.report(&mut out.problems);
         }
-        Geometry::Polygon(polys) => polygon(&mut out, polys, budget),
+        Geometry::Polygon(polys) => polygon(&mut out, polys, &mut Work { spent: 0, budget, room: Room(allow) }),
     }
     out.problems.sort_by_key(Problem::key);
     out.problems.dedup();
@@ -382,9 +392,65 @@ fn repeated_vertices(pts: &[Coord]) -> usize {
     pts.windows(2).filter(|w| w.first() == w.get(1)).count()
 }
 
+/// Reserves a feature's buffers fallibly, asking first whether to try (see [`check_with`]).
+#[derive(Clone, Copy)]
+struct Room<'a>(&'a dyn Fn(usize) -> bool);
+
+impl Room<'_> {
+    /// An empty vector with room for `n` elements.
+    fn vec<T>(self, n: usize) -> Result<Vec<T>, Limit> {
+        let mut v = Vec::new();
+        if !(self.0)(n) {
+            return Err(Limit::Memory);
+        }
+        v.try_reserve_exact(n).map_err(|_| Limit::Memory)?;
+        Ok(v)
+    }
+
+    /// At most `n` of `items`, in a vector reserved for `n`, so collecting them allocates nothing more.
+    fn collect<T>(self, n: usize, items: impl Iterator<Item = T>) -> Result<Vec<T>, Limit> {
+        let mut v = self.vec(n)?;
+        v.extend(items.take(n));
+        Ok(v)
+    }
+
+    /// Room for one more entry in the map `m`, growing it as an insert would.
+    fn map<K: Eq + std::hash::Hash, V>(self, m: &mut HashMap<K, V>) -> Result<(), Limit> {
+        if m.len() < m.capacity() {
+            return Ok(());
+        }
+        if !(self.0)(m.len().saturating_add(1)) {
+            return Err(Limit::Memory);
+        }
+        m.try_reserve(1).map_err(|_| Limit::Memory)
+    }
+
+    /// Room for one more element in the set `m`, growing it as an insert would.
+    fn set<K: Eq + std::hash::Hash>(self, m: &mut HashSet<K>) -> Result<(), Limit> {
+        if m.len() < m.capacity() {
+            return Ok(());
+        }
+        if !(self.0)(m.len().saturating_add(1)) {
+            return Err(Limit::Memory);
+        }
+        m.try_reserve(1).map_err(|_| Limit::Memory)
+    }
+
+    /// Room for one more element in `v`, growing it as `push` would.
+    fn grow<T>(self, v: &mut Vec<T>) -> Result<(), Limit> {
+        if v.len() < v.capacity() {
+            return Ok(());
+        }
+        if !(self.0)(v.len().saturating_add(1)) {
+            return Err(Limit::Memory);
+        }
+        v.try_reserve(1).map_err(|_| Limit::Memory)
+    }
+}
+
 /// A ring as the other checks read it: repeated vertices left out, and closed.
-fn closed_ring(pts: &[Coord]) -> geo::LineString<f64> {
-    let mut v: Vec<geo::Coord<f64>> = Vec::with_capacity(pts.len().saturating_add(1));
+fn closed_ring(pts: &[Coord], room: Room) -> Result<geo::LineString<f64>, Limit> {
+    let mut v: Vec<geo::Coord<f64>> = room.vec(pts.len().saturating_add(1))?;
     for c in pts {
         let c = geo::Coord { x: c.x, y: c.y };
         if v.last() != Some(&c) {
@@ -396,7 +462,7 @@ fn closed_ring(pts: &[Coord]) -> geo::LineString<f64> {
     {
         v.push(first);
     }
-    geo::LineString(v)
+    Ok(geo::LineString(v))
 }
 
 /// A segment of a ring, for the sweep.
@@ -427,27 +493,28 @@ impl Seg {
 
 /// The segments in sweep order along the axis that compares fewer pairs (`true`: y), with how many
 /// pairs the sweep compares. The count is exact, so a feature too busy to sweep is known before
-/// any pair is compared.
-fn sweep_order(segs: &[Seg]) -> (Vec<usize>, bool, u64) {
-    let along = |y: bool| {
-        let mut order: Vec<usize> = (0..segs.len()).collect();
+/// any pair is compared. The orders are reserved fallibly and sorted in place (an unstable sort
+/// allocates nothing): which of two equal lower bounds comes first doesn't change the pairs.
+fn sweep_order(segs: &[Seg], room: Room) -> Result<(Vec<usize>, bool, u64), Limit> {
+    let along = |y: bool| -> Result<(Vec<usize>, u64), Limit> {
+        let mut order: Vec<usize> = room.collect(segs.len(), 0..segs.len())?;
         let lo = |i: &usize| segs.get(*i).map_or(0.0, |s| s.lo(y));
-        order.sort_by(|a, b| lo(a).total_cmp(&lo(b)));
-        let los: Vec<f64> = order.iter().map(lo).collect();
+        order.sort_unstable_by(|a, b| lo(a).total_cmp(&lo(b)));
+        let los: Vec<f64> = room.collect(order.len(), order.iter().map(lo))?;
         let mut pairs = 0u64;
         for (k, i) in order.iter().enumerate() {
             let hi = segs.get(*i).map_or(0.0, |s| s.hi(y));
             let rest = los.get(k + 1..).unwrap_or(&[]);
             pairs = pairs.saturating_add(rest.partition_point(|l| *l <= hi) as u64);
         }
-        (order, pairs)
+        Ok((order, pairs))
     };
-    let (x_order, x_pairs) = along(false);
+    let (x_order, x_pairs) = along(false)?;
     if x_pairs <= segs.len() as u64 {
-        return (x_order, false, x_pairs);
+        return Ok((x_order, false, x_pairs));
     }
-    let (y_order, y_pairs) = along(true);
-    if y_pairs < x_pairs { (y_order, true, y_pairs) } else { (x_order, false, x_pairs) }
+    let (y_order, y_pairs) = along(true)?;
+    Ok(if y_pairs < x_pairs { (y_order, true, y_pairs) } else { (x_order, false, x_pairs) })
 }
 
 /// How two different rings or parts meet, from the sweep.
@@ -459,13 +526,14 @@ struct Meet {
     line: bool,
 }
 
-/// Work spent on a feature, against its budget.
-struct Work {
+/// Work spent on a feature, against its budget, and how its buffers are reserved.
+struct Work<'a> {
     spent: u64,
     budget: u64,
+    room: Room<'a>,
 }
 
-impl Work {
+impl Work<'_> {
     /// Spends `n`; false when that is past the budget.
     fn spend(&mut self, n: u64) -> bool {
         self.spent = self.spent.saturating_add(n);
@@ -483,36 +551,60 @@ struct Part {
     clean: bool,
 }
 
-fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
-    let mut work = Work { spent: 0, budget };
-    // Charged before any ring is copied: past the budget, only the checks that copy nothing run.
+/// An empty vector with room for `n` elements, unless the checks have stopped (`stop`), or stop
+/// now for want of memory.
+fn reserved<T>(stop: &mut Option<Limit>, room: Room, n: usize) -> Vec<T> {
+    if stop.is_some() {
+        return Vec::new();
+    }
+    room.vec(n).unwrap_or_else(|limit| {
+        *stop = Some(limit);
+        Vec::new()
+    })
+}
+
+fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], work: &mut Work) {
+    // Charged before any ring is copied. Past the budget, or without the memory for the copies,
+    // only the checks that copy nothing run.
     let coords = polys.iter().flatten().map(Vec::len).fold(0usize, usize::saturating_add);
-    let affordable = work.spend(u64::try_from(coords).unwrap_or(u64::MAX).saturating_mul(VERTEX_COST));
+    let mut stop = (!work.spend(u64::try_from(coords).unwrap_or(u64::MAX).saturating_mul(VERTEX_COST))).then_some(Limit::Work);
+    let room = work.room;
     let mut non_finite = NonFinite::default();
-    let mut parts: Vec<Part> = Vec::with_capacity(polys.len());
+    let mut parts: Vec<Part> = reserved(&mut stop, room, polys.len());
     for (p, rings) in polys.iter().enumerate() {
         if rings.is_empty() {
             out.problems.push(Problem::TooFewPoints { at: At::Part(p), distinct: 0 });
         }
-        let checked = rings
-            .iter()
-            .enumerate()
-            .map(|(r, ring)| {
-                let at = At::Ring(p, r);
-                (non_finite.add(ring, at) && vertex_checks(&mut out.problems, at, ring, true) && affordable).then(|| closed_ring(ring))
-            })
-            .collect::<Vec<_>>();
-        let simple = !checked.is_empty() && checked.iter().all(Option::is_some);
-        parts.push(Part { rings: checked, simple, clean: simple });
+        let mut checked = reserved(&mut stop, room, rings.len());
+        for (r, ring) in rings.iter().enumerate() {
+            let at = At::Ring(p, r);
+            let usable = non_finite.add(ring, at) && vertex_checks(&mut out.problems, at, ring, true);
+            if stop.is_some() {
+                continue;
+            }
+            match usable.then(|| closed_ring(ring, room)).transpose() {
+                // Within the room reserved for the part's rings.
+                Ok(copy) => checked.push(copy),
+                Err(limit) => stop = Some(limit),
+            }
+        }
+        if stop.is_none() {
+            let simple = !checked.is_empty() && checked.iter().all(Option::is_some);
+            parts.push(Part { rings: checked, simple, clean: simple });
+        }
     }
     non_finite.report(&mut out.problems);
-    if !affordable {
-        out.problems.push(Problem::TooComplex { limit: Limit::Work });
+    if let Some(limit) = stop {
+        out.problems.push(Problem::TooComplex { limit });
         return;
     }
 
     let n_segs = parts.iter().flat_map(|p| p.rings.iter().flatten()).map(|r| r.0.len().saturating_sub(1)).fold(0, usize::saturating_add);
-    let mut segs = Vec::with_capacity(n_segs);
+    let Ok(mut segs) = room.vec(n_segs) else {
+        out.problems.push(Problem::TooComplex { limit: Limit::Memory });
+        return;
+    };
+    // Within the room reserved: each ring has as many segments as counted.
     for (p, part) in parts.iter().enumerate() {
         for (r, ring) in part.rings.iter().enumerate() {
             let Some(ring) = ring else { continue };
@@ -520,7 +612,13 @@ fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
             segs.extend(ring.lines().enumerate().map(|(i, l)| Seg { a: l.start, b: l.end, part: p, ring: r, i, n }));
         }
     }
-    let (order, y, pairs) = sweep_order(&segs);
+    let (order, y, pairs) = match sweep_order(&segs, room) {
+        Ok(sweep) => sweep,
+        Err(limit) => {
+            out.problems.push(Problem::TooComplex { limit });
+            return;
+        }
+    };
     if !work.spend(pairs) {
         out.problems.push(Problem::TooComplex { limit: Limit::Work });
         return;
@@ -552,6 +650,10 @@ fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
                 if contact == Contact::Touch && s.next_to(t) {
                     continue;
                 }
+                if !selfx.contains_key(&(s.part, s.ring)) && room.map(&mut selfx).is_err() {
+                    out.problems.push(Problem::TooComplex { limit: Limit::Memory });
+                    return;
+                }
                 let e = selfx.entry((s.part, s.ring));
                 let new = matches!(e, std::collections::hash_map::Entry::Vacant(_));
                 let worst = e.or_insert(contact);
@@ -560,10 +662,18 @@ fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
             } else {
                 let meet = if s.part == t.part {
                     let key = (s.part, s.ring.min(t.ring), s.ring.max(t.ring));
+                    if !rings_meet.contains_key(&key) && room.map(&mut rings_meet).is_err() {
+                        out.problems.push(Problem::TooComplex { limit: Limit::Memory });
+                        return;
+                    }
                     let new = !rings_meet.contains_key(&key);
                     (rings_meet.entry(key).or_default(), new)
                 } else {
                     let key = (s.part.min(t.part), s.part.max(t.part));
+                    if !parts_meet.contains_key(&key) && room.map(&mut parts_meet).is_err() {
+                        out.problems.push(Problem::TooComplex { limit: Limit::Memory });
+                        return;
+                    }
                     let new = !parts_meet.contains_key(&key);
                     (parts_meet.entry(key).or_default(), new)
                 };
@@ -578,6 +688,10 @@ fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
             // One point is usually found by several pairs of segments (it is a vertex): kept once.
             if let Some(at) = at.filter(|_| s.part == t.part && s.ring != t.ring) {
                 for ring in [s.ring, t.ring] {
+                    if !touches.contains(&(s.part, ring, point_key(at))) && room.set(&mut touches).is_err() {
+                        out.problems.push(Problem::TooComplex { limit: Limit::Memory });
+                        return;
+                    }
                     if touches.insert((s.part, ring, point_key(at))) && !work.spend(CONTACT_COST) {
                         out.problems.push(Problem::TooComplex { limit: Limit::Work });
                         return;
@@ -595,12 +709,12 @@ fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
         }
     }
 
-    let related = relate_rings(out, &mut parts, &rings_meet, &mut work).and_then(|()| {
-        disconnected_interiors(out, &parts, touches);
-        relate_parts(out, &parts, &parts_meet, &mut work)
+    let related = relate_rings(out, &mut parts, &rings_meet, work).and_then(|()| {
+        disconnected_interiors(out, &parts, touches, room)?;
+        relate_parts(out, &parts, &parts_meet, work)
     });
-    if related.is_err() {
-        out.problems.push(Problem::TooComplex { limit: Limit::Work });
+    if let Err(limit) = related {
+        out.problems.push(Problem::TooComplex { limit });
     }
 }
 
@@ -615,8 +729,12 @@ fn point_key(c: geo::Coord<f64>) -> (u64, u64) {
 
 /// Reports the clean parts whose interior is split into pieces: those whose rings and touch points
 /// form a graph with a cycle (see the module doc). Each (ring, point) edge is there once.
-fn disconnected_interiors(out: &mut Checked, parts: &[Part], touches: HashSet<Touch>) {
-    let mut touches: Vec<Touch> = touches.into_iter().collect();
+fn disconnected_interiors(out: &mut Checked, parts: &[Part], touches: HashSet<Touch>, room: Room) -> Result<(), Limit> {
+    let n = touches.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let mut touches: Vec<Touch> = room.collect(n, touches.into_iter())?;
     touches.sort_unstable();
     for edges in touches.chunk_by(|a, b| a.0 == b.0) {
         let Some(&(p, ..)) = edges.first() else { continue };
@@ -624,9 +742,13 @@ fn disconnected_interiors(out: &mut Checked, parts: &[Part], touches: HashSet<To
         // Nodes: the part's rings, then its touch points as they come.
         let rings = part.rings.len();
         let mut points: HashMap<(u64, u64), usize> = HashMap::new();
-        let mut sets = Sets((0..rings).collect());
+        // Every node has its place reserved: the rings, and a point for each edge at most.
+        let mut sets = Sets(room.collect(rings.saturating_add(edges.len()), 0..rings)?);
         for &(_, ring, at) in edges {
             let next = rings.saturating_add(points.len());
+            if !points.contains_key(&at) {
+                room.map(&mut points)?;
+            }
             let point = *points.entry(at).or_insert(next);
             if !sets.join(ring, point) {
                 out.problems.push(Problem::DisconnectedInterior { part: p });
@@ -634,6 +756,7 @@ fn disconnected_interiors(out: &mut Checked, parts: &[Part], touches: HashSet<To
             }
         }
     }
+    Ok(())
 }
 
 /// Disjoint sets (union-find) of nodes `0..`, each pointing towards its set's root.
@@ -671,16 +794,8 @@ impl Sets {
     }
 }
 
-/// The work bound was reached.
-struct OverBudget;
-
 /// The interior rings of each simple part against its exterior and each other.
-fn relate_rings(
-    out: &mut Checked,
-    parts: &mut [Part],
-    meets: &HashMap<(usize, usize, usize), Meet>,
-    work: &mut Work,
-) -> Result<(), OverBudget> {
+fn relate_rings(out: &mut Checked, parts: &mut [Part], meets: &HashMap<(usize, usize, usize), Meet>, work: &mut Work) -> Result<(), Limit> {
     for (p, part) in parts.iter_mut().enumerate() {
         if part.rings.len() < 2 {
             continue;
@@ -689,7 +804,7 @@ fn relate_rings(
             out.unrelated = true;
             continue;
         }
-        let rings: Vec<&geo::LineString<f64>> = part.rings.iter().flatten().collect();
+        let rings: Vec<&geo::LineString<f64>> = work.room.collect(part.rings.len(), part.rings.iter().flatten())?;
         let Some((shell, holes)) = rings.split_first() else { continue };
         let found = out.problems.len();
         for (h, hole) in holes.iter().enumerate() {
@@ -723,7 +838,7 @@ fn relate_rings(
             let (Some(ha), Some(hb)) = (holes.get(a), holes.get(b)) else { continue };
             let (ra, rb) = (a + 1, b + 1);
             let meet = meets.get(&(p, ra, rb)).copied();
-            let nested = |work: &mut Work| -> Result<bool, OverBudget> {
+            let nested = |work: &mut Work| -> Result<bool, Limit> {
                 spend(work, ha.0.len().saturating_add(hb.0.len()))?;
                 Ok(first_inside(ha, hb) || first_inside(hb, ha))
             };
@@ -740,12 +855,12 @@ fn relate_rings(
 }
 
 /// The clean parts of a multipart polygon against each other.
-fn relate_parts(out: &mut Checked, parts: &[Part], meets: &HashMap<(usize, usize), Meet>, work: &mut Work) -> Result<(), OverBudget> {
+fn relate_parts(out: &mut Checked, parts: &[Part], meets: &HashMap<(usize, usize), Meet>, work: &mut Work) -> Result<(), Limit> {
     if parts.len() < 2 {
         return Ok(());
     }
     let shells: Vec<Option<&geo::LineString<f64>>> =
-        parts.iter().map(|p| p.rings.first().and_then(Option::as_ref).filter(|_| p.clean)).collect();
+        work.room.collect(parts.len(), parts.iter().map(|p| p.rings.first().and_then(Option::as_ref).filter(|_| p.clean)))?;
     if shells.iter().any(Option::is_none) {
         out.unrelated = true;
     }
@@ -755,11 +870,11 @@ fn relate_parts(out: &mut Checked, parts: &[Part], meets: &HashMap<(usize, usize
         if !(pa.clean && pb.clean) {
             continue;
         }
-        let ra: Vec<&geo::LineString<f64>> = pa.rings.iter().flatten().collect();
-        let rb: Vec<&geo::LineString<f64>> = pb.rings.iter().flatten().collect();
+        let ra: Vec<&geo::LineString<f64>> = work.room.collect(pa.rings.len(), pa.rings.iter().flatten())?;
+        let rb: Vec<&geo::LineString<f64>> = work.room.collect(pb.rings.len(), pb.rings.iter().flatten())?;
         let meet = meets.get(&(a, b)).copied();
         let all = vertices(&ra).saturating_add(vertices(&rb));
-        let nested = |work: &mut Work| -> Result<bool, OverBudget> {
+        let nested = |work: &mut Work| -> Result<bool, Limit> {
             spend(work, all)?;
             Ok(first_in_part(&ra, &rb) || first_in_part(&rb, &ra))
         };
@@ -781,9 +896,9 @@ fn shared(
     out: &mut Checked,
     meet: Option<Meet>,
     work: &mut Work,
-    nested: impl FnOnce(&mut Work) -> Result<bool, OverBudget>,
-    related: impl FnOnce(&mut Work) -> Result<Option<bool>, OverBudget>,
-) -> Result<Option<bool>, OverBudget> {
+    nested: impl FnOnce(&mut Work) -> Result<bool, Limit>,
+    related: impl FnOnce(&mut Work) -> Result<Option<bool>, Limit>,
+) -> Result<Option<bool>, Limit> {
     Ok(match meet {
         None => nested(work)?.then_some(true),
         Some(m) if m.cross => Some(true),
@@ -798,11 +913,11 @@ fn shared(
     })
 }
 
-fn spend(work: &mut Work, n: usize) -> Result<(), OverBudget> {
-    if work.spend(n as u64) { Ok(()) } else { Err(OverBudget) }
+fn spend(work: &mut Work, n: usize) -> Result<(), Limit> {
+    if work.spend(n as u64) { Ok(()) } else { Err(Limit::Work) }
 }
 
-fn spend_relate(work: &mut Work, a: &geo::LineString<f64>, b: &geo::LineString<f64>) -> Result<(), OverBudget> {
+fn spend_relate(work: &mut Work, a: &geo::LineString<f64>, b: &geo::LineString<f64>) -> Result<(), Limit> {
     spend(work, a.0.len().saturating_add(b.0.len()).saturating_mul(RELATE_COST as usize))
 }
 
@@ -850,10 +965,11 @@ fn bounds(pts: &[geo::Coord<f64>]) -> Box2 {
 }
 
 /// The pairs `(a, b)`, `a < b`, of boxes that meet, swept along x; each pair compared counts as work.
-fn boxes_meet(boxes: impl Iterator<Item = Box2>, work: &mut Work) -> Result<Vec<(usize, usize)>, OverBudget> {
-    let boxes: Vec<Box2> = boxes.collect();
-    let mut order: Vec<usize> = (0..boxes.len()).filter(|i| boxes.get(*i).is_some_and(|b| b.0 <= b.2)).collect();
-    order.sort_by(|a, b| boxes.get(*a).map_or(0.0, |x| x.0).total_cmp(&boxes.get(*b).map_or(0.0, |x| x.0)));
+fn boxes_meet(boxes: impl ExactSizeIterator<Item = Box2>, work: &mut Work) -> Result<Vec<(usize, usize)>, Limit> {
+    let boxes: Vec<Box2> = work.room.collect(boxes.len(), boxes)?;
+    let mut order: Vec<usize> = work.room.collect(boxes.len(), (0..boxes.len()).filter(|i| boxes.get(*i).is_some_and(|b| b.0 <= b.2)))?;
+    // In place: an unstable sort allocates nothing, and equal boxes may come in either order.
+    order.sort_unstable_by(|a, b| boxes.get(*a).map_or(0.0, |x| x.0).total_cmp(&boxes.get(*b).map_or(0.0, |x| x.0)));
     let mut pairs = Vec::new();
     for (k, i) in order.iter().enumerate() {
         let Some(a) = boxes.get(*i) else { continue };
@@ -866,6 +982,7 @@ fn boxes_meet(boxes: impl Iterator<Item = Box2>, work: &mut Work) -> Result<Vec<
             if b.1 <= a.3 && a.1 <= b.3 {
                 // A pair kept costs as much as a contact: memory held until the pairs are checked.
                 spend(work, CONTACT_COST as usize)?;
+                work.room.grow(&mut pairs)?;
                 pairs.push(((*i).min(*j), (*i).max(*j)));
             }
         }
@@ -880,6 +997,9 @@ mod tests {
     use geo::Validation;
 
     type Ring<'a> = &'a [(f64, f64)];
+
+    /// Every reservation tried.
+    const ANY: Room<'static> = Room(&|_| true);
 
     fn ring(pts: Ring) -> Vec<Coord> {
         pts.iter().map(|&(x, y)| Coord::new(x, y)).collect()
@@ -910,10 +1030,10 @@ mod tests {
         assert_eq!(distinct_up_to(&ring(&[(0., 0.), (-0., 0.)]), 3), 1, "signed zeros are one point");
         assert_eq!(distinct_up_to(&[], 2), 0);
         // Repeats left out, and closed once.
-        let closed = closed_ring(&ring(&[(0., 0.), (1., 0.), (1., 0.), (1., 1.)]));
+        let closed = closed_ring(&ring(&[(0., 0.), (1., 0.), (1., 0.), (1., 1.)]), ANY).unwrap();
         assert_eq!(closed.0.len(), 4);
         assert_eq!(closed.0.first(), closed.0.last());
-        assert_eq!(closed_ring(&ring(&[(0., 0.), (1., 0.), (1., 1.), (0., 0.), (0., 0.)])).0.len(), 4);
+        assert_eq!(closed_ring(&ring(&[(0., 0.), (1., 0.), (1., 1.), (0., 0.), (0., 0.)]), ANY).unwrap().0.len(), 4);
     }
 
     #[test]
@@ -1101,12 +1221,12 @@ mod tests {
                 .iter()
                 .enumerate()
                 .flat_map(|(r, pts)| {
-                    let l = closed_ring(&ring(pts));
+                    let l = closed_ring(&ring(pts), ANY).unwrap();
                     let n = l.0.len() - 1;
                     l.lines().enumerate().map(|(i, l)| Seg { a: l.start, b: l.end, part: 0, ring: r, i, n }).collect::<Vec<_>>()
                 })
                 .collect();
-            sweep_order(&segs).2
+            sweep_order(&segs, ANY).unwrap().2
         };
         // Each of the 10 ring coordinates is charged too.
         let coords = 10 * VERTEX_COST;
@@ -1123,12 +1243,12 @@ mod tests {
                 .iter()
                 .enumerate()
                 .flat_map(|(r, pts)| {
-                    let l = closed_ring(&ring(pts));
+                    let l = closed_ring(&ring(pts), ANY).unwrap();
                     let n = l.0.len() - 1;
                     l.lines().enumerate().map(|(i, l)| Seg { a: l.start, b: l.end, part: 0, ring: r, i, n }).collect::<Vec<_>>()
                 })
                 .collect();
-            sweep_order(&segs).2
+            sweep_order(&segs, ANY).unwrap().2
         };
         let charge = 5 * VERTEX_COST;
         assert!(pairs(&[SQUARE]) < charge - 1, "the sweep alone would fit");
@@ -1153,6 +1273,86 @@ mod tests {
         assert_eq!(check(Some(&circle(1_000_000)), MAX_WORK).problems, []);
     }
 
+    /// Counts the reservations in `tried`, allowing those whose number (from 0) `allow` takes.
+    fn counted(tried: &std::cell::Cell<usize>, allow: impl Fn(usize) -> bool) -> impl Fn(usize) -> bool {
+        move |_| {
+            let n = tried.get();
+            tried.set(n + 1);
+            allow(n)
+        }
+    }
+
+    /// A buffer whose memory can't be had makes the feature too complex, never valid, wherever the
+    /// checks ask for it; with the memory, the feature is checked fully.
+    #[test]
+    fn a_reservation_refused_reports_the_feature_too_complex_never_valid() {
+        // Two holes whose boxes meet, and an island in one of them: every buffer is asked for, and
+        // nothing is wrong. Both axes are swept for their pairs.
+        let a: Ring = &[(2., 2.), (6., 2.), (2., 6.), (2., 2.)];
+        let b: Ring = &[(6., 6.), (6., 4.5), (4.5, 6.), (6., 6.)];
+        let island: Ring = &[(2.5, 2.5), (3.5, 2.5), (2.5, 3.5), (2.5, 2.5)];
+        let g = multi(&[&[SQUARE, a, b], &[island]]);
+        let tried = std::cell::Cell::new(0);
+        assert_eq!(check_with(Some(&g), MAX_WORK, &counted(&tried, |_| true)).problems, []);
+        let asked = tried.get();
+        // The parts, each part's rings, the four ring copies, the segments, the sweep's two orders
+        // along each axis, the holes and their boxes and pairs, the parts' shells, boxes and pair,
+        // and the two parts' rings.
+        assert_eq!(asked, 1 + 2 + 4 + 1 + 4 + (1 + 3) + (1 + 3) + 2);
+        // Each refused alone, so no later reservation can make up for one taken lightly.
+        for k in 0..asked {
+            let tried = std::cell::Cell::new(0);
+            let c = check_with(Some(&g), MAX_WORK, &counted(&tried, |n| n != k));
+            assert_eq!(c.problems, [Problem::TooComplex { limit: Limit::Memory }], "reservation {k} refused");
+        }
+        // Rings in contact: the maps of contacts, the touch points and the cycle test's nodes are
+        // asked for too, each refused in turn.
+        let g = poly(&[SQUARE, ACROSS]);
+        let tried = std::cell::Cell::new(0);
+        assert_eq!(check_with(Some(&g), MAX_WORK, &counted(&tried, |_| true)).problems, disconnected(0));
+        let asked_in_contact = tried.get();
+        assert!(asked_in_contact > 1 + 1 + 2 + 1 + 4 + 2, "the contacts' maps are asked for: {asked_in_contact}");
+        for k in 0..asked_in_contact {
+            let tried = std::cell::Cell::new(0);
+            let c = check_with(Some(&g), MAX_WORK, &counted(&tried, |n| n != k));
+            assert_eq!(c.problems, [Problem::TooComplex { limit: Limit::Memory }], "reservation {k} of the touching rings refused");
+        }
+        // A ring meeting itself: the map of self-contacts is asked for too.
+        let g = poly(&[BOWTIE]);
+        let tried = std::cell::Cell::new(0);
+        assert_eq!(check_with(Some(&g), MAX_WORK, &counted(&tried, |_| true)).codes(), [Code::SelfIntersection]);
+        for k in 0..tried.get() {
+            let tried = std::cell::Cell::new(0);
+            let c = check_with(Some(&g), MAX_WORK, &counted(&tried, |n| n != k));
+            assert_eq!(c.problems, [Problem::TooComplex { limit: Limit::Memory }], "reservation {k} of the bowtie refused");
+        }
+        assert_eq!(Problem::TooComplex { limit: Limit::Memory }.describe(), "not checked fully: not enough memory to check it");
+        assert_eq!(Problem::TooComplex { limit: Limit::Work }.describe(), "not checked fully: too complex for the work limit");
+    }
+
+    /// Without the memory for the copies, the checks that copy nothing still run, on every ring.
+    #[test]
+    fn without_memory_the_vertex_checks_still_run() {
+        let open: Ring = &[(0., 0.), (10., 0.), (10., 0.), (10., 10.), (0., 10.)];
+        let thin: Ring = &[(20., 0.), (21., 0.), (20., 0.)];
+        let g = multi(&[&[SQUARE, open], &[thin], &[&[(30., 0.), (f64::NAN, 0.), (31., 1.), (30., 0.)]]]);
+        let all = [
+            Problem::NonFinite { count: 1, first: At::Ring(2, 0) },
+            Problem::TooFewPoints { at: At::Ring(1, 0), distinct: 2 },
+            Problem::RingNotClosed { at: At::Ring(0, 1) },
+            Problem::RepeatedVertex { at: At::Ring(0, 1), count: 1 },
+            Problem::TooComplex { limit: Limit::Memory },
+        ];
+        // Nothing reserved, or only the parts and the first part's rings (its shell's copy is refused).
+        for k in [0, 2] {
+            let tried = std::cell::Cell::new(0);
+            assert_eq!(check_with(Some(&g), MAX_WORK, &counted(&tried, |n| n < k)).problems, all, "{k} allowed");
+        }
+        // Lines and points copy nothing.
+        let line = Geometry::Line(vec![ring(&[(0., 0.), (0., 0.)])]);
+        assert_eq!(check_with(Some(&line), MAX_WORK, &|_| false).codes(), [Code::TooFewPoints, Code::RepeatedVertex]);
+    }
+
     /// The pairs the sweep is charged for are the ones it compares, along the axis with fewer.
     #[test]
     fn the_sweep_counts_its_pairs_before_comparing_them() {
@@ -1166,13 +1366,13 @@ mod tests {
         };
         // Ten segments spanning the same x range, stacked in y: every pair overlaps in x, none in y.
         let stacked: Vec<Seg> = (0..10).map(|i| seg(0., i as f64, 1., i as f64 + 0.5, i)).collect();
-        let (order, y, pairs) = sweep_order(&stacked);
+        let (order, y, pairs) = sweep_order(&stacked, ANY).unwrap();
         assert!(y);
         assert_eq!(pairs, 0);
         assert_eq!(order.len(), 10);
         // A zigzag across the same x range, overlapping in both: 45 pairs.
         let zigzag: Vec<Seg> = (0..10).map(|i| seg(0., i as f64, 1., i as f64 + 20.0, i)).collect();
-        assert_eq!(sweep_order(&zigzag).2, 45);
+        assert_eq!(sweep_order(&zigzag, ANY).unwrap().2, 45);
     }
 
     // Rings touching at points: the interior is split when the rings and touch points form a cycle.
@@ -1218,6 +1418,26 @@ mod tests {
         assert!(!check(Some(&poly(&[SQUARE, ACROSS])), MAX_WORK).unrelated);
     }
 
+    /// A hole whose boundary runs along the shell's shares stretches of boundary with it: rings
+    /// meeting on a line, as OGC and geo call it, even a hole that is the whole shell. (Their areas
+    /// always share space: a hole is inside its shell. Overlap is for two holes, or two parts.)
+    #[test]
+    fn a_hole_along_the_shell_touches_it_along_a_line() {
+        let along: Ring = &[(0., 0.), (5., 0.), (5., 5.), (0., 5.), (0., 0.)];
+        for hole in [along, SQUARE] {
+            let g = poly(&[SQUARE, hole]);
+            assert_eq!(problems(&g), [Problem::RingsIntersect { part: 0, a: 0, b: 1, area: false }]);
+            assert_eq!(described(&g), ["exterior ring and ring 2 of part 1 touch along a line"]);
+            let geo_says: Vec<String> =
+                geo::Polygon::new(closed_ring(&ring(SQUARE), ANY).unwrap(), vec![closed_ring(&ring(hole), ANY).unwrap()])
+                    .validation_errors()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+            assert_eq!(geo_says, ["exterior ring and interior ring at index 0 intersect on a line"], "{hole:?}");
+        }
+    }
+
     #[test]
     fn rings_touching_without_splitting_the_interior_are_fine() {
         // One hole touching the shell once; two holes touching each other once.
@@ -1256,12 +1476,12 @@ mod tests {
                 .iter()
                 .enumerate()
                 .flat_map(|(r, pts)| {
-                    let l = closed_ring(&ring(pts));
+                    let l = closed_ring(&ring(pts), ANY).unwrap();
                     let n = l.0.len() - 1;
                     l.lines().enumerate().map(|(i, l)| Seg { a: l.start, b: l.end, part: 0, ring: r, i, n }).collect::<Vec<_>>()
                 })
                 .collect();
-            sweep_order(&segs).2
+            sweep_order(&segs, ANY).unwrap().2
         };
         // The coordinates, the sweep, the pair of rings in contact, both rings at both points, and
         // relating them.

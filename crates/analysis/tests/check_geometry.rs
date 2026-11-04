@@ -213,13 +213,13 @@ fn a_feature_too_complex_to_check_is_reported_never_taken_for_valid() {
     assert!(started.elapsed().as_secs() < 30, "counted, not swept");
     let ds = dataset(&r);
     assert_eq!(text(ds, 0, "problem"), "too_complex");
-    assert_eq!(text(ds, 0, "detail"), "too complex to check for crossings and overlaps within the work limit");
+    assert_eq!(text(ds, 0, "detail"), "not checked fully: too complex for the work limit");
     assert!(ds.features[0].geometry.is_some());
     assert_eq!(
         r.messages,
         [
             "Check Geometry: 2 of 2 features have problems (self_intersection: 1, too_complex: 1)",
-            "Check Geometry: 1 feature could not be checked fully for crossings and overlaps (too complex for the work limit); it is in the output as too_complex",
+            "Check Geometry: 1 feature could not be checked fully (too complex for the work limit); it is in the output as too_complex",
         ]
     );
 }
