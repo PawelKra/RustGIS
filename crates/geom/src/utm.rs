@@ -14,7 +14,9 @@
 //! 32X, 34X and 36X don't exist), latitude bands C to X of 8° (X runs 12°, from 72° N to 84° N),
 //! and the 100 km squares of the AA lettering scheme used on WGS 84: column letters A–H, J–R and
 //! S–Z by zone in turn, row letters A–V (no I or O) from the equator, starting at F in even zones.
-//! A reference truncates its easting and northing to its precision, it doesn't round them.
+//! A reference truncates its easting and northing to its precision, it doesn't round them, and
+//! writes the zone with two digits (`04QFJ`), so references line up and sort; one digit is read
+//! as well.
 //!
 //! Only the UTM latitudes, 80° S to 84° N, are covered: the polar areas use the Universal Polar
 //! Stereographic (UPS) grid, which isn't implemented. There the functions return `None`, and a
@@ -45,8 +47,8 @@ const ROW_CYCLE: f64 = 2_000_000.0;
 /// the position they give is still the right one. A band's latitudes get no such allowance: the
 /// band is the latitude's own letter, so a reference in the wrong band is refused.
 const EDGE_SLOP_DEG: f64 = 0.5;
-/// How far (degrees) a place may lie outside its band, or past the UTM limits, for rounding: about
-/// a metre, the precision a UTM position is written to.
+/// How far (degrees) a place, or the nearest part of a cell, may lie outside its band, or past the
+/// UTM limits, for rounding: about a metre, the precision a UTM position is written to.
 const ROUNDING_DEG: f64 = 1.0 / M_PER_DEG;
 /// Metres per degree of latitude, roughly, for turning a cell's size into degrees.
 const M_PER_DEG: f64 = 111_000.0;
@@ -313,9 +315,9 @@ impl Mgrs {
         10f64.powi(5 - i32::from(self.digits.min(5)))
     }
 
-    /// Without spaces: `33UVP1234523456`.
+    /// Without spaces: `33UVP1234523456`, `04QFJ12345678`.
     pub fn compact(&self) -> String {
-        format!("{}{}{}{}{}", self.zone, self.band, self.column, self.row, self.digit_groups().concat())
+        format!("{:02}{}{}{}{}", self.zone, self.band, self.column, self.row, self.digit_groups().concat())
     }
 
     /// The easting and northing digits, zero-padded to the precision (empty for 100 km).
@@ -334,9 +336,9 @@ impl Mgrs {
 }
 
 impl fmt::Display for Mgrs {
-    /// `33U VP 12345 23456` (the readout's form; `33U VP` at 100 km).
+    /// `33U VP 12345 23456` (the readout's form; `33U VP` at 100 km; `04Q FJ …` in zones 1–9).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{} {}{}", self.zone, self.band, self.column, self.row)?;
+        write!(f, "{:02}{} {}{}", self.zone, self.band, self.column, self.row)?;
         let [e, n] = self.digit_groups();
         if !e.is_empty() {
             write!(f, " {e} {n}")?;
@@ -350,8 +352,13 @@ impl fmt::Display for Mgrs {
 pub fn to_mgrs(c: Coord, digits: u8) -> Option<Mgrs> {
     let digits = digits.min(5);
     let u = to_utm(c)?;
-    // Whole metres first, truncated, so the square letters and the digits agree at an edge.
-    let (e, n) = (u.easting.floor(), u.northing.floor());
+    // Whole metres first, truncated, so the square letters and the digits agree at an edge. Just
+    // south of the equator the northing can round up to the full 10,000 km false northing, which
+    // is the equator itself and row A of band N: it is kept a metre short, in row V of band M.
+    let (e, mut n) = (u.easting.floor(), u.northing.floor());
+    if !u.north() {
+        n = n.min(FALSE_NORTHING_SOUTH - 1.0);
+    }
     if !(SQUARE..9.0 * SQUARE).contains(&e) || !(0.0..=FALSE_NORTHING_SOUTH).contains(&n) {
         return None;
     }
@@ -420,12 +427,13 @@ impl fmt::Display for GridError {
 
 impl std::error::Error for GridError {}
 
-/// Whether a place found from a zone and band lies in them, give or take `cell_m` (the size of
-/// the cell a reference names), and for the zone's longitudes [`EDGE_SLOP_DEG`].
-fn check_place(p: Coord, zone: u8, band: char, cell_m: f64) -> Result<(), GridError> {
+/// Whether a place found from a zone and band lies in them. `lats` are the lowest and highest
+/// latitudes of the cell the reference names (the place's own for a UTM position): the cell must
+/// reach into the band, give or take [`ROUNDING_DEG`]. The place may lie outside the zone's
+/// longitudes by `cell_m` (the cell's size) and [`EDGE_SLOP_DEG`].
+fn check_place(p: Coord, lats: (f64, f64), zone: u8, band: char, cell_m: f64) -> Result<(), GridError> {
     let (south, north) = band_latitudes(band).ok_or(GridError::Band)?;
-    let lat_slop = cell_m / M_PER_DEG + ROUNDING_DEG;
-    if p.y < south - lat_slop || p.y > north + lat_slop {
+    if lats.1 < south - ROUNDING_DEG || lats.0 > north + ROUNDING_DEG {
         return Err(GridError::BandMismatch);
     }
     let (west, east) = zone_longitudes(zone, band).ok_or(GridError::OutsideZone)?;
@@ -438,7 +446,25 @@ fn check_place(p: Coord, zone: u8, band: char, cell_m: f64) -> Result<(), GridEr
     Ok(())
 }
 
-/// The centre of the cell an MGRS reference names: the 2,000 km row cycle is settled by the band.
+/// The lowest and highest latitudes of a grid cell (south-west corner `e0`, `n0`, side `cell`).
+/// Along a line of constant easting the latitude grows with the northing, and along a line of
+/// constant northing it lies farthest from the equator on the central meridian. A cell never
+/// straddles the central meridian (its 500 km easting is a multiple of every cell size), so the
+/// extremes are at its corners. `None` if a corner names no place (past a pole).
+fn cell_latitudes(zone: u8, north: bool, e0: f64, n0: f64, cell: f64) -> Option<(f64, f64)> {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for e in [e0, e0 + cell] {
+        for n in [n0, n0 + cell] {
+            let p = from_utm(zone, north, e, n)?;
+            lo = lo.min(p.y);
+            hi = hi.max(p.y);
+        }
+    }
+    Some((lo, hi))
+}
+
+/// The centre of the cell an MGRS reference names: the 2,000 km row cycle is settled by the band,
+/// which the cell must reach into.
 fn locate(m: &Mgrs) -> Result<Coord, GridError> {
     if !(1..=60).contains(&m.zone) {
         return Err(GridError::Zone);
@@ -459,14 +485,16 @@ fn locate(m: &Mgrs) -> Result<Coord, GridError> {
     if f64::from(m.easting) * cell >= SQUARE || f64::from(m.northing) * cell >= SQUARE {
         return Err(GridError::Digits);
     }
-    let easting = (col as f64 + 1.0) * SQUARE + f64::from(m.easting) * cell + cell / 2.0;
-    let northing = row * SQUARE + f64::from(m.northing) * cell + cell / 2.0;
+    let e0 = (col as f64 + 1.0) * SQUARE + f64::from(m.easting) * cell;
+    let n0 = row * SQUARE + f64::from(m.northing) * cell;
     let north = south >= 0.0;
     // Of the five northings the letters can stand for (0 to 10,000 km), the one in the band.
     let mut found = None;
     for k in 0..5 {
-        let Some(p) = from_utm(m.zone, north, easting, northing + f64::from(k) * ROW_CYCLE) else { continue };
-        match check_place(p, m.zone, m.band, cell) {
+        let n0 = n0 + f64::from(k) * ROW_CYCLE;
+        let Some(p) = from_utm(m.zone, north, e0 + cell / 2.0, n0 + cell / 2.0) else { continue };
+        let Some(lats) = cell_latitudes(m.zone, north, e0, n0, cell) else { continue };
+        match check_place(p, lats, m.zone, m.band, cell) {
             Ok(()) => {
                 found = Some(p);
                 break;
@@ -608,7 +636,7 @@ pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
             return Err(GridError::Polar);
         }
         let band = latitude_band(p.y.clamp(UTM_MIN_LAT, UTM_MAX_LAT - 1e-9)).ok_or(GridError::Polar)?;
-        check_place(p, zone, band, 1.0).map(|()| p)
+        check_place(p, (p.y, p.y), zone, band, 1.0).map(|()| p)
     };
     match word.as_str() {
         "NORTH" => by_hemisphere(true),
@@ -617,7 +645,11 @@ pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
             let band = band_letter(letter)?;
             let north = band >= 'N';
             let p = from_utm(zone, north, easting, northing).ok_or(GridError::OutsideZone)?;
-            match check_place(p, zone, band, 1.0) {
+            // Past 84° N or 80° S is polar, as in the hemisphere form, whatever the band says.
+            if p.y >= UTM_MAX_LAT + ROUNDING_DEG || p.y < UTM_MIN_LAT - ROUNDING_DEG {
+                return Err(GridError::Polar);
+            }
+            match check_place(p, (p.y, p.y), zone, band, 1.0) {
                 Ok(()) => Ok(p),
                 Err(GridError::BandMismatch) if band == 'N' => by_hemisphere(true),
                 Err(GridError::BandMismatch) if band == 'S' => Err(GridError::Ambiguous),
@@ -1036,6 +1068,119 @@ mod tests {
         assert_eq!(parse_utm(&format!("33 north {} {}", e.round(), n.round())), Err(GridError::Polar));
         let (e, n) = to_utm_in_zone(c(15.0, 83.95), 33, true).unwrap();
         assert!(parse_utm(&format!("33 north {} {}", e.round(), n.round())).is_ok());
+    }
+
+    /// Zones 1–9 are written with two digits, in the readout and without spaces, and read back.
+    #[test]
+    fn one_digit_zones_are_written_with_two() {
+        let m = to_mgrs(c(central_meridian(1), 0.5), 5).unwrap();
+        assert_eq!(m.zone, 1);
+        assert!(m.to_string().starts_with("01N EA "), "{m}");
+        assert!(m.compact().starts_with("01NEA"), "{}", m.compact());
+        for text in [m.to_string(), m.compact(), m.compact().replacen("01", "1", 1)] {
+            assert_eq!(parse_mgrs(&text), Ok(m), "{text}");
+        }
+        assert_eq!(to_mgrs(c(central_meridian(9), 10.0), 0).unwrap().to_string(), "09P WM");
+        assert_eq!(to_mgrs(c(central_meridian(10), 10.0), 0).unwrap().to_string(), "10P ES");
+        // UTM keeps the zone as it is numbered (EPSG:32604), like GeographicLib's `4n`.
+        assert!(format_utm(c(central_meridian(4), 20.0)).unwrap().starts_with("4Q "));
+    }
+
+    /// Just south of the equator the northing rounds to the full false northing (10,000 km, which
+    /// is the equator, row A of band N): the reference stays in row V of band M and reads back.
+    #[test]
+    fn a_northing_just_south_of_the_equator_stays_in_band_m() {
+        // A latitude a few 1e-15 degrees south: in band M, yet its northing rounds to 10,000 km.
+        let p = (1..400)
+            .map(|i| c(15.0, -1e-17 * f64::from(i) * 5.0))
+            .find(|p| to_utm(*p).is_some_and(|u| u.band == 'M' && u.northing == FALSE_NORTHING_SOUTH))
+            .expect("a place in band M whose northing rounds to the false northing");
+        assert_eq!(to_utm(p).map(|u| u.zone), Some(33));
+        for d in 0u8..=5 {
+            let m = to_mgrs(p, d).unwrap();
+            assert_eq!((m.band, m.row), ('M', 'V'), "{m}");
+            assert_eq!(parse_mgrs(&m.compact()), Ok(m), "{m}");
+        }
+        assert_eq!(to_mgrs(p, 5).unwrap().northing, 99_999);
+        // The equator itself and the north are untouched.
+        assert_eq!(to_mgrs(c(15.0, 0.0), 5).unwrap().compact(), "33NWA0000000000");
+    }
+
+    /// A cell is read in a band only if it reaches into it. 38T MJ (4,300–4,400 km north, in zone
+    /// 38's rows) ends at 39.7° N, short of band T's 40° N, while 38T MK crosses 40° N and is read
+    /// in either band; 38S MJ lies in band S.
+    #[test]
+    fn a_square_must_reach_into_its_band() {
+        assert_eq!(parse_mgrs("38TMJ"), Err(GridError::BandMismatch));
+        assert_eq!(parse_mgrs("38TMJ 5 9"), Err(GridError::BandMismatch));
+        for ok in ["38TMK", "38SMK", "38SMJ", "38TMK 5 2", "38SMK 5 2"] {
+            assert!(parse_mgrs(ok).is_ok(), "{ok}");
+        }
+        // 40° N is about 4,428 km north on the central meridian, in 38S MK's third 10 km row:
+        // the row above it isn't in band S, the row below it isn't in T.
+        assert_eq!(parse_mgrs("38SMK 5 4"), Err(GridError::BandMismatch));
+        assert_eq!(parse_mgrs("38TMK 5 1"), Err(GridError::BandMismatch));
+        // The 100 km square holding 48° N in zone 33, wide of the central meridian where the
+        // parallel bends south across the square: read in both bands.
+        for p in [c(12.1, 48.0001), c(12.1, 47.9999), c(17.9, 48.0001), c(17.9, 47.9999)] {
+            let m = to_mgrs(p, 0).unwrap();
+            let other = if m.band == 'U' { 'T' } else { 'U' };
+            let swapped = Mgrs { band: other, ..m };
+            assert!(parse_mgrs(&m.compact()).is_ok(), "{m}");
+            assert!(parse_mgrs(&swapped.compact()).is_ok(), "{swapped}");
+        }
+    }
+
+    /// Every reference the readout writes reads back to itself, at every precision, at random and
+    /// at the band edges (where a cell only partly in its band must still be read).
+    #[test]
+    fn every_precision_round_trips_at_band_edges() {
+        let mut r = Lcg(23);
+        let mut edges: Vec<f64> = (0..20).map(|i| UTM_MIN_LAT + 8.0 * f64::from(i)).collect();
+        edges.push(UTM_MAX_LAT);
+        for edge in edges {
+            for off in [-0.3, -1e-4, -1e-7, 0.0, 1e-7, 1e-4, 0.3] {
+                let lat = edge + off;
+                if !(UTM_MIN_LAT..UTM_MAX_LAT).contains(&lat) {
+                    continue;
+                }
+                for _ in 0..60 {
+                    let lon = -180.0 + r.next() * 360.0;
+                    for d in 0u8..=5 {
+                        let m = to_mgrs(c(lon, lat), d).unwrap();
+                        assert_eq!(parse_mgrs(&m.compact()), Ok(m), "{m} at {lon} {lat}");
+                    }
+                }
+            }
+        }
+        for _ in 0..3_000 {
+            let p = c(-180.0 + r.next() * 360.0, UTM_MIN_LAT + r.next() * (UTM_MAX_LAT - UTM_MIN_LAT - 1e-6));
+            let d = (r.next() * 6.0) as u8;
+            let m = to_mgrs(p, d).unwrap();
+            assert_eq!(parse_mgrs(&m.to_string()), Ok(m), "{m} at {p:?}");
+        }
+    }
+
+    /// Past 84° N or 80° S by more than the metre a position is rounded to, a UTM position is
+    /// polar whether it is written with band X or C or with the hemisphere.
+    #[test]
+    fn utm_past_the_limits_is_polar_in_either_form() {
+        let metres = |m: f64| m / M_PER_DEG;
+        for (lat, band, north) in [(UTM_MAX_LAT + metres(1.5), 'X', true), (UTM_MIN_LAT - metres(1.5), 'C', false)] {
+            let (e, n) = to_utm_in_zone(c(15.0, lat), 33, north).unwrap();
+            let (e, n) = (e.round(), n.round());
+            let hemi = if north { "north" } else { "south" };
+            assert_eq!(parse_utm(&format!("33{band} {e} {n}")), Err(GridError::Polar), "{lat}");
+            assert_eq!(parse_utm(&format!("33 {hemi} {e} {n}")), Err(GridError::Polar), "{lat}");
+        }
+        // Within the limits, by a metre, both forms read.
+        for (lat, band, north) in [(UTM_MAX_LAT - metres(1.0), 'X', true), (UTM_MIN_LAT + metres(1.0), 'C', false)] {
+            let (e, n) = to_utm_in_zone(c(15.0, lat), 33, north).unwrap();
+            let (e, n) = (e.round(), n.round());
+            let hemi = if north { "north" } else { "south" };
+            assert!(parse_utm(&format!("33{band} {e} {n}")).is_ok(), "{lat}");
+            assert!(parse_utm(&format!("33 {hemi} {e} {n}")).is_ok(), "{lat}");
+        }
     }
 
     #[test]

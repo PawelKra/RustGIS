@@ -53,11 +53,12 @@ fn lat_lon(c: Coord) -> String {
 
 /// The coordinate row: the text it shows and copies, in the readout's format, and whether it fell
 /// back from it. Decimal degrees are `lat, lon` ([`lat_lon`]); north of 84° N or south of 80° S,
-/// UTM and MGRS fall back to them (and the row's hover text says why).
-fn coordinate_row(c: Coord, f: CoordReadout) -> (String, bool) {
+/// and on another body's map (`earth` false), UTM and MGRS fall back to them (and the row's hover
+/// text says why).
+fn coordinate_row(c: Coord, f: CoordReadout, earth: bool) -> (String, bool) {
     match f {
         CoordReadout::Decimal => (lat_lon(c), false),
-        _ => match f.format(c) {
+        _ => match f.format(c, earth) {
             Some(text) => (text, false),
             None => (lat_lon(c), true),
         },
@@ -121,8 +122,14 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
     let c = place(c);
     ui.set_min_width(240.0);
     let format = app.map.coord_format;
-    let (coords, fell_back) = coordinate_row(c, format);
-    let hover = if fell_back {
+    let earth = app.session.map().body().is_earth();
+    let (coords, fell_back) = coordinate_row(c, format, earth);
+    let hover = if fell_back && !earth {
+        i18n::fmt(
+            "Copy coordinates to the clipboard. {format} is a grid of the Earth, so latitude and longitude",
+            &[("format", format.label())],
+        )
+    } else if fell_back {
         i18n::fmt(
             "Copy coordinates to the clipboard. No {format} here: outside the UTM zones (80° S to 84° N), so latitude and longitude",
             &[("format", format.label())],
@@ -266,15 +273,18 @@ mod tests {
     #[test]
     fn the_coordinate_row_copies_the_chosen_format() {
         let p = Coord::new(44.4, 33.3);
-        assert_eq!(coordinate_row(p, CoordReadout::Decimal), ("33.300000, 44.400000".into(), false));
-        assert_eq!(coordinate_row(p, CoordReadout::Dms), ("44°24′00.0″ E  33°18′00.0″ N".into(), false));
-        assert_eq!(coordinate_row(p, CoordReadout::Utm), ("38S 444141 3684706".into(), false));
-        assert_eq!(coordinate_row(p, CoordReadout::Mgrs), ("38S MB 44140 84706".into(), false));
+        assert_eq!(coordinate_row(p, CoordReadout::Decimal, true), ("33.300000, 44.400000".into(), false));
+        assert_eq!(coordinate_row(p, CoordReadout::Dms, true), ("44°24′00.0″ E  33°18′00.0″ N".into(), false));
+        assert_eq!(coordinate_row(p, CoordReadout::Utm, true), ("38S 444141 3684706".into(), false));
+        assert_eq!(coordinate_row(p, CoordReadout::Mgrs, true), ("38S MB 44140 84706".into(), false));
         // Where UTM has no zone, the row falls back to latitude and longitude (and says so).
         let pole = Coord::new(10.0, 86.0);
         for f in [CoordReadout::Utm, CoordReadout::Mgrs] {
-            assert_eq!(coordinate_row(pole, f), ("86.000000, 10.000000".into(), true), "{f:?}");
+            assert_eq!(coordinate_row(pole, f, true), ("86.000000, 10.000000".into(), true), "{f:?}");
+            // On another body's map as well: UTM and MGRS are the Earth's grids.
+            assert_eq!(coordinate_row(p, f, false), ("33.300000, 44.400000".into(), true), "{f:?}");
         }
-        assert!(!coordinate_row(pole, CoordReadout::Dms).1);
+        assert!(!coordinate_row(pole, CoordReadout::Dms, true).1);
+        assert_eq!(coordinate_row(p, CoordReadout::Dms, false), coordinate_row(p, CoordReadout::Dms, true));
     }
 }

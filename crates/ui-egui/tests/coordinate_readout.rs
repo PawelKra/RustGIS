@@ -91,5 +91,14 @@ fn the_status_bar_reads_the_pointer_in_the_chosen_format_and_a_click_switches() 
     h.state_mut().run("map.goToXY", json!({"lon": 10.0, "lat": 84.5, "scale": 10000})).unwrap();
     hover_map(&mut h);
     assert!(h.state().map.pointer_lonlat.is_some_and(|c| c.y > 84.0));
-    h.get_by_label("No MGRS here: outside the UTM zones (80° S to 84° N)");
+    h.get_by_label("No MGRS here");
+    // On another body's map UTM and MGRS, the Earth's grids, read nothing either.
+    h.state_mut().run("map.body", json!({"name": "mars", "basemap": false})).unwrap();
+    h.state_mut().run("map.goToXY", json!({"lon": 44.4, "lat": 33.3, "scale": 10000})).unwrap();
+    hover_map(&mut h);
+    assert!(h.state().map.pointer_lonlat.is_some_and(|c| (c.y - 33.3).abs() < 0.05));
+    h.get_by_label("No MGRS here");
+    h.state_mut().run("ui.coordinateFormat", json!({"format": "decimal"})).unwrap();
+    hover_map(&mut h);
+    h.get_by_label(&rustgis_engine::geom::format_lonlat(h.state().map.pointer_lonlat.unwrap()));
 }

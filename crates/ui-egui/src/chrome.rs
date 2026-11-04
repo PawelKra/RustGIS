@@ -304,9 +304,12 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 sep(ui, &t);
                 // Pointer coordinates.
                 let format = app.map.coord_format;
+                let earth = app.session.map().body().is_earth();
                 let resp = ui.add(
-                    egui::Label::new(egui::RichText::new(format.readout(app.map.pointer_lonlat)).monospace().size(11.5).color(t.text_dim))
-                        .sense(Sense::click()),
+                    egui::Label::new(
+                        egui::RichText::new(format.readout(app.map.pointer_lonlat, earth)).monospace().size(11.5).color(t.text_dim),
+                    )
+                    .sense(Sense::click()),
                 );
                 if resp.on_hover_text(format.hover()).clicked() {
                     let _ = app.run("ui.coordinateFormat", Value::Null);

@@ -7,7 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use rustgis_data::Value as Attr;
-use rustgis_geom::{Coord, Extent};
+use rustgis_geom::{Coord, Extent, GridError};
 use serde_json::{Value, json};
 
 use super::{f, ps};
@@ -132,6 +132,10 @@ impl Hit {
 pub struct Results {
     pub hits: Vec<Hit>,
     pub partial: Vec<u32>,
+    /// Why the query, written as a UTM position or an MGRS reference, names no place (a band
+    /// that doesn't hold its northing, square letters the zone doesn't use, `S` that may mean
+    /// south); `None` when it isn't written as one, or reads.
+    pub grid_error: Option<GridError>,
 }
 
 /// Searches the active map for `query`: a coordinate first, then layers, bookmarks and features.
@@ -144,14 +148,21 @@ pub fn search(s: &Session, query: &str, limit: usize) -> Results {
     // A query that is plainly a coordinate (a decimal point, a degree mark, a hemisphere, a UTM
     // zone and band) isn't looked for in the tables; two whole numbers (an id, years, a range)
     // may be either, and so may a bare 100 km MGRS square, which names Sentinel-2's tiles (33UVP);
-    // an MGRS reference with digits is plainly a coordinate.
+    // an MGRS reference with digits is plainly a coordinate. UTM and MGRS are the Earth's grids,
+    // so on another body's map they name no place.
     let mut plainly_coordinate = false;
     if let Some(c) = parse_lat_lon(&q) {
         out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
         plainly_coordinate = q.chars().any(|c| matches!(c, '.' | '°' | 'º' | '\'' | '′' | '"' | '″') || c.is_alphabetic());
-    } else if let Some(c) = parse_grid_reference(&q) {
-        out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
-        plainly_coordinate = rustgis_geom::parse_mgrs(&q).map_or(true, |m| m.digits > 0);
+    } else if s.map().body().is_earth() {
+        match read_grid_reference(&q) {
+            Ok(c) => {
+                out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
+                plainly_coordinate = rustgis_geom::parse_mgrs(&q).map_or(true, |m| m.digits > 0);
+            }
+            Err(GridError::Syntax) => {}
+            Err(e) => out.grid_error = Some(e),
+        }
     }
     let needle = q.to_lowercase();
     let map = s.map();
@@ -339,20 +350,36 @@ fn search_cmd(s: &mut Session, p: &Value) -> CmdResult {
         ),
     };
     if let Some(i) = pick {
-        let hit =
-            r.hits.get(i).ok_or_else(|| if r.hits.is_empty() { format!("nothing matches '{query}'") } else { format!("no hit {i}") })?;
+        let hit = r.hits.get(i).ok_or_else(|| match (r.hits.is_empty(), r.grid_error) {
+            (true, Some(e)) => format!("nothing matches '{query}': as a grid reference, {e}"),
+            (true, None) => format!("nothing matches '{query}'"),
+            (false, _) => format!("no hit {i}"),
+        })?;
         go_to(s, hit)?;
     }
-    Ok(json!({"hits": r.hits.iter().map(Hit::to_json).collect::<Vec<_>>(), "partial": r.partial}))
+    let mut out = json!({"hits": r.hits.iter().map(Hit::to_json).collect::<Vec<_>>(), "partial": r.partial});
+    if let Some(e) = r.grid_error {
+        out["gridError"] = json!(e.to_string());
+    }
+    Ok(out)
 }
 
 /// A place typed as an MGRS reference (the centre of the square it names) or a UTM position, in
 /// the forms [`rustgis_geom::parse_mgrs`] and [`rustgis_geom::parse_utm`] accept; `None` for
 /// anything else, an ambiguous UTM zone letter or a reference that names no place.
 pub fn parse_grid_reference(text: &str) -> Option<Coord> {
+    read_grid_reference(text).ok()
+}
+
+/// As [`parse_grid_reference`], with why a reference was refused: [`GridError::Syntax`] for text
+/// written as neither form, otherwise the reason of the form it was written in.
+pub fn read_grid_reference(text: &str) -> Result<Coord, GridError> {
     match rustgis_geom::parse_mgrs(text) {
-        Ok(m) => m.centre().ok(),
-        Err(_) => rustgis_geom::parse_utm(text).ok(),
+        Ok(m) => m.centre(),
+        Err(mgrs) => match rustgis_geom::parse_utm(text) {
+            Err(GridError::Syntax) => Err(mgrs),
+            utm => utm,
+        },
     }
 }
 
@@ -628,6 +655,35 @@ mod tests {
             assert!(parse_grid_reference(q).is_none(), "{q}");
             assert!(!search(&s, q, 50).hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}");
         }
+        // The reason a reference was refused comes with the results and the command's answer,
+        // rather than reading as nothing found.
+        for (q, why) in [
+            ("33S 412345 5523456", GridError::Ambiguous),
+            ("33T 412345 5523456", GridError::BandMismatch),
+            ("38SAB4414084706", GridError::Square),
+            ("38SMB441408470", GridError::Digits),
+            ("38TMB4414084706", GridError::BandMismatch),
+            ("38TMJ", GridError::BandMismatch),
+            ("38Z 444141 3684706", GridError::Polar),
+            ("38ZMB4414084706", GridError::Polar),
+            ("99X 1 2", GridError::Zone),
+            ("33U 1000000 5523456", GridError::OutsideZone),
+        ] {
+            assert_eq!(read_grid_reference(q), Err(why), "{q}");
+            assert_eq!(search(&s, q, 50).grid_error, Some(why), "{q}");
+        }
+        // Text not written as a grid reference, and references that read, carry no reason.
+        for q in ["1C", "Paris", "Countries", "12 Main St", "2020", "40.7, -74.0", "38SMB", "38S 444141 3684706", "10 20"] {
+            assert_eq!(search(&s, q, 50).grid_error, None, "{q}");
+        }
+        let mut s = s;
+        let v = s.run("map.search", &json!({"query": "33S 412345 5523456"})).unwrap();
+        assert!(v["gridError"].as_str().is_some_and(|e| e.contains("south")), "{v}");
+        assert!(s.run("map.search", &json!({"query": "Paris"})).unwrap().get("gridError").is_none());
+        let e = s.run("map.search", &json!({"query": "33S 412345 5523456", "go": true})).unwrap_err();
+        assert!(e.contains("nothing matches") && e.contains("33 south"), "{e}");
+        let e = s.run("map.search", &json!({"query": "Zzyzx Qq", "go": true})).unwrap_err();
+        assert_eq!(e, "nothing matches 'Zzyzx Qq'");
         // MGRS-looking garbage never panics.
         let mut r = 1u64;
         let alphabet: Vec<char> = "0123456789 ACHINOSUVXZacz.-,°\u{0}é٣".chars().collect();
@@ -640,6 +696,22 @@ mod tests {
             let _ = parse_grid_reference(&q);
             let _ = parse_lat_lon(&q);
         }
+    }
+
+    /// UTM and MGRS are the Earth's grids: on another body's map they find no place (and give
+    /// no reason), while a latitude and longitude still does.
+    #[test]
+    fn grid_references_are_the_earths() {
+        let mut s = Session::new(crate::sample::world_project());
+        s.run("map.body", &json!({"name": "mars", "basemap": false})).unwrap();
+        for q in ["38SMB4414084706", "38S 444141 3684706", "33S 412345 5523456"] {
+            let r = search(&s, q, 50);
+            assert!(!r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}: {r:?}");
+            assert_eq!(r.grid_error, None, "{q}");
+        }
+        assert!(matches!(search(&s, "33.3, 44.4", 50).hits.first(), Some(Hit::Coordinate { .. })));
+        s.run("map.body", &json!({"name": "earth", "basemap": false})).unwrap();
+        assert!(matches!(search(&s, "38SMB4414084706", 50).hits.first(), Some(Hit::Coordinate { .. })));
     }
 
     #[test]

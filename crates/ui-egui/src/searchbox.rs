@@ -286,7 +286,12 @@ fn list_area(app: &mut RustGisApp, ui: &Ui, frame_r: Rect, list: &[Row], t: &Tok
                             picked = Some(k);
                         }
                     }
-                    if none {
+                    // A grid reference that names no place says why (the band, the square letters, S
+                    // that may mean south), also while places can still be searched for it.
+                    let grid = st.results.grid_error.filter(|_| st.query == st.searched && st.results.hits.is_empty());
+                    if let Some(e) = grid {
+                        note(ui, &grid_error_text(e), t.text_dim);
+                    } else if none {
                         note(ui, tl!("Nothing found"), t.text_dim);
                     }
                 });
@@ -373,10 +378,30 @@ fn describe(st: &State, row: &Row) -> (String, &'static str, String, Option<Stri
     }
 }
 
+/// Why a query written as a UTM position or an MGRS reference names no place.
+fn grid_error_text(e: rustgis_engine::geom::GridError) -> String {
+    use rustgis_engine::geom::GridError as G;
+    let reason = match e {
+        G::Syntax => tl!("not a UTM or MGRS grid reference"),
+        G::Zone => tl!("the UTM zone must be 1 to 60"),
+        G::Band => tl!("the latitude band must be a letter from C to X (not I or O)"),
+        G::Polar => tl!("polar (UPS) grid references, north of 84° N or south of 80° S, aren't supported"),
+        G::Square => tl!("the 100 km square letters aren't used in this zone"),
+        G::Digits => tl!("the grid digits must be an even count of 0 to 10, half for the easting and half for the northing"),
+        G::BandMismatch => tl!("the northing doesn't fall in the latitude band given"),
+        G::OutsideZone => tl!("the place lies outside the zone given"),
+        G::Ambiguous => {
+            tl!("S after the zone is latitude band S; for the southern hemisphere write the zone, then south (33 south 412345 3768000)")
+        }
+    };
+    crate::i18n::fmt("No place at this grid reference: {reason}", &[("reason", reason)])
+}
+
 fn note(ui: &mut Ui, text: &str, color: Color32) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        ui.label(egui::RichText::new(text).size(12.0).color(color));
+        // Wrapped at the list's width: a reason or an error can be longer than the list is wide.
+        ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(color)).wrap());
     });
 }
 
@@ -505,7 +530,7 @@ pub fn paint_marker(p: &egui::Painter, at: egui::Pos2, name: &str, t: &Tokens) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use egui::accesskit::Role;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     use super::*;
 
@@ -519,6 +544,53 @@ mod tests {
         });
         assert!(h.query_by_role_and_label(Role::Button, "Bogota, name").is_some());
         assert!(h.query_by_role_and_label(Role::Button, "Cities").is_some());
+    }
+
+    /// A grid reference that names no place says why under the box, before places are searched
+    /// and after none are found; a query that isn't one says nothing of grids.
+    #[test]
+    fn a_refused_grid_reference_says_why() {
+        for (query, places, want) in [
+            ("33S 412345 5523456", Places::Idle, Some("write the zone, then south")),
+            ("38TMJ", Places::Found(Vec::new()), Some("doesn't fall in the latitude band")),
+            ("Zzyzx Qq", Places::Found(Vec::new()), None),
+        ] {
+            let mut app = RustGisApp::with_sample();
+            let results = search::search(&app.session, query, search::LIMIT);
+            let st = &mut app.ui.search;
+            st.query = query.into();
+            st.searched = query.into();
+            st.results = results;
+            st.places = places;
+            st.open = true;
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(800.0, 800.0)).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    show(app, ui, &Tokens::get(&ctx));
+                },
+                app,
+            );
+            h.run();
+            // The list stays up while the box has the focus (as when typing).
+            h.get_by_role(Role::TextInput).focus();
+            h.run();
+            // A label's text is its accessible value.
+            let grid = h
+                .query_all_by(|n| n.role() == Role::Label && n.value().is_some_and(|v| v.starts_with("No place at this grid reference")))
+                .next()
+                .and_then(|n| n.accesskit_node().value());
+            match want {
+                Some(w) => {
+                    let label: String = grid.unwrap_or_else(|| panic!("{query}: no reason shown"));
+                    assert!(label.contains(w), "{query}: {label}");
+                }
+                None => {
+                    assert!(grid.is_none(), "{query}");
+                    assert!(h.query_by_label("Nothing found").is_some(), "{query}");
+                }
+            }
+        }
     }
 
     /// A number typed for one layer, then another layer picked in a list a places search left

@@ -125,8 +125,9 @@ rustgis-cli run --sample --cmd 'map.search={"query":"Tokyo","go":true}'
 
 **Right-click the map** for a menu about that place. Its first row shows the place in the status
 bar's coordinate format (latitude and longitude as `40.712800, -74.006000` for decimal degrees);
-click it to copy it. North of 84° N and south of 80° S, where UTM and MGRS have no zone, it shows
-and copies the latitude and longitude, and its hover text says why. Below it, **Copy As GeoJSON**
+click it to copy it. North of 84° N and south of 80° S, where UTM and MGRS have no zone, and on
+the map of another body than the Earth, it shows and copies the latitude and longitude, and its
+hover text says why. Below it, **Copy As GeoJSON**
 copies the place as a point feature, **Center Map Here** and **Zoom In Here** move the view, and **Directions To Here** and
 **Directions From Here** open the [Directions](#directions) pane. **Quick Analysis** runs a tool
 at the place: a buffer of 500 m, 1 km or 5 km (¼, 1 or 5 miles when the Directions pane is set
@@ -144,19 +145,21 @@ choice is remembered and also sets the right-click menu's first row. The same pl
 | Decimal degrees | `15.3000° E  49.8500° N` | four decimal places |
 | DMS | `15°18′00.0″ E  49°51′00.0″ N` | degrees, minutes and seconds |
 | UTM | `33U 521567 5521996` | zone and latitude band, easting and northing in metres, rounded to the metre |
-| MGRS | `33U WR 21566 21996` | zone and band, the 100 km square, easting and northing within it, truncated to the metre |
+| MGRS | `33U WR 21566 21996` | zone (two digits: `04Q FJ …`) and band, the 100 km square, easting and northing within it, truncated to the metre |
 
 UTM and MGRS are on WGS 84, with the zone exceptions for southern Norway (32V) and Svalbard (31X,
 33X, 35X and 37X), and cover 80° S to 84° N. Nearer the poles they would need the Universal Polar
-Stereographic grid, which RustGIS doesn't have: there the readout says it is outside the UTM
-zones rather than show a wrong reference. Scripts set the format with
+Stereographic grid, which RustGIS doesn't have: there the readout shows *No UTM here* (or
+*No MGRS here*) rather than a wrong reference, and so it does on the map of another body than
+the Earth, where degrees still read. Scripts set the format with
 `ui.coordinateFormat={"format":"utm"}` (`decimal`, `dms`, `utm` or `mgrs`); without `format`
 it steps to the next one.
 
 The [search box](#navigating) takes the same grid references, in any case:
 
 - **MGRS** with or without spaces: `33UWR2156621996`, `33U WR 21566 21996`, `33UWR 2156 2199`,
-  or a 100 km square alone, `33UWR`. The digits are an even count from 0 to 10, half for the
+  or a 100 km square alone, `33UWR`; a zone below 10 with or without its leading zero (`04QFJ`,
+  `4QFJ`). The digits are an even count from 0 to 10, half for the
   easting and half for the northing, and the search goes to the middle of the square they name.
   A 100 km square is also looked for in the attribute tables, since Sentinel-2 tiles are named
   after them.
@@ -167,9 +170,10 @@ The [search box](#navigating) takes the same grid references, in any case:
   Angeles); with a northing outside band S it could mean the southern hemisphere, so it finds
   nothing: write `south` instead.
 
-A reference that doesn't exist (square letters the zone doesn't use, a northing outside the band,
-an odd number of digits, a place outside the zone) finds nothing rather than a place somewhere
-else.
+A reference that doesn't exist (square letters the zone doesn't use, a northing or a square
+outside the band, an odd number of digits, a place outside the zone) finds nothing rather than a
+place somewhere else, and the list says why; `map.search` returns the reason as `gridError`. On
+the map of another body, grid references find nothing.
 
 ### Directions
 
