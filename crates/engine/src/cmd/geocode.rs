@@ -255,10 +255,19 @@ struct Lookup {
 fn lookup(g: &Geocoder, distinct: &[String]) -> Result<Lookup, String> {
     let mut out = Lookup::default();
     let (mut succeeded, mut in_a_row) = (0usize, 0usize);
+    let mut sent = false;
     for (i, a) in distinct.iter().enumerate() {
-        if i > 0 {
+        // An address longer than the server takes isn't sent cut short: it fails on its own, and
+        // isn't a refusal by the server (which would stop the run).
+        if let Err(e) = g.check_query(a) {
+            out.failed += 1;
+            out.error = Some(e);
+            continue;
+        }
+        if sent {
             std::thread::sleep(std::time::Duration::from_millis(g.spacing_ms()));
         }
+        sent = true;
         match crate::render::rustgis_tiles::geocode::search_blocking(g, a, 1) {
             Ok(found) => {
                 succeeded += 1;

@@ -14279,6 +14279,35 @@ fn geocoding_with_the_locatieserver() {
     assert!(g.spacing_ms() > 0);
 }
 
+/// Addresses longer than the Locatieserver takes, ahead of one it finds: each fails on its own
+/// (counted in the run's notice) and isn't sent, rather than counting as the server refusing
+/// requests, which would stop the run before the address it finds.
+#[test]
+fn geocoding_skips_addresses_too_long_for_the_server() {
+    use crate::render::rustgis_tiles::geocode::Geocoder;
+    let clean = br#"{"response":{"numFound":1,"start":0,"docs":[
+        {"weergavenaam":"Damrak 1, 1012LG Amsterdam","centroide_ll":"POINT(4.89803846 52.37714446)"}]}}"#;
+    let g = Geocoder::new(Some("locatieserver"), Some("http://127.0.0.1")).unwrap();
+    let path = g.url("Damrak 1, Amsterdam", 1).trim_start_matches("http://127.0.0.1").to_string();
+    let (base, asked) = serve_files(vec![(path, clean.to_vec())]);
+    let mut csv = "id,address\n".to_string();
+    for (i, c) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+        csv.push_str(&format!("{i},{}\n", c.repeat(401)));
+    }
+    csv.push_str("9,\"Damrak 1, Amsterdam\"\n");
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName": "lang.csv", "text": csv})).unwrap();
+    let r = s
+        .run("layer.geocode", &json!({"table": "lang", "address": "address", "provider": "locatieserver", "url": format!("{base}/free")}))
+        .unwrap();
+    assert_eq!((r["matched"].as_u64(), r["unmatched"].as_u64()), (Some(1), Some(6)), "{r}");
+    let failed: Vec<_> = s.notices.iter().filter(|n| n.text.contains("couldn't be looked up")).map(|n| n.text.clone()).collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0].starts_with("6 addresses") && failed[0].contains("401 characters"), "{failed:?}");
+    // Only the address that fits was sent.
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
 /// The SQL workspace's commands: a query's first rows without a layer, and a database's columns
 /// (through DuckDB when it is installed; without it, they say how to get it).
 #[cfg(not(target_arch = "wasm32"))]

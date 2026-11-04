@@ -4,7 +4,7 @@
 use egui::vec2;
 use rustgis_engine::render::rustgis_tiles::{
     cache,
-    geocode::{Geocoder, Place},
+    geocode::{Geocoder, Kind, Place},
 };
 use serde_json::{Map, Value, json};
 use web_time::Instant;
@@ -20,6 +20,8 @@ pub struct State {
     search: Option<(Geocoder, Answer)>,
     /// The places the last search found.
     pub places: Vec<Place>,
+    /// The kind of geocoder that found them (its credit is shown under them).
+    pub found_by: Option<Kind>,
     /// Whether a search is under way.
     pub searching: bool,
     job: Option<Job>,
@@ -61,6 +63,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
         match take(slot) {
             Some(r) => {
                 let r = r.and_then(|b| g.read(&b));
+                let kind = g.kind;
                 st.search = None;
                 st.searching = false;
                 if let Ok(found) = &r
@@ -73,6 +76,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                     Ok(f) => {
                         app.dialogs.error = None;
                         st.places = f.places;
+                        st.found_by = Some(kind);
                     }
                     Err(e) => app.dialogs.error = Some(e),
                 }
@@ -200,12 +204,7 @@ pub fn find_place(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             }
         }
     });
-    let attribution = if app.dialogs.mode == "locatieserver" {
-        tl!("Search results: PDOK Locatieserver (Kadaster)")
-    } else {
-        tl!("Search results © OpenStreetMap contributors")
-    };
-    let attribution = egui::RichText::new(attribution).small().weak();
+    let attribution = egui::RichText::new(attribution(&app.ui.geocode, app.dialogs.mode)).small().weak();
     ui.label(attribution);
     if let Some(p) = picked.and_then(|i| app.ui.geocode.places.get(i)).cloned() {
         rustgis_engine::cmd::geocode::go_to_place(&mut app.session, &p);
@@ -213,6 +212,16 @@ pub fn find_place(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         return true;
     }
     false
+}
+
+/// The credit for the places shown: those of the geocoder that found them (another may have been
+/// picked since), or of the one picked when none are shown.
+fn attribution(st: &State, mode: &str) -> &'static str {
+    let pdok = match st.found_by.filter(|_| !st.places.is_empty()) {
+        Some(kind) => kind == Kind::Locatieserver,
+        None => mode == "locatieserver",
+    };
+    if pdok { tl!("Search results: PDOK Locatieserver (Kadaster)") } else { tl!("Search results © OpenStreetMap contributors") }
 }
 
 /// The geocoder choice shared by both dialogs: OpenStreetMap's Nominatim, Photon, PDOK's
@@ -328,4 +337,41 @@ pub fn geocode(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         });
         Ok(())
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// The credit under the places is the geocoder's that found them, not the one picked since.
+    #[test]
+    fn the_credit_follows_the_places_not_the_picked_geocoder() {
+        let place = Place { name: "Damrak 1".into(), lon: 4.9, lat: 52.4, bbox: None };
+        let osm = tl!("Search results © OpenStreetMap contributors");
+        let pdok = tl!("Search results: PDOK Locatieserver (Kadaster)");
+        let mut st = State { places: vec![place], found_by: Some(Kind::Nominatim), ..State::default() };
+        assert_eq!(attribution(&st, "locatieserver"), osm);
+        st.found_by = Some(Kind::Locatieserver);
+        assert_eq!(attribution(&st, "nominatim"), pdok);
+        assert_eq!(attribution(&st, "locatieserver"), pdok);
+        // No places shown: the picked geocoder's.
+        st.places.clear();
+        assert_eq!(attribution(&st, "nominatim"), osm);
+        assert_eq!(attribution(&st, "locatieserver"), pdok);
+    }
+
+    /// A search's places land with the kind of geocoder that found them.
+    #[test]
+    fn a_search_records_the_geocoder_that_found_its_places() {
+        let mut app = RustGisApp::with_sample();
+        let slot: Answer = Slot::default();
+        *slot.lock().unwrap() = Some(Ok(br#"[{"display_name":"Damrak, Amsterdam","lat":"52.37","lon":"4.89"}]"#.to_vec()));
+        app.ui.geocode.search = Some((Geocoder::new(Some("nominatim"), None).unwrap(), slot));
+        app.dialogs.mode = "locatieserver";
+        poll(&mut app, &egui::Context::default());
+        assert_eq!(app.ui.geocode.places.len(), 1);
+        assert_eq!(app.ui.geocode.found_by, Some(Kind::Nominatim));
+        assert_eq!(attribution(&app.ui.geocode, app.dialogs.mode), tl!("Search results © OpenStreetMap contributors"));
+    }
 }
