@@ -6,7 +6,7 @@ use rustgis_engine::geom::Coord;
 use serde_json::json;
 
 use crate::widgets::{menu_row, submenu_row};
-use crate::{RustGisApp, i18n};
+use crate::{CoordReadout, RustGisApp, i18n};
 
 /// Decimal places of the coordinates shown, copied and sent to Google (~0.1 m).
 const PRECISION: usize = 6;
@@ -49,6 +49,19 @@ fn trim(v: f64) -> String {
 /// "lat, lon", as Google Maps writes a place.
 fn lat_lon(c: Coord) -> String {
     format!("{:.p$}, {:.p$}", c.y, c.x, p = PRECISION)
+}
+
+/// The coordinate row: the text it shows and copies, in the readout's format, and whether it fell
+/// back from it. Decimal degrees are `lat, lon` ([`lat_lon`]); north of 84° N or south of 80° S,
+/// UTM and MGRS fall back to them (and the row's hover text says why).
+fn coordinate_row(c: Coord, f: CoordReadout) -> (String, bool) {
+    match f {
+        CoordReadout::Decimal => (lat_lon(c), false),
+        _ => match f.format(c) {
+            Some(text) => (text, false),
+            None => (lat_lon(c), true),
+        },
+    }
 }
 
 /// The place as a GeoJSON point feature.
@@ -107,8 +120,17 @@ fn run(app: &mut RustGisApp, id: &str, params: serde_json::Value) {
 pub fn show(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
     let c = place(c);
     ui.set_min_width(240.0);
-    let coords = lat_lon(c);
-    if menu_row(ui, "locate", &coords, "", true).on_hover_text(tl!("Copy coordinates to the clipboard")).clicked() {
+    let format = app.map.coord_format;
+    let (coords, fell_back) = coordinate_row(c, format);
+    let hover = if fell_back {
+        i18n::fmt(
+            "Copy coordinates to the clipboard. No {format} here: outside the UTM zones (80° S to 84° N), so latitude and longitude",
+            &[("format", format.label())],
+        )
+    } else {
+        tl!("Copy coordinates to the clipboard").to_string()
+    };
+    if menu_row(ui, "locate", &coords, "", true).on_hover_text(hover).clicked() {
         ui.ctx().copy_text(coords);
         ui.close();
     }
@@ -239,5 +261,20 @@ mod tests {
         assert!(google_earth_url(c, 30.0).ends_with(",0a,150d,35y,0h,0t,0r"));
         assert!((web_zoom(156_543.033_92, 0.0)).abs() < 1e-9);
         assert!(point_geojson(c).contains("\"Point\""));
+    }
+
+    #[test]
+    fn the_coordinate_row_copies_the_chosen_format() {
+        let p = Coord::new(44.4, 33.3);
+        assert_eq!(coordinate_row(p, CoordReadout::Decimal), ("33.300000, 44.400000".into(), false));
+        assert_eq!(coordinate_row(p, CoordReadout::Dms), ("44°24′00.0″ E  33°18′00.0″ N".into(), false));
+        assert_eq!(coordinate_row(p, CoordReadout::Utm), ("38S 444141 3684706".into(), false));
+        assert_eq!(coordinate_row(p, CoordReadout::Mgrs), ("38S MB 44140 84706".into(), false));
+        // Where UTM has no zone, the row falls back to latitude and longitude (and says so).
+        let pole = Coord::new(10.0, 86.0);
+        for f in [CoordReadout::Utm, CoordReadout::Mgrs] {
+            assert_eq!(coordinate_row(pole, f), ("86.000000, 10.000000".into(), true), "{f:?}");
+        }
+        assert!(!coordinate_row(pole, CoordReadout::Dms).1);
     }
 }

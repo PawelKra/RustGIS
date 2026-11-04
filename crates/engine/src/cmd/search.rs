@@ -1,4 +1,5 @@
-//! The map's search box: one query matched against a coordinate, the map's layers, its
+//! The map's search box: one query matched against a coordinate (a latitude and longitude, or a
+//! UTM or MGRS grid reference), the map's layers, its
 //! bookmarks and the values in its layers' attribute tables. Places (geocoding) are the UI's,
 //! asked for on Enter: the public servers don't allow searching as one types.
 
@@ -16,7 +17,7 @@ pub fn commands() -> Vec<C> {
     vec![
         // Not a view command: going to a feature selects it.
         C::new("map.search", "Search", "Map", search_cmd).params(
-            r#"{"query": "a latitude and longitude (40.7, -74.0; 40°42'N 74°0'W), a layer, a bookmark or a value in a layer's table", "limit"?: 1–50, "go"?: true (the first hit) | index}"#,
+            r#"{"query": "a latitude and longitude (40.7, -74.0; 40°42'N 74°0'W), a UTM position (33U 412345 5523456; 33 north 412345 5523456) or an MGRS reference (33UVP1234523456; 33U VP 12345 23456), a layer, a bookmark or a value in a layer's table", "limit"?: 1–50, "go"?: true (the first hit) | index}"#,
         ),
     ]
 }
@@ -96,7 +97,8 @@ fn digest(time_urls: &[(f64, String)]) -> u64 {
 /// What a search found.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Hit {
-    /// A point typed as a latitude and longitude.
+    /// A point typed as a latitude and longitude, a UTM position or an MGRS reference (the centre
+    /// of the square it names).
     Coordinate { lon: f64, lat: f64 },
     /// A layer whose name matches.
     Layer { id: u32, name: String },
@@ -139,8 +141,17 @@ pub fn search(s: &Session, query: &str, limit: usize) -> Results {
     if q.is_empty() {
         return out;
     }
+    // A query that is plainly a coordinate (a decimal point, a degree mark, a hemisphere, a UTM
+    // zone and band) isn't looked for in the tables; two whole numbers (an id, years, a range)
+    // may be either, and so may a bare 100 km MGRS square, which names Sentinel-2's tiles (33UVP);
+    // an MGRS reference with digits is plainly a coordinate.
+    let mut plainly_coordinate = false;
     if let Some(c) = parse_lat_lon(&q) {
         out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
+        plainly_coordinate = q.chars().any(|c| matches!(c, '.' | '°' | 'º' | '\'' | '′' | '"' | '″') || c.is_alphabetic());
+    } else if let Some(c) = parse_grid_reference(&q) {
+        out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
+        plainly_coordinate = rustgis_geom::parse_mgrs(&q).map_or(true, |m| m.digits > 0);
     }
     let needle = q.to_lowercase();
     let map = s.map();
@@ -159,10 +170,6 @@ pub fn search(s: &Session, query: &str, limit: usize) -> Results {
             out.hits.push(Hit::Bookmark { name: b.name.clone() });
         }
     }
-    // A query that is plainly a coordinate (a decimal point, a degree mark, a hemisphere) isn't
-    // looked for in the tables; two whole numbers (an id, years, a range) may be either.
-    let plainly_coordinate = matches!(out.hits.first(), Some(Hit::Coordinate { .. }))
-        && q.chars().any(|c| matches!(c, '.' | '°' | 'º' | '\'' | '′' | '"' | '″') || c.is_alphabetic());
     if q.chars().count() >= MIN_FEATURE_QUERY && !plainly_coordinate {
         let number = q.parse::<f64>().ok().filter(|n| n.is_finite());
         for l in map.layers.iter().filter(|l| !l.is_raster() && !l.graphics) {
@@ -337,6 +344,16 @@ fn search_cmd(s: &mut Session, p: &Value) -> CmdResult {
         go_to(s, hit)?;
     }
     Ok(json!({"hits": r.hits.iter().map(Hit::to_json).collect::<Vec<_>>(), "partial": r.partial}))
+}
+
+/// A place typed as an MGRS reference (the centre of the square it names) or a UTM position, in
+/// the forms [`rustgis_geom::parse_mgrs`] and [`rustgis_geom::parse_utm`] accept; `None` for
+/// anything else, an ambiguous UTM zone letter or a reference that names no place.
+pub fn parse_grid_reference(text: &str) -> Option<Coord> {
+    match rustgis_geom::parse_mgrs(text) {
+        Ok(m) => m.centre().ok(),
+        Err(_) => rustgis_geom::parse_utm(text).ok(),
+    }
 }
 
 /// `lat, lon` rounded to six decimals (about 0.1 m), without trailing zeros.
@@ -540,6 +557,89 @@ mod tests {
         assert_eq!(ll("40°42.767' -74°0.35'"), Some((40.7128, -74.0058)));
         assert_eq!(ll("40 42 46 N, 74 0 21 W"), Some((40.7128, -74.0058)));
         assert_eq!(ll("51.5074,-0.1278"), Some((51.5074, -0.1278)));
+    }
+
+    #[test]
+    fn grid_references_are_found() {
+        let s = Session::new(crate::sample::world_project());
+        let near = |r: &Results, lon: f64, lat: f64| matches!(r.hits.first(), Some(Hit::Coordinate { lon: x, lat: y }) if (x - lon).abs() < 1e-4 && (y - lat).abs() < 1e-4);
+        // GeographicLib's GeoConvert example, 33.3° N 44.4° E: 38n 444140.54 3684706.36,
+        // 38SMB4414084706.
+        for q in [
+            "38S 444141 3684706",
+            "38s 444140.54, 3684706.36",
+            "38 north 444141 3684706",
+            "38N 444141 3684706",
+            "38SMB4414084706",
+            "38S MB 44140 84706",
+            "38smb 44140 84706",
+        ] {
+            let r = search(&s, q, 50);
+            assert!(near(&r, 44.4, 33.3), "{q}: {r:?}");
+        }
+        // A 100 km square is found at its centre.
+        let r = search(&s, "38SMB", 50);
+        let u = rustgis_geom::to_utm(match r.hits.first() {
+            Some(Hit::Coordinate { lon, lat }) => Coord::new(*lon, *lat),
+            other => panic!("{other:?}"),
+        })
+        .unwrap();
+        assert!((u.easting - 450_000.0).abs() < 1e-3 && (u.northing - 3_650_000.0).abs() < 1e-3, "{u:?}");
+        // A table holding tile names is searched for an MGRS reference, not for a UTM position.
+        let mut s = s;
+        s.run(
+            "layer.addDataText",
+            &json!({"fileName": "tiles.csv", "text": "tile,lon,lat\n38SMB,44.5,33\n38S 444141 3684706,44.4,33.3\n"}),
+        )
+        .unwrap();
+        let r = search(&s, "38SMB", 50);
+        assert!(matches!(r.hits.first(), Some(Hit::Coordinate { .. })), "{r:?}");
+        assert!(r.hits.iter().any(|h| matches!(h, Hit::Feature { value, .. } if value == "38SMB")), "{r:?}");
+        let r = search(&s, "38S 444141 3684706", 50);
+        assert!(!r.hits.iter().any(|h| matches!(h, Hit::Feature { .. })), "{r:?}");
+        // Only the bare 100 km square names a tile: a reference with digits is plainly a place.
+        s.run("layer.addDataText", &json!({"fileName": "refs.csv", "text": "ref,lon,lat\n38SMB4414084706,44.4,33.3\n"})).unwrap();
+        let r = search(&s, "38SMB4414084706", 50);
+        assert!(matches!(r.hits.first(), Some(Hit::Coordinate { .. })), "{r:?}");
+        assert!(!r.hits.iter().any(|h| matches!(h, Hit::Feature { .. })), "{r:?}");
+        // The command goes there.
+        s.run("map.search", &json!({"query": "38SMB4414084706", "go": true})).unwrap();
+        let centre = s.map().camera.center_lonlat();
+        assert!((centre.x - 44.4).abs() < 1e-3 && (centre.y - 33.3).abs() < 1e-3, "{centre:?}");
+    }
+
+    #[test]
+    fn bad_grid_references_find_no_place() {
+        let s = Session::new(crate::sample::world_project());
+        for q in [
+            // Band S with a northing outside it may be the southern hemisphere.
+            "33S 412345 5523456",
+            // The northing isn't in band T; the square letters aren't zone 38's; odd digits.
+            "33T 412345 5523456",
+            "38SAB4414084706",
+            "38SMB441408470",
+            "38TMB4414084706",
+            // Polar (UPS) references aren't read.
+            "38Z 444141 3684706",
+            "38ZMB4414084706",
+            "99X 1 2",
+            "1C",
+        ] {
+            assert!(parse_grid_reference(q).is_none(), "{q}");
+            assert!(!search(&s, q, 50).hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}");
+        }
+        // MGRS-looking garbage never panics.
+        let mut r = 1u64;
+        let alphabet: Vec<char> = "0123456789 ACHINOSUVXZacz.-,°\u{0}é٣".chars().collect();
+        for _ in 0..5_000 {
+            let mut q = String::new();
+            for _ in 0..(r % 24) {
+                r = r.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                q.push(alphabet[(r >> 33) as usize % alphabet.len()]);
+            }
+            let _ = parse_grid_reference(&q);
+            let _ = parse_lat_lon(&q);
+        }
     }
 
     #[test]

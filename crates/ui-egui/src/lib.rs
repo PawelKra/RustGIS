@@ -25,6 +25,7 @@ mod connectiontree;
 mod connectionui;
 #[cfg(not(target_arch = "wasm32"))]
 mod connectui;
+mod coordreadout;
 mod cswui;
 mod cubesui;
 mod diagnosticlog;
@@ -105,6 +106,7 @@ use serde_json::{Value, json};
 pub use autosave::FolderStore;
 pub use autosave::{Recovery, RecoveryStore};
 pub use chrome::{DoubleClick, TitlebarMetrics};
+pub use coordreadout::CoordReadout;
 pub use rustgis_assistant;
 pub use rustgis_engine;
 pub use widgets::big_split_menu;
@@ -1225,6 +1227,14 @@ impl RustGisApp {
             .unwrap_or_else(|| "Meters".into());
         self.ui.measurement_imperial =
             self.services.load_pref.as_ref().and_then(|load| load("measurement_units")).as_deref() == Some("imperial");
+        // The pointer's coordinate format; an unknown or missing one reads as decimal degrees.
+        self.map.coord_format = self
+            .services
+            .load_pref
+            .as_ref()
+            .and_then(|load| load(coordreadout::PREF))
+            .and_then(|code| CoordReadout::from_code(&code))
+            .unwrap_or_default();
         // The GPU map backend: RUSTGIS_GPU forces it on, else the saved preference.
         self.map.gpu_enabled = std::env::var_os("RUSTGIS_GPU").is_some()
             || self.services.load_pref.as_ref().and_then(|load| load("ui.map.gpu")).as_deref() == Some("1");
@@ -2348,6 +2358,18 @@ impl RustGisApp {
                 self.ui.measurement_imperial = imperial;
                 if let Some(save) = &self.services.save_pref {
                     save("measurement_units", if imperial { "imperial" } else { "metric" });
+                }
+            }
+            "ui.coordinateFormat" => {
+                let format = match p.get("format") {
+                    None | Some(Value::Null) => self.map.coord_format.next(),
+                    Some(Value::String(v)) => CoordReadout::from_code(v)
+                        .ok_or_else(|| tl!("The coordinate format must be decimal, dms, utm or mgrs").to_string())?,
+                    _ => return Err(tl!("The coordinate format must be decimal, dms, utm or mgrs").into()),
+                };
+                self.map.coord_format = format;
+                if let Some(save) = &self.services.save_pref {
+                    save(coordreadout::PREF, format.code());
                 }
             }
             "ui.moveSharedVertices" => {
