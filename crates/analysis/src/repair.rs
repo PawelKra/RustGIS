@@ -13,7 +13,10 @@
 //!   hole outside its exterior ring disappears and holes that overlap merge; and the feature is
 //!   the union of its parts, so parts that overlap merge. geo's boolean overlay (i_overlay) does
 //!   the arithmetic on an integer grid, which moves coordinates a little ([`grid_step`],
-//!   [`GRID_STEPS_MOVED`]), and writes each piece of a split interior as a part of its own.
+//!   [`GRID_STEPS_MOVED`]), and writes each piece of a split interior as a part of its own. A hole
+//!   or part narrower than a step of that grid in any direction (up to √2 steps across a diagonal,
+//!   [`narrower_than`]) may be left no area by it, so it is dropped before the overlay and counted
+//!   ([`Repaired::narrow`]).
 //! - A repaired geometry is checked again and written only when it is valid. A feature too busy
 //!   to check or overlay within the work bound, or without the memory for it, or one the overlay
 //!   fails on, is left as it was ([`Kept`]): never dropped.
@@ -99,7 +102,12 @@ pub(crate) struct Repaired {
     pub codes: Vec<Code>,
     /// Rings and parts left out: too few distinct points, or no area.
     pub dropped: usize,
-    /// When the overlay rebuilt it, how far its coordinates may have moved, in its units.
+    /// Holes and parts left out of the overlay as narrower than a step of its grid in any
+    /// direction, where they would have no area ([`narrower_than`]); written as `no_area` after
+    /// the codes.
+    pub narrow: usize,
+    /// When the overlay rebuilt it, how far its coordinates may have moved, in their units (degrees,
+    /// as coordinates are stored).
     pub moved: Option<f64>,
 }
 
@@ -141,7 +149,7 @@ pub(crate) fn repair_with(g: Option<&Geometry>, budget: u64, allow: &dyn Fn(usiz
             Err(limit) => Outcome::Kept(kept_for(limit)),
             Ok((parts, _)) if parts.is_empty() => Outcome::Gone(Gone::TooFewPoints),
             Ok((parts, dropped)) => {
-                verified(Repaired { geometry: Geometry::Line(parts), codes: first.codes(), dropped, moved: None }, budget, allow)
+                verified(Repaired { geometry: Geometry::Line(parts), codes: first.codes(), dropped, narrow: 0, moved: None }, budget, allow)
             }
         },
         Geometry::Polygon(polys) => polygon(polys, &first, budget, allow, has_room),
@@ -289,7 +297,7 @@ fn polygon(
     }
     codes.sort_unstable();
     if second.problems.is_empty() {
-        return Outcome::Repaired(Repaired { geometry: fixed, codes, dropped, moved: None });
+        return Outcome::Repaired(Repaired { geometry: fixed, codes, dropped, narrow: 0, moved: None });
     }
     let Geometry::Polygon(parts) = &fixed else { return Outcome::Kept(Kept::Failed) };
     if gone(second).is_some() {
@@ -315,7 +323,7 @@ fn polygon(
         Err(limit) => return Outcome::Kept(kept_for(limit)),
     };
     let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| by_area(parts, &crossing, room)));
-    let (polys, no_area, found) = match rebuilt {
+    let Rebuilt { polys, no_area, narrow, found } = match rebuilt {
         Ok(Ok(rebuilt)) => rebuilt,
         Ok(Err(kept)) => return Outcome::Kept(kept),
         Err(_) => return Outcome::Kept(Kept::Failed),
@@ -330,7 +338,7 @@ fn polygon(
     }
     codes.sort_unstable();
     let moved = Some(step * GRID_STEPS_MOVED);
-    verified(Repaired { geometry: Geometry::Polygon(polys), codes, dropped: dropped.saturating_add(no_area), moved }, budget, allow)
+    verified(Repaired { geometry: Geometry::Polygon(polys), codes, dropped: dropped.saturating_add(no_area), narrow, moved }, budget, allow)
 }
 
 /// The step of the integer grid i_overlay rounds the points `pts` to: it takes half the larger
@@ -351,22 +359,171 @@ pub(crate) fn grid_step(pts: impl Iterator<Item = (f64, f64)>) -> Option<f64> {
     (scale.is_normal() && step.is_normal()).then_some(step)
 }
 
-/// Whether the overlay can run on `rings`: they have a grid ([`grid_step`]).
-fn on_grid<'a>(rings: impl Iterator<Item = &'a geo::LineString<f64>>) -> Result<(), Kept> {
-    grid_step(rings.flat_map(|r| r.0.iter().map(|c| (c.x, c.y)))).map(|_| ()).ok_or(Kept::Failed)
+/// The step of the grid the overlay rounds `rings` to ([`grid_step`]); an error when there is
+/// none, and the overlay can't run on them.
+fn on_grid<'a>(rings: impl Iterator<Item = &'a geo::LineString<f64>>) -> Result<f64, Kept> {
+    grid_step(rings.flat_map(|r| r.0.iter().map(|c| (c.x, c.y)))).ok_or(Kept::Failed)
+}
+
+/// Every ring of `polys`, as the overlay takes them in.
+fn rings_of(polys: &[geo::Polygon<f64>]) -> impl Iterator<Item = &geo::LineString<f64>> {
+    polys.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+}
+
+/// Whether `poly` is narrower than `step`, the step of the overlay's grid, in some direction:
+/// rounded to that grid, its points may then all fall on one line, which leaves it no area.
+/// Whether they do depends on where it lies between the grid's lines, so such a polygon is dropped
+/// before the overlay, and counted, rather than left to the overlay to drop unsaid.
+///
+/// Rounding moves a point by at most half a step on each axis, so across a line with unit normal
+/// `(nx, ny)` by at most `(|nx| + |ny|) / 2` steps. Points rounded onto one such line were within
+/// `|nx| + |ny|` steps of each other across it: one step across the axes, up to √2 steps at 45°. So
+/// `poly` is narrower when, in some direction, its width is less than `|nx| + |ny|` steps. Between
+/// the axes and the normals of its convex hull's edges, width and allowance are each a sinusoid of
+/// the direction, and their ratio is monotonic, so the least ratio is found in one of those
+/// directions: the axes, by the extent, and each hull edge, by the hull vertex farthest from its
+/// line, which rotating calipers find in one turn around the hull (M. I. Shamos, "Computational
+/// Geometry", PhD thesis, Yale University, 1978; G. T. Toussaint, "Solving geometric problems with
+/// the rotating calipers", Proc. IEEE MELECON '83, 1983). Only the exterior ring makes the hull.
+///
+/// Only thin polygons pay for the hull. A polygon of least width `w` lies in a strip `w` wide and
+/// as long as its diameter, at most the diagonal of its extent, so its area is at most `w` times
+/// that diagonal; its rings here are simple (the overlay's, or ones the check found not to cross
+/// themselves), so the exterior ring's area is the area it covers. An area of twice the step times
+/// the diagonal or more means a width of more than √2 steps, wide enough in every direction (twice,
+/// so that the rounding of the area's sum can't tip it). The hull sorts the vertices the overlay
+/// is charged for ([`OVERLAY_COST`]), in buffers reserved fallibly.
+fn narrower_than(poly: &geo::Polygon<f64>, step: f64, room: Room) -> Result<bool, Limit> {
+    let ring = &poly.exterior().0;
+    let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for c in ring {
+        (lo_x, lo_y, hi_x, hi_y) = (lo_x.min(c.x), lo_y.min(c.y), hi_x.max(c.x), hi_y.max(c.y));
+    }
+    let (wide, high) = (hi_x - lo_x, hi_y - lo_y);
+    if wide.min(high) < step {
+        return Ok(true);
+    }
+    // Twice the area, from the first vertex, so that far from the origin no precision is lost.
+    let Some(o) = ring.first() else { return Ok(true) };
+    let twice = ring.windows(2).fold(0.0, |s, w| match w {
+        [a, b] => s + (a.x - o.x) * (b.y - o.y) - (b.x - o.x) * (a.y - o.y),
+        _ => s,
+    });
+    if twice.abs() >= 4.0 * step * wide.hypot(high) {
+        return Ok(false);
+    }
+    let hull = hull(ring, room)?;
+    let n = hull.len();
+    if n < 3 {
+        // All on one line.
+        return Ok(true);
+    }
+    // Twice the area of the triangle of edge `i` and vertex `k`: the vertex's distance from the
+    // edge's line times the edge's length; positive inside, as the hull turns anticlockwise.
+    let across = |i: usize, k: usize| -> Option<f64> {
+        let (a, b, p) = (hull.get(i % n)?, hull.get((i + 1) % n)?, hull.get(k % n)?);
+        Some((b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x))
+    };
+    // The calipers turn once around the hull; the bound on their steps only guards the loop.
+    let (mut far, mut turns) = (1usize, 0usize);
+    for i in 0..n {
+        while turns < n.saturating_mul(3) {
+            match (across(i, far), across(i, far + 1)) {
+                (Some(here), Some(next)) if next > here => {
+                    far = (far + 1) % n;
+                    turns += 1;
+                }
+                _ => break,
+            }
+        }
+        let (Some(a), Some(b), Some(d)) = (hull.get(i), hull.get((i + 1) % n), across(i, far)) else { return Ok(false) };
+        // The farthest vertex's distance, `d / |e|`, against the allowance `(|ex| + |ey|) / |e|` steps.
+        if d < step * ((b.x - a.x).abs() + (b.y - a.y).abs()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The convex hull of `pts`, anticlockwise, without collinear points or a closing repeat, by
+/// Andrew's monotone chain (A. M. Andrew, "Another efficient algorithm for convex hulls in two
+/// dimensions", Information Processing Letters 9(5), 1979), in buffers reserved fallibly.
+fn hull(pts: &[geo::Coord<f64>], room: Room) -> Result<Vec<geo::Coord<f64>>, Limit> {
+    let mut pts = room.collect(pts.len(), pts.iter().copied())?;
+    pts.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    pts.dedup();
+    let turns_left = |h: &[geo::Coord<f64>], p: geo::Coord<f64>| match h {
+        [.., a, b] => (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) > 0.0,
+        _ => true,
+    };
+    let mut hull = room.vec(pts.len().saturating_add(1))?;
+    // The lower chain, left to right, then the upper, right to left, on top of it.
+    for &p in &pts {
+        while !turns_left(&hull, p) {
+            hull.pop();
+        }
+        room.grow(&mut hull)?;
+        hull.push(p);
+    }
+    let lower = hull.len();
+    for &p in pts.iter().rev().skip(1) {
+        while hull.len() > lower && !turns_left(&hull, p) {
+            hull.pop();
+        }
+        room.grow(&mut hull)?;
+        hull.push(p);
+    }
+    // The upper chain ends where the lower began.
+    if hull.len() > 1 {
+        hull.pop();
+    }
+    Ok(hull)
+}
+
+/// `polys` without those narrower than `step` ([`narrower_than`]), adding how many were left out
+/// to `narrow`.
+fn wider(mut polys: Vec<geo::Polygon<f64>>, step: f64, narrow: &mut usize, room: Room) -> Result<Vec<geo::Polygon<f64>>, Kept> {
+    let before = polys.len();
+    let mut failed = None;
+    polys.retain(|p| match narrower_than(p, step, room) {
+        Ok(thin) => !thin,
+        Err(limit) => {
+            failed.get_or_insert(limit);
+            true
+        }
+    });
+    if let Some(limit) = failed {
+        return Err(kept_for(limit));
+    }
+    *narrow = narrow.saturating_add(before - polys.len());
+    Ok(polys)
 }
 
 /// What the rebuild by area found that the checks may have missed: a part with a ring crossing
 /// itself isn't related to its other rings or to other parts (see `Checked::unrelated`).
 type Found = Vec<Code>;
 
+/// What [`by_area`] made of a feature's parts.
+struct Rebuilt {
+    /// The rings of the result.
+    polys: Vec<Vec<Vec<Coord>>>,
+    /// Rings and parts left without area.
+    no_area: usize,
+    /// Holes and parts dropped as narrower than a step of the overlay's grid in any direction.
+    narrow: usize,
+    found: Found,
+}
+
 /// The rebuild by area (see the module doc) of `parts`, closed rings each with 3 distinct points
 /// or more, of which those in `crossing` (part, ring; sorted) cross, touch or run back over
-/// themselves. The rings of the result, how many rings and parts were left without area, and what
-/// it found: [`Code::HoleOutsideShell`] when some of the holes of a part with such a ring lie
-/// outside its exterior ring's area, and [`Code::PartsOverlap`] when parts merged, which the union
-/// tells by making fewer polygons than it was given (pieces that only touch at points stay apart).
-fn by_area(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -> Result<(Vec<Vec<Vec<Coord>>>, usize, Found), Kept> {
+/// themselves. The rings of the result, how many rings and parts were left without area, how many
+/// holes and parts were dropped as narrower, in any direction, than a step of the grid of the
+/// overlay that takes them out or merges them, and what it found: [`Code::HoleOutsideShell`] when some of the holes of a
+/// part with such a ring lie outside its exterior ring's area, [`Code::RingsIntersect`] when holes
+/// of such a part merged, and [`Code::PartsOverlap`] when parts merged, which each union tells by
+/// making fewer polygons than it was given (pieces that only touch at points stay apart; the narrow
+/// ones are dropped first, so their vanishing isn't taken for a merge).
+fn by_area(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -> Result<Rebuilt, Kept> {
     let empty = geo::MultiPolygon::<f64>::new(vec![]);
     let area = |ring: &Vec<Coord>, at: (usize, usize)| -> Result<geo::MultiPolygon<f64>, Kept> {
         let ring = geo::LineString(room.collect(ring.len(), ring.iter().map(|c| geo::Coord { x: c.x, y: c.y })).map_err(kept_for)?);
@@ -380,6 +537,7 @@ fn by_area(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -
     };
     let mut all: Vec<geo::Polygon<f64>> = Vec::new();
     let mut no_area = 0usize;
+    let mut narrow = 0usize;
     let mut found = Found::new();
     for (p, rings) in parts.iter().enumerate() {
         let Some((shell, holes)) = rings.split_first() else { continue };
@@ -400,18 +558,33 @@ fn by_area(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -
                 cut.push(piece);
             }
         }
+        // Holes narrower than a step of the grid the difference below rounds to, in any direction,
+        // are dropped first.
+        if !cut.is_empty() {
+            let step = on_grid(rings_of(&shell.0).chain(rings_of(&cut)))?;
+            cut = wider(cut, step, &mut narrow, room)?;
+        }
         let part = if cut.is_empty() {
             shell
         } else {
             // The holes' areas, each wound the same way, make their union under non-zero winding.
             let cut = geo::MultiPolygon::new(cut);
-            on_grid(shell.0.iter().chain(&cut.0).flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors())))?;
             let related = (0..rings.len()).all(|r| crossing.binary_search(&(p, r)).is_err());
             if !related
                 && !found.contains(&Code::HoleOutsideShell)
                 && !cut.boolean_op_with_fill_rule(&shell, OpType::Difference, FillRule::NonZero).0.is_empty()
             {
                 found.push(Code::HoleOutsideShell);
+            }
+            // Holes that overlap or touch along a line merge, which their union tells by making
+            // fewer polygons than it was given, as the parts' union does below.
+            if !related
+                && cut.0.len() > 1
+                && !found.contains(&Code::RingsIntersect)
+                && on_grid(rings_of(&cut.0)).is_ok()
+                && cut.boolean_op_with_fill_rule(&empty, OpType::Union, FillRule::NonZero).0.len() < cut.0.len()
+            {
+                found.push(Code::RingsIntersect);
             }
             shell.boolean_op_with_fill_rule(&cut, OpType::Difference, FillRule::NonZero)
         };
@@ -423,9 +596,13 @@ fn by_area(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -
             all.push(piece);
         }
     }
+    if parts.len() > 1 && all.len() > 1 {
+        // Parts narrower than a step of the union's grid, in any direction, are dropped first.
+        let step = on_grid(rings_of(&all))?;
+        all = wider(all, step, &mut narrow, room)?;
+    }
     let all = geo::MultiPolygon::new(all);
     let merged = if parts.len() > 1 && all.0.len() > 1 {
-        on_grid(all.0.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors())))?;
         let merged = all.boolean_op_with_fill_rule(&empty, OpType::Union, FillRule::NonZero);
         if merged.0.len() < all.0.len() {
             found.push(Code::PartsOverlap);
@@ -434,7 +611,7 @@ fn by_area(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -
     } else {
         all
     };
-    Ok((polygons(&merged, room).map_err(kept_for)?, no_area, found))
+    Ok(Rebuilt { polys: polygons(&merged, room).map_err(kept_for)?, no_area, narrow, found })
 }
 
 /// The overlay's polygons as rings, copied fallibly.
@@ -556,9 +733,64 @@ mod tests {
         // The overlay runs only on rings with a grid: in the browser, where its failures can't be
         // caught, it never sees one it can't scale.
         let ls = |pts: &[(f64, f64)]| geo::LineString::from(pts.to_vec());
-        assert_eq!(on_grid([ls(&[(0., 0.), (1., 0.), (0., 1.), (0., 0.)])].iter()), Ok(()));
+        assert_eq!(on_grid([ls(&[(0., 0.), (1., 0.), (0., 1.), (0., 0.)])].iter()), Ok((-30f64).exp2()));
         assert_eq!(on_grid([ls(&[(0., 0.), (1e-310, 0.), (0., 1e-310), (0., 0.)])].iter()), Err(Kept::Failed));
         assert_eq!(on_grid([ls(&[(-1e308, 0.), (1e308, 0.), (0., 1.), (-1e308, 0.)])].iter()), Err(Kept::Failed));
+    }
+
+    #[test]
+    fn widths_are_measured_in_every_direction() {
+        let p = |pts: &[(f64, f64)]| geo::Polygon::new(geo::LineString::from(pts.to_vec()), vec![]);
+        let thin = |pts: &[(f64, f64)], step: f64| narrower_than(&p(pts), step, ANY);
+        // A strip at 45°, 100 long and 1 wide: 70 across and up, but within √2 steps across only
+        // at a step of more than 1 / √2.
+        let a = 0.5f64.sqrt();
+        let strip = [(0., 0.), (70.7, 70.7), (70.7 - a, 70.7 + a), (-a, a), (0., 0.)];
+        assert_eq!(thin(&strip, 0.70), Ok(false));
+        assert_eq!(thin(&strip, 0.71), Ok(true));
+        // On the axes, a step is enough, and the bound is strict.
+        let wide = [(0., 0.), (100., 0.), (100., 1.), (0., 1.), (0., 0.)];
+        assert_eq!(thin(&wide, 1.0), Ok(false));
+        assert_eq!(thin(&wide, 1.0 + 1e-9), Ok(true));
+        // A triangle's least width is its smallest height: here 4.8, from the right angle to the
+        // hypotenuse of a 6, 8, 10 triangle at 36.87°, where rounding moves a point across by up
+        // to 0.7 steps (cos + sin over 2); its legs, 6 and 8, lie on the axes.
+        let triangle = [(0., 0.), (8., 0.), (0., 6.), (0., 0.)];
+        assert_eq!(thin(&triangle, 4.8 / 1.4 - 1e-9), Ok(false));
+        assert_eq!(thin(&triangle, 4.8 / 1.4 + 1e-9), Ok(true));
+        // Many vertices on a thin lens, far from the origin, wound either way.
+        let lens: Vec<(f64, f64)> = (0..=2000)
+            .map(|k| {
+                let t = std::f64::consts::TAU * f64::from(k) / 2000.0;
+                (1e6 + 50.0 * t.cos() - 0.2 * t.sin(), 1e6 + 50.0 * t.cos() + 0.2 * t.sin())
+            })
+            .collect();
+        let back: Vec<(f64, f64)> = lens.iter().rev().copied().collect();
+        // 0.4 √2 wide across its diagonal: thin at a step over 0.4.
+        for l in [&lens, &back] {
+            assert_eq!(thin(l, 0.399), Ok(false));
+            assert_eq!(thin(l, 0.401), Ok(true));
+        }
+        // Points in a row, all one point, nothing, or not numbers: thin or not, but never a panic.
+        assert_eq!(thin(&[(0., 0.), (5., 5.), (10., 10.), (0., 0.)], 1e-9), Ok(true));
+        assert_eq!(thin(&[(3., 3.), (3., 3.), (3., 3.), (3., 3.)], 1e-9), Ok(true));
+        assert_eq!(thin(&[], 1e-9), Ok(true));
+        let _ = thin(&[(f64::NAN, 0.), (1., f64::NAN), (2., 2.), (f64::NAN, 0.)], 1e-9);
+        let _ = thin(&[(f64::INFINITY, 0.), (1., 1.), (0., f64::NEG_INFINITY), (f64::INFINITY, 0.)], 1e-9);
+        // The hull's buffers are asked for first.
+        assert_eq!(narrower_than(&p(&strip), 0.70, Room(&|_| false)), Err(Limit::Memory));
+        // The hull: anticlockwise, without the points inside or on its edges, or a repeat.
+        let hull_of = |pts: &[(f64, f64)]| -> Vec<(f64, f64)> {
+            let pts: Vec<geo::Coord<f64>> = pts.iter().map(|&(x, y)| geo::Coord { x, y }).collect();
+            hull(&pts, ANY).unwrap().iter().map(|c| (c.x, c.y)).collect()
+        };
+        assert_eq!(
+            hull_of(&[(0., 0.), (2., 0.), (1., 1.), (2., 2.), (1., 0.), (0., 2.), (0., 0.)]),
+            [(0., 0.), (2., 0.), (2., 2.), (0., 2.)]
+        );
+        assert_eq!(hull_of(&[(0., 0.), (1., 1.), (2., 2.)]), [(0., 0.), (2., 2.)]);
+        assert_eq!(hull_of(&[(1., 1.)]), [(1., 1.)]);
+        assert_eq!(hull_of(&[]), []);
     }
 
     #[test]
@@ -635,8 +867,12 @@ mod tests {
     #[test]
     fn a_reservation_refused_leaves_the_feature_as_it_was() {
         let hole_out: Ring = &[(20., 20.), (21., 20.), (21., 21.), (20., 20.)];
+        // A strip at 45°, 1.45 steps of the union's grid wide: only its hull tells it is wide enough.
+        let a = 1.45 * (-20f64).exp2() / 2f64.sqrt();
+        let strip: Ring = &[(1000., 1000.), (1005., 1005.), (1005. - a, 1005. + a), (1000. - a, 1000. + a), (1000., 1000.)];
         for g in [
             poly(&[BOWTIE]),
+            multi(&[&[SQUARE], &[&[(5., 5.), (15., 5.), (15., 15.), (5., 15.), (5., 5.)]], &[strip]]),
             multi(&[&[SQUARE, hole_out], &[&[(5., 5.), (15., 5.), (15., 15.), (5., 15.), (5., 5.)]]]),
             poly(&[&[(0., 0.), (10., 0.), (10., 0.), (10., 10.)]]),
             Geometry::Line(vec![ring(&[(0., 0.), (1., 1.), (1., 1.)])]),
@@ -674,9 +910,9 @@ mod tests {
 
     #[test]
     fn a_repair_that_is_not_valid_is_not_kept() {
-        let bad = Repaired { geometry: poly(&[BOWTIE]), codes: vec![Code::SelfIntersection], dropped: 0, moved: None };
+        let bad = Repaired { geometry: poly(&[BOWTIE]), codes: vec![Code::SelfIntersection], dropped: 0, narrow: 0, moved: None };
         assert_eq!(verified(bad, validity::MAX_WORK, &|_| true), Outcome::Kept(Kept::Failed));
-        let busy = Repaired { geometry: poly(&[BOWTIE]), codes: vec![], dropped: 0, moved: None };
+        let busy = Repaired { geometry: poly(&[BOWTIE]), codes: vec![], dropped: 0, narrow: 0, moved: None };
         assert_eq!(verified(busy, 0, &|_| true), Outcome::Kept(Kept::Work));
     }
 }

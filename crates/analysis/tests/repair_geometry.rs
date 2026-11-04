@@ -334,6 +334,19 @@ fn several_problems_in_one_feature() {
     // Without a hole outside, none is said to be.
     let g = multi(&[&[SQUARE], &[&[(5., 5.), (15., 15.), (15., 5.), (5., 15.), (5., 5.)], &[(12., 8.), (13., 8.), (13., 9.), (12., 8.)]]]);
     assert_eq!(one(GeometryType::Polygon, Some(g)).1, "self_intersection, parts_overlap");
+    // Holes of a part crossing itself that overlap are merged, and said to intersect.
+    let bowtie: Ring = &[(0., 0.), (20., 20.), (20., 0.), (0., 20.), (0., 0.)];
+    let a: Ring = &[(1., 8.), (4., 8.), (4., 12.), (1., 12.), (1., 8.)];
+    let b: Ring = &[(2., 9.), (5., 9.), (5., 11.), (2., 11.), (2., 9.)];
+    let (got, repairs) = one(GeometryType::Polygon, Some(poly(&[bowtie, a, b])));
+    assert_eq!(repairs, "self_intersection, rings_intersect");
+    assert_eq!(area(got.as_ref().unwrap()), 200.0 - 14.0, "the holes' union taken out");
+    // Holes apart, or only touching at a point, aren't.
+    let c: Ring = &[(1., 9.), (3., 9.), (3., 11.), (1., 11.), (1., 9.)];
+    let d: Ring = &[(4., 9.), (6., 9.), (6., 11.), (4., 11.), (4., 9.)];
+    let e: Ring = &[(3., 11.), (4., 11.), (4., 12.), (3., 12.), (3., 11.)];
+    assert_eq!(one(GeometryType::Polygon, Some(poly(&[bowtie, c, d]))).1, "self_intersection");
+    assert_eq!(one(GeometryType::Polygon, Some(poly(&[bowtie, c, e]))).1, "self_intersection");
     // Nor parts merged that only touch at a point.
     let g = multi(&[&[BOWTIE], &[&[(2., 2.), (4., 2.), (4., 4.), (2., 2.)]]]);
     assert_eq!(one(GeometryType::Polygon, Some(g)).1, "self_intersection");
@@ -437,7 +450,7 @@ fn a_mixed_layer_says_what_was_done_with_counts() {
             "Repair Geometry: the parts that overlapped or touched along a line were merged in 1 feature",
             "Repair Geometry: 1 feature whose interior was cut into pieces by rings touching at points is written with each piece as a part of its own",
             // The hole outside makes the largest extent, 21 across: a grid step of 2^-26, five of them.
-            "Repair Geometry: 4 features were rebuilt by geo's boolean overlay, which rounds coordinates to a fine grid: they may have moved by up to 7.5e-8 in the layer's coordinate units, and vertices in the middle of straight edges were left out",
+            "Repair Geometry: 4 features were rebuilt by geo's boolean overlay, which rounds coordinates to a fine grid: they may have moved by up to 7.5e-8 degrees of longitude or latitude, and vertices in the middle of straight edges were left out",
         ]
     );
 }
@@ -472,6 +485,156 @@ fn plural_counts_of_pieces_and_holes() {
             "Repair Geometry: the parts that overlapped or touched along a line were merged in 1 feature",
         ]
     );
+}
+
+/// A closed ring around a rectangle `w` by `h` with its lower left corner at `(x, y)`.
+fn rect(x: f64, y: f64, w: f64, h: f64) -> Vec<(f64, f64)> {
+    vec![(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]
+}
+/// A closed ring around a strip `len` long and `w` wide at `deg` degrees from the x axis, with a
+/// corner at `(x, y)`.
+fn strip(x: f64, y: f64, len: f64, deg: f64, w: f64) -> Vec<(f64, f64)> {
+    let (s, c) = deg.to_radians().sin_cos();
+    vec![(x, y), (x + len * c, y + len * s), (x + len * c - w * s, y + len * s + w * c), (x - w * s, y + w * c), (x, y)]
+}
+/// A strip at 45°, 5 across and up from a corner placed 0.45 of a step of the grid of the parts'
+/// union (2^-20, as below) right of (1000, 1000), and `w` steps wide: one step wide, the overlay
+/// rounds all its points onto one diagonal line of its grid.
+fn diagonal(w: f64) -> Vec<(f64, f64)> {
+    let step = (-20f64).exp2();
+    let (x, y, a) = (1000. + 0.45 * step, 1000., w * step / 2f64.sqrt());
+    vec![(x, y), (x + 5., y + 5.), (x + 5. - a, y + 5. + a), (x - a, y + a), (x, y)]
+}
+/// A bowtie 20 across, whose left lobe holds the holes at x 1 to 4 and whose right lobe holds
+/// those at x 18.
+const BIG_BOWTIE: Ring = &[(0., 0.), (20., 20.), (20., 0.), (0., 20.), (0., 0.)];
+
+/// A part far from the others, or a hole far from the other holes, narrower than a step of the
+/// overlay's grid would be rounded to no area by the union or the difference, which would also
+/// take its vanishing for a merge: it is dropped first, counted, and said with no_area.
+#[test]
+fn a_part_or_hole_narrower_than_the_overlays_grid_is_dropped_and_said() {
+    // Parts 1000 apart: half the extent is about 500, so the union's grid step is 2^-20; the far
+    // part is three quarters of a step across.
+    let tiny = rect(1000., 1000., 0.75 * (-20f64).exp2(), 0.75 * (-20f64).exp2());
+    let overlapping = multi(&[&[SQUARE], &[OVERLAPPING], &[&tiny]]);
+    // Parts apart, rebuilt for the bowtie: without the narrow part dropped first, its vanishing
+    // would have been taken for parts that overlap.
+    let apart = multi(&[&[BOWTIE], &[&rect(5., 5., 2., 2.)], &[&tiny]]);
+    // A hole three quarters of a step of the difference's grid across (2^-26: the bowtie is 20
+    // across), far from the other hole: their union would have taken its vanishing for holes
+    // that overlap.
+    let tiny_hole = rect(18., 10., 0.75 * (-26f64).exp2(), 0.75 * (-26f64).exp2());
+    let holes = poly(&[BIG_BOWTIE, &rect(1., 8., 3., 4.), &tiny_hole]);
+
+    let (got, repairs) = one(GeometryType::Polygon, Some(overlapping.clone()));
+    assert_eq!(repairs, "parts_overlap, no_area");
+    let got = got.unwrap();
+    let Geometry::Polygon(parts) = &got else { panic!() };
+    assert_eq!(parts.len(), 1, "the squares merged, the narrow part dropped");
+    assert_eq!(area(&got), 175.0);
+
+    let mut l = layer(GeometryType::Polygon);
+    add(&mut l, Some(overlapping), "overlapping");
+    add(&mut l, Some(apart), "apart");
+    add(&mut l, Some(holes), "holes");
+    let r = run(&l);
+    let ds = dataset(&r);
+    valid(ds);
+    let repairs: Vec<String> = (0..3).map(|i| text(ds, i, "repairs")).collect();
+    assert_eq!(repairs, ["parts_overlap, no_area", "self_intersection, no_area", "self_intersection, no_area"]);
+    let Some(Geometry::Polygon(parts)) = &ds.features[1].geometry else { panic!() };
+    assert_eq!(parts.len(), 3, "the bowtie's two lobes and the square");
+    assert_eq!(area(ds.features[2].geometry.as_ref().unwrap()), 200.0 - 12.0);
+    assert_eq!(
+        r.messages[..3],
+        [
+            "Repair Geometry: repaired 3 of 3 features (self_intersection: 2, parts_overlap: 1, no_area: 3)",
+            "Repair Geometry: 3 holes or parts narrower than a step of the overlay's grid, which would leave them no area, were dropped from 3 features, with no_area in repairs",
+            "Repair Geometry: the parts that overlapped or touched along a line were merged in 1 feature",
+        ]
+    );
+    let said = "Repair Geometry: 1 hole or part narrower than a step of the overlay's grid, which would leave it no area, was dropped from 1 feature, with no_area in repairs";
+    let mut l = layer(GeometryType::Polygon);
+    add(&mut l, Some(multi(&[&[SQUARE], &[OVERLAPPING], &[&tiny]])), "one");
+    assert_eq!(run(&l).messages[1], said);
+
+    // Long slivers at an angle, many steps across and up, but three quarters of a step wide; and a
+    // strip at 45° a step wide, which rounding can put on one line, as it moves a point by up to
+    // half a step on each axis: across the diagonal, by up to √2 / 2 steps.
+    let step = (-20f64).exp2();
+    let slivers = [strip(1000., 1000., 10., 45., 0.75 * step), strip(1000., 1000., 10., 30., 0.75 * step), diagonal(1.0)];
+    for sliver in &slivers {
+        for (g, want, parts_out) in [
+            (multi(&[&[SQUARE], &[OVERLAPPING], &[sliver]]), "parts_overlap, no_area", 1),
+            (multi(&[&[BOWTIE], &[&rect(5., 5., 2., 2.)], &[sliver]]), "self_intersection, no_area", 3),
+        ] {
+            let mut l = layer(GeometryType::Polygon);
+            add(&mut l, Some(g.clone()), "x");
+            let r = run(&l);
+            let ds = dataset(&r);
+            valid(ds);
+            assert_eq!(text(ds, 0, "repairs"), want, "{sliver:?}");
+            let Some(Geometry::Polygon(parts)) = &ds.features[0].geometry else { panic!() };
+            assert_eq!(parts.len(), parts_out, "{sliver:?}");
+            assert!(r.messages.iter().any(|m| m == said), "{:?}", r.messages);
+        }
+    }
+    // A hole at 30°, a unit long and three quarters of a step of the difference's grid wide.
+    let hole = strip(17., 12., 1., 30., 0.75 * (-26f64).exp2());
+    let mut l = layer(GeometryType::Polygon);
+    add(&mut l, Some(poly(&[BIG_BOWTIE, &rect(1., 8., 3., 4.), &hole])), "x");
+    let r = run(&l);
+    let ds = dataset(&r);
+    valid(ds);
+    assert_eq!(text(ds, 0, "repairs"), "self_intersection, no_area");
+    let Some(Geometry::Polygon(parts)) = &ds.features[0].geometry else { panic!() };
+    assert_eq!(parts.iter().map(Vec::len).sum::<usize>(), 3, "the lobes and the hole left of them");
+    assert_eq!(r.messages[1], said);
+}
+
+/// The same features without the narrow part or hole, or with one exactly a grid step wide, or at
+/// an angle as wide as rounding can move a point across it (√2 steps at 45°, cos 30° + sin 30° at
+/// 30°) or a little more, which the overlay keeps: nothing is dropped, and nothing said of it.
+#[test]
+fn parts_and_holes_a_grid_step_wide_are_kept_unsaid() {
+    let step = (-20f64).exp2();
+    let sliver = rect(1000., 1000., step, 10.);
+    let hole_sliver = rect(18., 9., (-26f64).exp2(), 2.);
+    let (at_45, at_30) = (1.45 * step, 1.4 * step);
+    let hole_at_45 = strip(17., 12., 2., 45., 1.45 * (-26f64).exp2());
+    // Rounded, a side of a strip at an angle moves by up to √2 / 2 steps across it, so its area
+    // changes by up to √2 steps times its length (10 at most) on the union's grid, and its ends
+    // move too: twice that is allowed.
+    let (exact, drift) = (1e-7, 2.0 * 10.0 * std::f64::consts::SQRT_2 * step);
+    let squares = |far: &[(f64, f64)]| multi(&[&[SQUARE], &[OVERLAPPING], &[far]]);
+    let apart = |far: &[(f64, f64)]| multi(&[&[BOWTIE], &[&rect(5., 5., 2., 2.)], &[far]]);
+    let holes = |far: &[(f64, f64)]| poly(&[BIG_BOWTIE, &rect(1., 8., 3., 4.), far]);
+    for (g, want, parts_out, rings_out, want_area, tol) in [
+        (multi(&[&[SQUARE], &[OVERLAPPING]]), "parts_overlap", 1, 1, 175.0, exact),
+        (squares(&sliver), "parts_overlap", 2, 2, 175.0 + 10.0 * step, exact),
+        (squares(&diagonal(1.45)), "parts_overlap", 2, 2, 175.0 + 50f64.sqrt() * at_45, drift),
+        (squares(&strip(1000., 1000., 10., 45., at_45)), "parts_overlap", 2, 2, 175.0 + 10.0 * at_45, drift),
+        (squares(&strip(1000., 1000., 10., 30., at_30)), "parts_overlap", 2, 2, 175.0 + 10.0 * at_30, drift),
+        (multi(&[&[BOWTIE], &[&rect(5., 5., 2., 2.)]]), "self_intersection", 3, 3, 6.0, exact),
+        (apart(&strip(1000., 1000., 10., 30., at_30)), "self_intersection", 4, 4, 6.0 + 10.0 * at_30, drift),
+        (poly(&[BIG_BOWTIE, &rect(1., 8., 3., 4.)]), "self_intersection", 2, 3, 188.0, exact),
+        (holes(&hole_sliver), "self_intersection", 2, 4, 188.0 - 2.0 * (-26f64).exp2(), exact),
+        (holes(&hole_at_45), "self_intersection", 2, 4, 188.0 - 2.0 * 1.45 * (-26f64).exp2(), drift),
+    ] {
+        let mut l = layer(GeometryType::Polygon);
+        add(&mut l, Some(g.clone()), "x");
+        let r = run(&l);
+        let ds = dataset(&r);
+        valid(ds);
+        assert_eq!(text(ds, 0, "repairs"), want, "{g:?}");
+        let got = ds.features[0].geometry.as_ref().unwrap();
+        let Geometry::Polygon(parts) = got else { panic!() };
+        assert_eq!(parts.len(), parts_out, "{g:?}");
+        assert_eq!(parts.iter().map(Vec::len).sum::<usize>(), rings_out, "{g:?}");
+        assert!((area(got) - want_area).abs() < tol, "{g:?}: area {}", area(got));
+        assert!(!r.messages.iter().any(|m| m.contains("no_area") || m.contains("narrower")), "{:?}", r.messages);
+    }
 }
 
 /// A feature too busy to check, or whose overlay would be past the work bound, is written as it
@@ -510,7 +673,7 @@ fn a_feature_too_complex_to_repair_is_written_unchanged() {
         [
             "Repair Geometry: repaired 1 of 3 features (self_intersection: 1)",
             "Repair Geometry: 2 features were too complex to repair within the work limit and are written unchanged, with too_complex in repairs",
-            "Repair Geometry: 1 feature was rebuilt by geo's boolean overlay, which rounds coordinates to a fine grid: they may have moved by up to 9.4e-9 in the layer's coordinate units, and vertices in the middle of straight edges were left out",
+            "Repair Geometry: 1 feature was rebuilt by geo's boolean overlay, which rounds coordinates to a fine grid: they may have moved by up to 9.4e-9 degrees of longitude or latitude, and vertices in the middle of straight edges were left out",
         ]
     );
 }

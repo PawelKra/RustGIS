@@ -49,6 +49,10 @@ struct Tally {
     /// Rings and parts dropped (too few points, no area), and from how many features.
     dropped: usize,
     dropped_features: usize,
+    /// Holes and parts dropped as narrower than a step of the overlay's grid in any direction, and
+    /// from how many features (each with `no_area` in its repairs).
+    narrow: usize,
+    narrow_features: usize,
     /// Features rebuilt by the overlay, and how far their coordinates may have moved at most.
     overlaid: usize,
     moved: f64,
@@ -112,11 +116,15 @@ fn run_with_room(
                 }
                 tally.dropped += r.dropped;
                 tally.dropped_features += usize::from(r.dropped > 0);
+                tally.narrow += r.narrow;
+                tally.narrow_features += usize::from(r.narrow > 0);
                 if let Some(moved) = r.moved {
                     tally.overlaid += 1;
                     tally.moved = tally.moved.max(moved);
                 }
-                let names: Vec<&str> = r.codes.iter().map(|c| c.as_str()).collect();
+                // A hole or part with no area on the overlay's grid is said after the codes.
+                let narrow = (r.narrow > 0).then_some(Gone::NoArea.as_str());
+                let names: Vec<&str> = r.codes.iter().map(|c| c.as_str()).chain(narrow).collect();
                 (joined(&names, ", ").map_err(no_memory)?, Written::Repaired(r.geometry))
             }
             Outcome::Gone(why) => {
@@ -193,8 +201,9 @@ fn run_with_room(
 }
 
 /// The run's notices: the result in one line, then one notice per kind of feature not repaired,
-/// and per kind of change beyond the codes: pieces dropped, holes taken out, parts merged or split,
-/// coordinates moved. `field` is the output's repairs field.
+/// and per kind of change beyond the codes: pieces dropped (with too few points or no area, or
+/// narrower than a step of the overlay's grid in any direction), holes taken out, parts merged or
+/// split, coordinates moved. `field` is the output's repairs field.
 fn notices(t: &Tally, field: &str) -> Vec<String> {
     let mut messages = vec![summary(t)];
     let is = |n: usize| if n == 1 { "is" } else { "are" };
@@ -242,6 +251,17 @@ fn notices(t: &Tally, field: &str) -> Vec<String> {
             features(t.dropped_features)
         ));
     }
+    if t.narrow > 0 {
+        messages.push(format!(
+            "{TOOL}: {} {} narrower than a step of the overlay's grid, which would leave {} no area, {} dropped from {}, with {} in {field}",
+            t.narrow,
+            if t.narrow == 1 { "hole or part" } else { "holes or parts" },
+            if t.narrow == 1 { "it" } else { "them" },
+            was(t.narrow),
+            features(t.narrow_features),
+            Gone::NoArea.as_str()
+        ));
+    }
     let holes = t.count(Code::HoleOutsideShell);
     if holes > 0 {
         messages.push(format!(
@@ -263,7 +283,7 @@ fn notices(t: &Tally, field: &str) -> Vec<String> {
     }
     if t.overlaid > 0 {
         messages.push(format!(
-            "{TOOL}: {} {} rebuilt by geo's boolean overlay, which rounds coordinates to a fine grid: they may have moved by up to {} in the layer's coordinate units, and vertices in the middle of straight edges were left out",
+            "{TOOL}: {} {} rebuilt by geo's boolean overlay, which rounds coordinates to a fine grid: they may have moved by up to {} degrees of longitude or latitude, and vertices in the middle of straight edges were left out",
             features(t.overlaid),
             was(t.overlaid),
             rounded_up(t.moved)
@@ -298,8 +318,11 @@ fn summary(t: &Tally) -> String {
     if t.repaired == 0 && others == 0 {
         return format!("{TOOL}: no repairs needed in {}", features(t.processed));
     }
-    let by_code: Vec<String> =
+    let mut by_code: Vec<String> =
         Code::ALL.iter().zip(t.counts).filter(|(_, n)| *n > 0).map(|(c, n)| format!("{}: {n}", c.as_str())).collect();
+    if t.narrow_features > 0 {
+        by_code.push(format!("{}: {}", Gone::NoArea.as_str(), t.narrow_features));
+    }
     let codes = if by_code.is_empty() { String::new() } else { format!(" ({})", by_code.join(", ")) };
     format!("{TOOL}: repaired {} of {}{codes}", t.repaired, features(t.processed))
 }

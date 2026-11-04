@@ -920,17 +920,27 @@ How each problem is repaired:
 
 When a ring of a part crosses itself, Check Geometry doesn't check that part against its other
 rings or the other parts; Repair Geometry checks the feature again after the fixes that move no
-coordinate, and adds `hole_outside_shell` and `parts_overlap` when the rebuild finds a hole outside
-or merges parts.
+coordinate, and adds `hole_outside_shell`, `rings_intersect` and `parts_overlap` when the rebuild
+finds a hole outside, merges holes or merges parts.
 
 The rebuild uses the [geo](https://github.com/georust/geo) library's boolean overlay, which works on
-an integer grid: half the larger side of the feature's extent spans about 2<sup>29</sup> steps,
-which is about 0.008 mm for a feature 10 km across in metres, and about 0.000 000 24° (2.6 cm at
-the equator) for one spanning the world in degrees. Rebuilt coordinates may move by up to five
-steps from the input's rings; in the tests they moved at most two thirds of a step. The overlay
-also leaves out vertices in the middle of straight edges. The tool says how many features were
-rebuilt and the farthest their coordinates may have moved. Every rebuilt geometry is checked again
-and written only when it is valid.
+an integer grid: half the larger side of the feature's extent spans about 2<sup>29</sup> steps.
+Coordinates are stored in degrees of longitude and latitude, so a step is about
+0.000 000 000 12° (0.013 mm) for a feature 10 km across, and about 0.000 000 24° (2.6 cm at the
+equator) for one spanning the world. Rebuilt coordinates may move by up to five steps from the
+input's rings; in the tests they moved at most two thirds of a step. The overlay also leaves out
+vertices in the middle of straight edges. The tool says how many features were rebuilt and the
+farthest, in degrees, their coordinates may have moved. Every rebuilt geometry is checked again and
+written only when it is valid.
+
+A hole or part narrower than one step of that grid in any direction can be rounded onto a single
+line of it and lose its area, depending on where it lies between the grid's lines. Rounding moves a
+point by up to half a step on each axis, so across a diagonal a piece needs to be wider, up to √2
+steps at 45°. The grid follows the extent of all the rings of a part, or of all the parts of a
+feature, so this happens to a tiny or thin hole or part far from the others, such as a long sliver
+at an angle. So before the overlay takes out a part's holes or merges the parts, a hole or part
+that narrow in any direction is dropped: `no_area` is added after the other codes in `repairs`, and
+the tool says how many holes and parts were dropped this way, from how many features.
 
 A feature that can't be repaired stays in the output without geometry, with its attributes, and
 `repairs` says why. One the tool couldn't repair is written unchanged, never dropped:
@@ -946,10 +956,10 @@ A feature that can't be repaired stays in the output without geometry, with its 
 
 The messages say how many features were repaired, with each code; how many were written without
 geometry and why; how many were left unchanged for each reason; how many rings or parts were
-dropped; from how many features holes were taken out; in how many parts were merged or pieces
-written as parts of their own; and how far rebuilt coordinates may have moved. On the desktop and
-the command line a failure of the overlay is caught and the feature written unchanged; in the
-browser it can't be caught, so the rebuild runs only on finite coordinates the grid can hold, with
+dropped, and how many holes or parts narrower than the overlay's grid; from how many features holes
+were taken out; in how many parts were merged or pieces written as parts of their own; and how far
+rebuilt coordinates may have moved. On the desktop and the command line a failure of the overlay is
+caught and the feature written unchanged; in the browser it can't be caught, so the rebuild runs only on finite coordinates the grid can hold, with
 its work bounded and its memory asked of the browser first, as in Clip and Dissolve.
 
 ```text
