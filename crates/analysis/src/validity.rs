@@ -30,10 +30,18 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// The most work one feature's crossing and overlap checks may take, in segment pairs compared.
-/// A point-in-ring test counts one per ring segment, and relating two rings or parts
-/// [`RELATE_COST`] per vertex. The topology checks' bound: about a quarter of a second natively,
-/// of which a polygon of a million vertices needs a small part. A busier feature is too complex.
+/// Each ring coordinate counts [`VERTEX_COST`] first, a point-in-ring test one per ring segment,
+/// and relating two rings or parts [`RELATE_COST`] per vertex. The topology checks' bound: about a
+/// quarter of a second natively, of which a polygon of a million vertices needs a small part. A
+/// busier feature is too complex.
 pub(crate) const MAX_WORK: u64 = 50_000_000;
+/// Work per ring coordinate of a polygon, charged before its rings are copied for the sweep, so
+/// what the sweep holds grows with the budget, not with the feature. Per coordinate it holds
+/// about 104 bytes: the ring's copy (16), its segment (64), and the sweep's two orders and lower
+/// bounds (24). At 16, a feature has at most `MAX_WORK / 16` (3,125,000) coordinates to sweep,
+/// about 325 MB at once; a polygon of a million coordinates spends 16 million of its 50 million on
+/// them, and keeps the rest for the comparisons.
+const VERTEX_COST: u64 = 16;
 /// Work per vertex of relating two rings or parts (building geo's relate graph and its index).
 const RELATE_COST: u64 = 32;
 /// Work per pair of rings or parts found in contact, and per point where a ring touches another
@@ -476,6 +484,10 @@ struct Part {
 }
 
 fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
+    let mut work = Work { spent: 0, budget };
+    // Charged before any ring is copied: past the budget, only the checks that copy nothing run.
+    let coords = polys.iter().flatten().map(Vec::len).fold(0usize, usize::saturating_add);
+    let affordable = work.spend(u64::try_from(coords).unwrap_or(u64::MAX).saturating_mul(VERTEX_COST));
     let mut non_finite = NonFinite::default();
     let mut parts: Vec<Part> = Vec::with_capacity(polys.len());
     for (p, rings) in polys.iter().enumerate() {
@@ -487,15 +499,20 @@ fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
             .enumerate()
             .map(|(r, ring)| {
                 let at = At::Ring(p, r);
-                (non_finite.add(ring, at) && vertex_checks(&mut out.problems, at, ring, true)).then(|| closed_ring(ring))
+                (non_finite.add(ring, at) && vertex_checks(&mut out.problems, at, ring, true) && affordable).then(|| closed_ring(ring))
             })
             .collect::<Vec<_>>();
         let simple = !checked.is_empty() && checked.iter().all(Option::is_some);
         parts.push(Part { rings: checked, simple, clean: simple });
     }
     non_finite.report(&mut out.problems);
+    if !affordable {
+        out.problems.push(Problem::TooComplex { limit: Limit::Work });
+        return;
+    }
 
-    let mut segs = Vec::new();
+    let n_segs = parts.iter().flat_map(|p| p.rings.iter().flatten()).map(|r| r.0.len().saturating_sub(1)).fold(0, usize::saturating_add);
+    let mut segs = Vec::with_capacity(n_segs);
     for (p, part) in parts.iter().enumerate() {
         for (r, ring) in part.rings.iter().enumerate() {
             let Some(ring) = ring else { continue };
@@ -504,7 +521,6 @@ fn polygon(out: &mut Checked, polys: &[Vec<Vec<Coord>>], budget: u64) {
         }
     }
     let (order, y, pairs) = sweep_order(&segs);
-    let mut work = Work { spent: 0, budget };
     if !work.spend(pairs) {
         out.problems.push(Problem::TooComplex { limit: Limit::Work });
         return;
@@ -1092,8 +1108,49 @@ mod tests {
                 .collect();
             sweep_order(&segs).2
         };
-        assert_eq!(check(Some(&poly(&[SQUARE, HOLE])), pairs).codes(), [Code::TooComplex]);
-        assert_eq!(check(Some(&poly(&[SQUARE, HOLE])), pairs + 5).codes(), []);
+        // Each of the 10 ring coordinates is charged too.
+        let coords = 10 * VERTEX_COST;
+        assert_eq!(check(Some(&poly(&[SQUARE, HOLE])), coords + pairs).codes(), [Code::TooComplex]);
+        assert_eq!(check(Some(&poly(&[SQUARE, HOLE])), coords + pairs + 5).codes(), []);
+    }
+
+    /// The coordinates are charged before the rings are copied and swept: a feature whose
+    /// coordinates alone are past the budget is too complex, however few pairs its sweep compares.
+    #[test]
+    fn coordinates_are_charged_before_the_sweep() {
+        let pairs = |rings: &[Ring]| {
+            let segs: Vec<Seg> = rings
+                .iter()
+                .enumerate()
+                .flat_map(|(r, pts)| {
+                    let l = closed_ring(&ring(pts));
+                    let n = l.0.len() - 1;
+                    l.lines().enumerate().map(|(i, l)| Seg { a: l.start, b: l.end, part: 0, ring: r, i, n }).collect::<Vec<_>>()
+                })
+                .collect();
+            sweep_order(&segs).2
+        };
+        let charge = 5 * VERTEX_COST;
+        assert!(pairs(&[SQUARE]) < charge - 1, "the sweep alone would fit");
+        assert_eq!(check(Some(&poly(&[SQUARE])), charge - 1).problems, [Problem::TooComplex { limit: Limit::Work }]);
+        assert_eq!(check(Some(&poly(&[SQUARE])), charge + pairs(&[SQUARE])).problems, []);
+        // Checks that copy nothing still run: the open ring is reported.
+        let open: Ring = &[(0., 0.), (10., 0.), (10., 10.), (0., 10.)];
+        assert_eq!(check(Some(&poly(&[open])), 4 * VERTEX_COST - 1).codes(), [Code::RingNotClosed, Code::TooComplex]);
+        // A ring past the budget by its coordinates alone: too complex, never valid, and quick.
+        let circle = |n: u32| {
+            let step = std::f64::consts::TAU / f64::from(n);
+            let mut pts: Vec<Coord> =
+                (0..n).map(|i| Coord::new((f64::from(i) * step).cos() * 1e3, (f64::from(i) * step).sin() * 1e3)).collect();
+            pts.push(Coord::new(1e3, 0.));
+            Geometry::Polygon(vec![vec![pts]])
+        };
+        let over = u32::try_from(MAX_WORK / VERTEX_COST).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(check(Some(&circle(over)), MAX_WORK).problems, [Problem::TooComplex { limit: Limit::Work }]);
+        assert!(started.elapsed().as_secs() < 10, "not swept");
+        // A polygon of a million coordinates is still checked fully.
+        assert_eq!(check(Some(&circle(1_000_000)), MAX_WORK).problems, []);
     }
 
     /// The pairs the sweep is charged for are the ones it compares, along the axis with fewer.
@@ -1206,12 +1263,14 @@ mod tests {
                 .collect();
             sweep_order(&segs).2
         };
-        // The sweep, the pair of rings in contact, both rings at both points, and relating them.
-        let needed = pairs + CONTACT_COST + 4 * CONTACT_COST + (5 + 5) * RELATE_COST;
+        // The coordinates, the sweep, the pair of rings in contact, both rings at both points, and
+        // relating them.
+        let coords = 10 * VERTEX_COST;
+        let needed = coords + pairs + CONTACT_COST + 4 * CONTACT_COST + (5 + 5) * RELATE_COST;
         assert_eq!(check(Some(&g), needed).problems, disconnected(0));
         assert_eq!(check(Some(&g), needed - 1).codes(), [Code::TooComplex]);
         // Short of the touch points' share, too: never valid.
-        assert_eq!(check(Some(&g), pairs + CONTACT_COST + 3 * CONTACT_COST).codes(), [Code::TooComplex]);
+        assert_eq!(check(Some(&g), coords + pairs + CONTACT_COST + 3 * CONTACT_COST).codes(), [Code::TooComplex]);
     }
 
     /// Pairs of holes whose boxes meet are held until they are checked, so each one kept is charged

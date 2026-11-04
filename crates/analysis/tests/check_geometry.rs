@@ -342,7 +342,7 @@ fn non_finite_coordinates_are_written_without_geometry() {
         [
             "Check Geometry: 3 of 3 features have problems (non_finite_coordinate: 3, self_intersection: 1)",
             "Check Geometry: 3 features with non-finite coordinates are written without geometry",
-            "Check Geometry: the rings or parts of 1 feature weren't checked against each other, because some of their rings have too few points, non-finite coordinates or cross themselves",
+            "Check Geometry: the rings or parts of 1 feature weren't all checked against each other, because some of their rings or parts already have problems of their own (see problem)",
         ]
     );
 }
@@ -428,7 +428,26 @@ fn a_mixed_layer_counts_each_kind_of_problem_by_feature() {
         r.messages,
         [
             "Check Geometry: 4 of 7 features have problems (null_geometry: 1, ring_not_closed: 1, self_intersection: 2)",
-            "Check Geometry: the rings or parts of 1 feature weren't checked against each other, because some of their rings have too few points, non-finite coordinates or cross themselves",
+            "Check Geometry: the rings or parts of 1 feature weren't all checked against each other, because some of their rings or parts already have problems of their own (see problem)",
+        ]
+    );
+}
+
+/// Parts are only compared when their rings have no problem: a part whose hole is outside its
+/// shell isn't checked against the part overlapping it, and the notice says why.
+#[test]
+fn parts_are_not_compared_when_a_part_has_a_problem_of_its_own() {
+    let mut l = layer(GeometryType::Polygon);
+    add(&mut l, Some(multi(&[&[SQUARE, OUTSIDE], &[&[(5., 5.), (15., 5.), (15., 15.), (5., 15.), (5., 5.)]]])), "hole outside, overlapped");
+    let r = run(&l);
+    let ds = dataset(&r);
+    assert_eq!(text(ds, 0, "problem"), "hole_outside_shell");
+    assert_eq!(text(ds, 0, "detail"), "ring 2 of part 1 is not inside the exterior ring");
+    assert_eq!(
+        r.messages,
+        [
+            "Check Geometry: 1 of 1 feature has problems (hole_outside_shell: 1)",
+            "Check Geometry: the rings or parts of 1 feature weren't all checked against each other, because some of their rings or parts already have problems of their own (see problem)",
         ]
     );
 }

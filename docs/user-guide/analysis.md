@@ -854,7 +854,7 @@ features were checked.
 | `rings_intersect` | Two rings of one polygon overlap or touch along a line |
 | `disconnected_interior` | Rings of one polygon touch at points so that they cut its interior into pieces, such as a hole touching the exterior ring at two points, or three holes each touching the next |
 | `parts_overlap` | Two polygons of one multipart feature overlap or touch along a line |
-| `too_complex` | The feature needs more work than the tool spends on one feature, so it couldn't be checked for crossings and overlaps |
+| `too_complex` | The feature couldn't be checked fully for crossings and overlaps: it needs more work than the tool spends on one feature, or the geo library's relate operation failed on some of its rings or parts (`detail` says which of the two, not which rings or parts). The tool says how many features each reason left out |
 
 Codes are listed in this order, and are never translated. The checks work in stored
 coordinates, without projection. Lines may cross themselves, so only polygon rings are checked
@@ -864,9 +864,10 @@ once its rings have no other problem with each other); any number of rings may m
 point. An unclosed ring is reported, then checked as if it
 were closed. Ring orientation is not checked, since GeoJSON and Shapefiles wind rings in
 opposite directions. The rings of a polygon are only checked against each other when each of them is
-usable (enough points, finite coordinates, not crossing itself), and the parts of a feature
-only when their rings are fine; the tool says how many features were not fully checked this
-way. Rings and parts that touch are compared with the
+usable (enough points, finite coordinates, and not crossing, touching or running back over
+itself), and the parts of a feature only when each part's rings are usable and have no problem
+with each other; the tool says how many features were not fully checked this way, because some
+of their rings or parts already have problems of their own. Rings and parts that touch are compared with the
 [geo](https://github.com/georust/geo) library's relate operation.
 
 ```text
