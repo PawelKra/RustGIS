@@ -200,6 +200,23 @@ A layer saved by an older version, which kept the file name it was downloaded un
 the service's address, shows **Add**; RustGIS won't guess by name. A service's downloaded layers
 are grouped under the service's host in the Layers pane's **Data Source** view, and **Copy Path**
 gives that address without its keys or tokens.
+
+Adding a layer or importing a group leaves the view where it is: only the first content added to an
+empty map (beyond its basemap) is framed. A map holds content once it has a layer (hidden or not), a
+tile overlay, or a cloud-optimised GeoTIFF, PMTiles or MBTiles tile layer (hidden, or drawn as a
+basemap, included). A plain basemap does not count, and neither does a map style a service offers:
+it draws as a basemap, under the layers.
+
+A PMTiles or MBTiles archive added as a file is the exception: it is framed on its bounds whatever
+the map holds, unless it covers the whole world. Features asked for over an area keep the view, or
+go to the box given. Layer files (`.rgislyr`) retain the current view even on an empty map.
+STAC searches frame their result footprints, in the browser and the commands, so the searched
+area is visible. Adding administrative boundaries follows the ordinary first-content rule.
+If several archives or styles request a view while their metadata loads, the latest request
+supersedes earlier pending requests. Panning or navigating elsewhere cancels pending framing.
+MBTiles metadata normally loads in the background. A read still pending after 30 seconds, or
+a worker pool saturated by stalled storage, reports an error; retry once the storage responds.
+
 An OGC API landing page works directly: RustGIS follows its advertised
 JSON collections link, so you don't need to append `/collections`. If the landing page also
 offers map tiles, they remain listed alongside the collections. A failed collections request
@@ -495,8 +512,8 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 
 | Format | How to write it | Notes |
 | --- | --- | --- |
-| GeoJSON (`.geojson`, `.json`), CSV | Data › Export (`share.exportLayer`) | The Export Features dialog picks the format; the chosen extension is appended when needed. In the web app it downloads any vector format below except GeoPackage and FlatGeobuf (a Shapefile as one zip). A streamed layer exports its whole source: on the desktop, to GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet a chunk at a time with no limit on its size (a GeoParquet source's row groups are read whole, so on the desktop each holds at most 16,777,216 rows), otherwise loaded whole (see [Streamed layers](data.md)); remote sources on the web must be downloaded first. |
-| GeoPackage | Data › Export to `.gpkg` (desktop) | A new file with one feature table (an attributes table for a layer without geometry) in the layer's coordinate system (see below), with an R-tree and GeoPackage 1.4 triggers to maintain it. An existing destination is refused; adding or replacing tables in an existing GeoPackage is not supported. Unique feature ids that fit signed 64-bit integers are kept; otherwise SQLite assigns new ids. |
+| GeoJSON (`.geojson`, `.json`), CSV | Data › Export (`share.exportLayer`) | The Export Features dialog picks the format; the chosen extension is appended when needed. In the web app it downloads any vector format below except GeoPackage and FlatGeobuf (a Shapefile as one zip). A streamed layer exports its whole source: on the desktop, to GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet a chunk at a time with no limit on its size (a GeoParquet source's row groups are read whole, so on the desktop each holds at most 16,777,216 rows; a layer read in place from the GeoPackage it goes into is read whole first), otherwise loaded whole (see [Streamed layers](data.md)); remote sources on the web must be downloaded first. |
+| GeoPackage | Data › Export to `.gpkg` (desktop) | A new file with one feature table (an attributes table for a layer without geometry) in the layer's coordinate system (see below), with an R-tree and GeoPackage 1.4 triggers to maintain it. An existing destination is refused unless the export adds a table to it or replaces one of its feature or attribute tables (`mode`, see [Exporting](sharing.md)), leaving its other tables as they were. Unique feature ids that fit signed 64-bit integers are kept; otherwise SQLite assigns new ids. |
 | GeoParquet (`.parquet`, `.geoparquet`) | Data › Export | GeoParquet 1.1: WKB geometry in WGS 84, Zstd level 9 compression, row groups of up to 65,536 features and a `bbox` covering column with byte-stream-split encoding. The covering keeps spatial range reads available; compression favours smaller files over export speed. A standalone table without geometry writes plain Parquet. |
 | Shapefile | Data › Export to `.shp` (or `.zip` for the files zipped) | Writes `.shp`, `.shx`, `.dbf`, `.prj` (the coordinate system, see below) and `.cpg` (UTF-8). Field names are cut to 10 bytes (made unique ignoring case, and reported), text to at most 254 bytes, and numbers that do not fit their dBase field are left empty. Export notices count shortened text, non-null values left empty (including incompatible types), and numbers rounded to the field's precision, and name the affected source fields; features without geometry, and lines of a single point, are left out (and reported). |
 | FlatGeobuf | Data › Export to `.fgb` | In the layer's coordinate system (see below), with a spatial index; features without geometry are left out (and reported). Desktop only: the writer needs a temporary file, which the browser doesn't have. |

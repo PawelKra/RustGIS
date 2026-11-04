@@ -34,6 +34,8 @@ mod docpanes;
 mod earthaccessui;
 mod editpanes;
 mod embeddingsui;
+#[cfg(not(target_arch = "wasm32"))]
+mod exportjob;
 mod failureui;
 mod fieldlists;
 mod fieldmenu;
@@ -923,6 +925,9 @@ pub struct RustGisApp {
     pub(crate) graphic_format: graphicformat::GraphicFormat,
     pub forms: editpanes::Forms,
     pub workflow: analysispane::Workflow,
+    /// An export writing its file on its own thread (see [`exportjob`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    export_job: Option<exportjob::ExportJob>,
     /// ModelBuilder's view: the model on its canvas.
     pub mb: modelbuilder::ModelBuilder,
     pub ws: workspacepanes::WorkspaceState,
@@ -940,6 +945,8 @@ pub struct RustGisApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub connect: connectui::ConnectState,
     fonts_frames: u32,
+    /// When this frame's `logic` began, for the double-click delay `ui` sets when it ends.
+    frame_start: Option<web_time::Instant>,
     applied_dark: Option<bool>,
     sent_title: String,
     pub quit_requested: bool,
@@ -994,6 +1001,20 @@ pub struct RustGisApp {
 }
 
 impl RustGisApp {
+    /// The layer to export: `layer` (an id or name, as commands take it; the dialog's is checked
+    /// against its `instance`, so a reused id isn't taken for it), else the active layer.
+    fn export_target(&self, p: &Value) -> Result<u32, String> {
+        if p.get("layer").is_none_or(Value::is_null) {
+            return self.session.active_layer.ok_or_else(|| "select a layer in the Layers pane first".to_string());
+        }
+        let id = self.session.layer_id(p)?;
+        let l = self.session.map().layer(id).ok_or("the layer Export Features was opened on is gone")?;
+        match p.get("instance").and_then(Value::as_u64) {
+            Some(instance) if instance != l.instance_id() => Err("the layer Export Features was opened on is gone".into()),
+            _ => Ok(id),
+        }
+    }
+
     /// The Ctrl (⌘) shortcuts the keymap takes, as (Alt, Shift, key), the clipboard's left out:
     /// in a browser, what the web app keeps from the browser's own shortcuts (⌘D bookmarking
     /// the page, ⌘Y opening its history, ⌘= zooming it), as design tools in the browser do.
@@ -1106,6 +1127,8 @@ impl RustGisApp {
             graphic_format: graphicformat::GraphicFormat::default(),
             forms: editpanes::Forms { distance_units: "Meters".into(), ..editpanes::Forms::default() },
             workflow: analysispane::Workflow::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            export_job: None,
             mb: modelbuilder::ModelBuilder::default(),
             ws: workspacepanes::WorkspaceState::default(),
             time: timebar::TimeBarState::default(),
@@ -1115,6 +1138,7 @@ impl RustGisApp {
             docs: docpanes::DocState::default(),
             assistant: assistantpane::AssistantState::default(),
             fonts_frames: 0,
+            frame_start: None,
             applied_dark: None,
             sent_title: String::new(),
             quit_requested: false,
@@ -1768,6 +1792,13 @@ impl RustGisApp {
     /// is removed, as recovery is for a run that didn't close. Call it once, as the app closes.
     pub fn end_autosave(&mut self) {
         autosave::end(self);
+    }
+
+    /// The app closing (the desktop app's `on_exit`): an export still writing is cancelled and
+    /// given a moment to stop, so it leaves no temporary file beside its destination.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn end_exports(&mut self) {
+        exportjob::stop(self, std::time::Duration::from_secs(5));
     }
 
     /// Whether this shell opens files by path (the desktop app; the web app picks them in the
@@ -2670,8 +2701,10 @@ impl RustGisApp {
                         q[k] = v.clone();
                     }
                 }
-                if p.get("zoom").and_then(Value::as_bool) == Some(true) {
-                    q["zoom"] = json!(true);
+                if let Some(zoom) =
+                    p.get("zoom").and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| matches!(s, "true" | "yes" | "1" | "on"))))
+                {
+                    q["zoom"] = json!(zoom);
                 }
                 for k in ["service", "coverage"] {
                     if p.get(k).and_then(Value::as_bool) == Some(true) {
@@ -3380,14 +3413,12 @@ impl RustGisApp {
                 self.dialogs.open("exportLayer", &self.session)?;
             }
             "ui.exportLayer" if self.services.download.is_some() => {
-                let l = self
-                    .session
-                    .active_layer
-                    .and_then(|id| self.session.map().layer(id))
-                    .ok_or("select a layer in the Layers pane first")?;
+                let id = self.export_target(p)?;
+                let l = self.session.map().layer(id).ok_or("select a layer in the Layers pane first")?;
                 // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
                 // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
+                rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
                 let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
@@ -3442,6 +3473,10 @@ impl RustGisApp {
                     .map(|l| format!("{}.tif", l.name))
                     .unwrap_or_default();
                 if let Some(path) = dialogs::pick_save(&name, &["tif", "tiff"], tl!("GeoTIFF")) {
+                    // Written on a thread of its own, with progress and Cancel in the status bar.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return exportjob::start(self, "share.exportRaster", json!({"path": path}));
+                    #[cfg(target_arch = "wasm32")]
                     return self.run("share.exportRaster", json!({"path": path}));
                 }
             }
@@ -3458,18 +3493,40 @@ impl RustGisApp {
                     .find(|(_, e)| *e == ext)
                     .map(|(l, _)| *l)
                     .ok_or_else(|| format!("unknown format '{ext}'"))?;
-                let name = self
-                    .session
-                    .active_layer
-                    .and_then(|id| self.session.map().layer(id))
-                    .map(|l| format!("{}.{ext}", l.name))
-                    .unwrap_or_default();
+                // Into a GeoPackage that exists: picked to open, as it is kept, not replaced.
+                // Checked as the command checks them, before a file is asked for; then passed on.
+                let gpkg = rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
+                let id = self.export_target(p)?;
+                let with_table = |mut args: Value| {
+                    for key in ["mode", "tableName"] {
+                        if let Some(v) = p.get(key) {
+                            args[key] = v.clone();
+                        }
+                    }
+                    args
+                };
+                if gpkg.mode != rustgis_engine::data::io::GpkgMode::NewFile {
+                    if let Some(path) = dialogs::pick_open(&["gpkg"], label) {
+                        let args = with_table(json!({"layer": id, "path": path}));
+                        #[cfg(not(target_arch = "wasm32"))]
+                        return exportjob::start(self, "share.exportLayer", args);
+                        #[cfg(target_arch = "wasm32")]
+                        return self.run("share.exportLayer", args);
+                    }
+                    return Ok(Value::Null);
+                }
+                let name = self.session.map().layer(id).map(|l| format!("{}.{ext}", l.name)).unwrap_or_default();
                 if let Some(path) = dialogs::pick_save(&name, &[ext.as_str()], label) {
                     // The format chosen decides: its extension is added unless it was typed (a dot
                     // in the name, as in "U.S. Cities", isn't taken for one).
                     let typed = std::path::Path::new(&path).extension().is_some_and(|e| e.eq_ignore_ascii_case(&ext));
                     let path = if typed { path } else { format!("{path}.{ext}") };
-                    return self.run("share.exportLayer", json!({"path": path}));
+                    // Written on a thread of its own, with progress and Cancel in the status bar.
+                    let args = with_table(json!({"layer": id, "path": path}));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return exportjob::start(self, "share.exportLayer", args);
+                    #[cfg(target_arch = "wasm32")]
+                    return self.run("share.exportLayer", args);
                 }
             }
             // Add Zarr Variable, connected to a store (a link, a script).
@@ -3899,6 +3956,10 @@ impl RustGisApp {
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
         let _diagnostics = self.session.diagnostics.enter();
+        // A pass egui asks to repeat is the same frame: `ui` sets the delay once, from the first pass.
+        if ctx.current_pass_index() == 0 {
+            self.frame_start = Some(web_time::Instant::now());
+        }
         // The MCP relay: what attached agents sent runs here, on this session, before the frame
         // draws (Session lives on this thread; the listener only queues messages).
         #[cfg(not(target_arch = "wasm32"))]
@@ -4169,11 +4230,11 @@ impl RustGisApp {
         fieldmenu::play(self, &ctx);
         chrome::shortcuts(self, &ctx);
         panes::follow_layer_filter(self);
-        // A Zarr summary, a trend or a workflow running on its thread lands whatever is in view,
-        // the File menu's backstage too, so a project saved there holds it (all are looked at: `|`,
-        // not `||`), and the frames go on while one runs so it's taken when it ends.
+        // A Zarr summary, a trend, a workflow or an export running on its thread lands whatever is
+        // in view, the File menu's backstage too, so a project saved there holds it (all are looked
+        // at: `|`, not `||`), and the frames go on while one runs so it's taken when it ends.
         #[cfg(not(target_arch = "wasm32"))]
-        if workspacepanes::land_summary(self) | analysispane::land_trend(self) | analysispane::land_job(self) {
+        if workspacepanes::land_summary(self) | analysispane::land_trend(self) | analysispane::land_job(self) | exportjob::land(self) {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         if self.ui.backstage {
@@ -4223,6 +4284,15 @@ impl RustGisApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.sent_title = title;
         }
+        // egui times clicks by the frame they arrive in: at a slow frame rate the two clicks of a
+        // double-click land too far apart for its default delay (#1321). It reads the delay when
+        // the next frame begins, before that frame's `logic`, so it's set here, from this frame's
+        // work so far (a map drawn on the CPU) and from the last frame's length, painting included
+        // (`stable_dt` leaves out the time spent idle between frames).
+        if let Some(start) = self.frame_start.take() {
+            let dt = ctx.input(|i| i.stable_dt).max(start.elapsed().as_secs_f32());
+            ctx.options_mut(|o| o.input_options.max_double_click_delay = double_click_delay(dt));
+        }
     }
 }
 
@@ -4232,6 +4302,28 @@ fn project_file_name(url: &str) -> Option<&str> {
     let path = url.split(['?', '#']).next().unwrap_or("");
     let last = path.rsplit('/').next().unwrap_or("");
     (rustgis_engine::project::opens_as_project(last) || rustgis_engine::map::geolibre::is_project_file(last)).then_some(last)
+}
+
+/// The longest gap between the two clicks of a double-click, in seconds, for frames `dt` seconds
+/// long. egui times a click by the frame it arrives in, so a gap of 0.3 s can be measured as up to
+/// two frames more. At least 0.5 s, the Windows default; at most 1.2 s, so two separate clicks
+/// still read as two.
+fn double_click_delay(dt: f32) -> f64 {
+    (0.3 + 2.0 * f64::from(dt)).clamp(0.5, 1.2)
+}
+
+/// A test's click whose press and release arrive in one frame, as they do inside a slow one, `gap`
+/// seconds on egui's clock after the frame before.
+#[cfg(test)]
+pub(crate) fn click_in_one_frame(h: &mut egui_kittest::Harness<'_, RustGisApp>, at: egui::Pos2, gap: f64) {
+    let time = h.ctx.input(|i| i.time) + gap;
+    let button =
+        |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    let input = h.input_mut();
+    input.time = Some(time);
+    input.events.extend([egui::Event::PointerMoved(at), button(true), button(false)]);
+    h.step();
+    h.input_mut().time = None;
 }
 
 /// Tests that fetch through the tile cache take turns: it has one fetcher for the whole process,
@@ -4625,6 +4717,12 @@ mod download_service_tests {
             app
         };
         let mut app = with(true);
+        // The browser's export refuses a GeoPackage mode for another format, as the desktop's does.
+        assert!(app.run("ui.exportLayer", json!({"format": "geojson", "mode": "replaceTable"})).is_err());
+        assert_eq!(changed(&app), 0);
+        // As the command reads them: no table name given is none.
+        app.run("ui.exportLayer", json!({"format": "geojson", "mode": " newFile ", "tableName": ""})).unwrap();
+        assert_eq!(changed(&app), 0, "GeoJSON keeps the names");
         app.run("ui.exportLayer", json!({"format": "shp"})).unwrap();
         assert_eq!(changed(&app), 1);
         assert!(app.session.notices.iter().any(|n| n.text == "Sites.zip: 1 text value was cut to at most 254 bytes, in 'notes'"));
@@ -4650,6 +4748,44 @@ mod download_service_tests {
         app.run("ui.exportLayer", json!({"format": "shp"})).unwrap();
         assert_eq!(changed(&app), 0, "the sample's names fit");
         assert!(!app.session.notices.iter().any(|n| n.text.contains("254 bytes") || n.text.contains("left empty")));
+    }
+
+    /// Export Features into an existing GeoPackage: the file is picked to open, not to save over,
+    /// and the layer goes in as the table named in the dialog, beside the file's others.
+    #[test]
+    fn export_features_adds_a_table_to_a_picked_geopackage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("county.gpkg");
+        let mut app = RustGisApp::with_sample();
+        app.run("share.exportLayer", json!({"layer": "Cities", "path": path})).unwrap();
+        app.session.active_layer = app.session.map().layer_by_name("Countries").map(|l| l.id);
+        app.run("ui.dialog", json!({"name": "exportLayer"})).unwrap();
+        let (id, instance) = app.dialogs.export_layer.unwrap();
+        // Another layer selected while the dialog is open: the dialog's is the one exported.
+        app.session.active_layer = app.session.map().layer_by_name("Cities").map(|l| l.id);
+        crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(path.display().to_string()));
+        let p = json!({"format": "gpkg", "mode": "addTable", "tableName": "borders", "layer": id, "instance": instance});
+        app.run("ui.exportLayer", p).unwrap();
+        // Written on a thread of its own: waits for it to land.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::exportjob::land(&mut app) {
+            assert!(std::time::Instant::now() < end, "the export never landed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(rustgis_engine::data::source::layers(&path).unwrap(), ["Cities", "borders"]);
+        let countries = app.session.map().layer_by_name("Countries").map(|l| l.dataset.features.len() as u64);
+        assert_eq!(rustgis_engine::data::source::open_path(&path, Some("borders")).unwrap().info().count, countries);
+        // An unknown mode is refused before a file is asked for (the pick isn't taken).
+        crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(path.display().to_string()));
+        assert!(app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "append"})).unwrap_err().contains("unknown mode"));
+        assert!(crate::dialogs::PICKED.with(|p| p.borrow_mut().take()).is_some());
+        // A layer by name is that layer; one not there is refused, not taken for the active one.
+        let e = app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "addTable", "layer": "Nowhere"})).unwrap_err();
+        assert!(e.contains("Nowhere"), "{e}");
+        // Cancelling the pick writes nothing.
+        let before = std::fs::read(&path).unwrap();
+        app.run("ui.exportLayer", json!({"format": "gpkg", "mode": "replaceTable", "tableName": "Cities"})).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
