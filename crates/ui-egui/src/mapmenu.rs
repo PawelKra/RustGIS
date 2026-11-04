@@ -126,12 +126,12 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
     let (coords, fell_back) = coordinate_row(c, format, earth);
     let hover = if fell_back && !earth {
         i18n::fmt(
-            "Copy coordinates to the clipboard. {format} is a grid of the Earth, so latitude and longitude",
+            "Copy coordinates to the clipboard. {format} is a grid of the Earth, so latitude and longitude are copied",
             &[("format", format.label())],
         )
     } else if fell_back {
         i18n::fmt(
-            "Copy coordinates to the clipboard. No {format} here: outside the UTM zones (80° S to 84° N), so latitude and longitude",
+            "Copy coordinates to the clipboard. No {format} here: outside the UTM zones (80° S to 84° N), so latitude and longitude are copied",
             &[("format", format.label())],
         )
     } else {

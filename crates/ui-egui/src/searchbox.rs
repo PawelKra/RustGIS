@@ -381,17 +381,18 @@ fn describe(st: &State, row: &Row) -> (String, &'static str, String, Option<Stri
 /// Why a query written as a UTM position or an MGRS reference names no place.
 fn grid_error_text(e: rustgis_engine::geom::GridError) -> String {
     use rustgis_engine::geom::GridError as G;
+    // In logical order: the reason is filled into the message, which is put in display order.
     let reason = match e {
-        G::Syntax => tl!("not a UTM or MGRS grid reference"),
-        G::Zone => tl!("the UTM zone must be 1 to 60"),
-        G::Band => tl!("the latitude band must be a letter from C to X (not I or O)"),
-        G::Polar => tl!("polar (UPS) grid references, north of 84° N or south of 80° S, aren't supported"),
-        G::Square => tl!("the 100 km square letters aren't used in this zone"),
-        G::Digits => tl!("the grid digits must be an even count of 0 to 10, half for the easting and half for the northing"),
-        G::BandMismatch => tl!("the northing doesn't fall in the latitude band given"),
-        G::OutsideZone => tl!("the place lies outside the zone given"),
+        G::Syntax => tl_raw!("not a UTM or MGRS grid reference"),
+        G::Zone => tl_raw!("the UTM zone must be 1 to 60"),
+        G::Band => tl_raw!("the latitude band must be a letter from C to X (not I or O)"),
+        G::Polar => tl_raw!("polar (UPS) grid references, north of 84° N or south of 80° S, aren't supported"),
+        G::Square => tl_raw!("the 100 km square letters aren't used in this zone"),
+        G::Digits => tl_raw!("the grid digits must be an even count of 0 to 10, half for the easting and half for the northing"),
+        G::BandMismatch => tl_raw!("the northing doesn't fall in the latitude band given"),
+        G::OutsideZone => tl_raw!("the place lies outside the zone given"),
         G::Ambiguous => {
-            tl!("S after the zone is latitude band S; for the southern hemisphere write the zone, then south (33 south 412345 3768000)")
+            tl_raw!("S after the zone is latitude band S; for the southern hemisphere write the zone, then south (33 south 412345 3768000)")
         }
     };
     crate::i18n::fmt("No place at this grid reference: {reason}", &[("reason", reason)])
