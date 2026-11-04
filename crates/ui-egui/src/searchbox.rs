@@ -292,7 +292,7 @@ fn list_area(app: &mut RustGisApp, ui: &Ui, frame_r: Rect, list: &[Row], t: &Tok
                     if let Some(e) = grid {
                         note(ui, &grid_error_text(e), t.text_dim);
                     } else if none {
-                        note(ui, tl!("Nothing found"), t.text_dim);
+                        note(ui, tl_raw!("Nothing found"), t.text_dim);
                     }
                 });
                 // Places stay in sight under the map's matches: the row that searches them, or
@@ -319,7 +319,7 @@ fn list_area(app: &mut RustGisApp, ui: &Ui, frame_r: Rect, list: &[Row], t: &Tok
                     note(ui, &e, t.red);
                 }
                 if matches!(&st.places, Places::Found(p) if p.is_empty()) {
-                    note(ui, tl!("No place found"), t.text_dim);
+                    note(ui, tl_raw!("No place found"), t.text_dim);
                 }
                 if matches!(st.places, Places::Found(_)) {
                     ui.horizontal(|ui| {
@@ -381,7 +381,7 @@ fn describe(st: &State, row: &Row) -> (String, &'static str, String, Option<Stri
 /// Why a query written as a UTM position or an MGRS reference names no place.
 fn grid_error_text(e: rustgis_engine::geom::GridError) -> String {
     use rustgis_engine::geom::GridError as G;
-    // In logical order: the reason is filled into the message, which is put in display order.
+    // In logical order: the message is fitted to the list's rows, each put in display order.
     let reason = match e {
         G::Syntax => tl_raw!("not a UTM or MGRS grid reference"),
         G::Zone => tl_raw!("the UTM zone must be 1 to 60"),
@@ -395,14 +395,15 @@ fn grid_error_text(e: rustgis_engine::geom::GridError) -> String {
             tl_raw!("S after the zone is latitude band S; for the southern hemisphere write the zone, then south (33 south 412345 3768000)")
         }
     };
-    crate::i18n::fmt("No place at this grid reference: {reason}", &[("reason", reason)])
+    crate::i18n::fmt_raw("No place at this grid reference: {reason}", &[("reason", reason)])
 }
 
+/// `text`, in logical order, wrapped at the list's width: a reason or an error can be longer
+/// than the list is wide, and a right-to-left one keeps its rows in reading order.
 fn note(ui: &mut Ui, text: &str, color: Color32) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        // Wrapped at the list's width: a reason or an error can be longer than the list is wide.
-        ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(color)).wrap());
+        crate::i18n::paragraph(ui, text, regular(12.0), color);
     });
 }
 
@@ -592,6 +593,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A reason in right-to-left text, longer than the list is wide, is broken into rows ahead of
+    /// the toolkit's wrapping, which would put a back-to-front paragraph's rows out of order; the
+    /// first row holds the start of the sentence.
+    #[test]
+    fn a_right_to_left_note_keeps_its_rows_in_reading_order() {
+        let text = "هیچ مکانی در این مرجع شبکه نیست زیرا حرف پس از منطقه کمربند عرض جغرافیایی است";
+        // The interface fonts, which hold the Persian glyphs, are in from the next frame on.
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(220.0, 300.0)).build_ui(move |ui| {
+            if !fonts {
+                crate::theme::install_fonts(ui.ctx(), &[], None);
+                fonts = true;
+                return;
+            }
+            let t = Tokens::get(ui.ctx());
+            note(ui, text, t.text_dim);
+        });
+        h.run();
+        let shown: String = h.query_all_by_role(Role::Label).find_map(|n| n.value()).unwrap();
+        let rows: Vec<&str> = shown.split('\n').collect();
+        assert!(rows.len() > 1, "{shown:?}");
+        assert!(rows[0].contains("هیچ"), "{shown:?}");
+        assert!(!rows[0].contains("است"), "{shown:?}");
     }
 
     /// A number typed for one layer, then another layer picked in a list a places search left

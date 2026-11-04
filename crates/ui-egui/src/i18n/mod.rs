@@ -401,6 +401,13 @@ pub fn location(loc: &str) -> String {
 /// logical order — [`t_raw`] (`tl_raw!`) for translated fragments, raw data as it is —
 /// for the finished message is transformed as a whole.
 pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
+    rtl::visual(&fmt_raw(template, args))
+}
+
+/// [`fmt`] in logical order, without the display form: for a message shown with
+/// [`paragraph`], which fits a right-to-left message to its rows and puts each row in
+/// display form itself.
+pub fn fmt_raw(template: &str, args: &[(&str, &str)]) -> String {
     let template = tr_raw(current(), template);
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -409,7 +416,7 @@ pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
         let Some((name, tail)) = after.split_once('}') else {
             out.push('{');
             out.push_str(after);
-            return rtl::visual(&out);
+            return out;
         };
         match args.iter().find(|(k, _)| *k == name) {
             Some((_, v)) => out.push_str(v),
@@ -422,7 +429,7 @@ pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
         rest = tail;
     }
     out.push_str(rest);
-    rtl::visual(&out)
+    out
 }
 
 thread_local! {
