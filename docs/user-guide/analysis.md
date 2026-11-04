@@ -67,7 +67,12 @@ made to its input layers while it runs are kept: a selection it makes selects th
 where they now are (and says how many are gone), and a result that would replace an edited
 layer, or one loaded whole meanwhile, is refused. Renaming the map while it runs is fine; after
 switching to another map, a result that adds to or changes the map is refused (one made only of
-tables or a file is still made). Opening another project drops the run. Scripts, models, the AI
+tables or a file is still made). Opening another project drops the run. The Analysis pane's
+**Zonal Statistics**, **Viewshed**, **Interpolate (IDW)**, **Classification Wizard** (k-means) and
+**Deep Learning** (training and classifying) run in the background the same way, with their
+progress and **Cancel** under the pane's inputs, one at a time; so does the map's right-click
+**Viewshed … Here**, which opens the pane to show it. A model trained there is kept once its classes
+are added: a cancelled run keeps none. Scripts, models, the AI
 Assistant, the command line and the web app wait for each tool to finish.
 
 **Viewshed**, **IDW Interpolation** and **Kriging** refuse a run that would take more than a second
@@ -519,8 +524,16 @@ rule), `last`, `sum` and `mean` (numeric fields), `min` and `max` (numbers or te
 matches with a value) and `join` (the values as text, separated by `delimiter`, `, ` by default).
 Every rule but `first` and `last` skips empty values. A target without matches gets empty
 values, except a `count` of 0. `mean` writes a decimal field, `count` a whole number and `join`
-text. The `sum` of a whole-number field adds its whole numbers, and is empty when too large to
-hold. For example, the total units permitted in each district:
+text. The `sum` of a whole-number field adds its whole numbers exactly, and is empty when too
+large for a 64-bit integer; the tool says how many sums were left empty, and in which fields. A
+decimal with a fraction, or a number past that range, isn't a whole number the field holds: the sum
+leaves it out. The other numeric rules leave out a number too large for a decimal (text such as
+`1e309`). The tool says how many matched numbers were left out, and in which fields. Whole numbers written as text count as the
+numbers they are, however they are written (`12`, `12.0`, `1.2e1`). `min`
+and `max` compare whole numbers exactly, past 2^53 (9,007,199,254,740,992) too, where their decimals
+can be equal. The `mean` of whole numbers comes from their exact sum; a mean that is a whole number
+past 2^53, which a decimal can't hold, is rounded, and the tool says how many were. For example, the
+total units permitted in each district:
 
 ```text
 gp.run={"tool":"spatialJoin","params":{"target":"districts","join":"permits","merge":[{"field":"units","rule":"sum"}]}}
