@@ -520,7 +520,9 @@ fn locate(m: &Mgrs) -> Result<Coord, GridError> {
 /// Most characters a typed grid reference may have.
 const MAX_REF_CHARS: usize = 64;
 
-/// Reads a zone number (1–60, one or two digits) and the letter after it, skipping spaces.
+/// Reads a zone number (one or two digits) and the letter after it, skipping spaces. The zone
+/// isn't checked to be 1–60 here (the caller does, once the rest reads as a reference): until
+/// then, `75 Main St` is text.
 fn zone_and_letter(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<(u8, char), GridError> {
     while chars.next_if(|c| c.is_whitespace()).is_some() {}
     let mut zone = String::new();
@@ -531,9 +533,6 @@ fn zone_and_letter(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Resu
         return Err(GridError::Syntax);
     }
     let zone: u8 = zone.parse().map_err(|_| GridError::Syntax)?;
-    if !(1..=60).contains(&zone) {
-        return Err(GridError::Zone);
-    }
     while chars.next_if(|c| c.is_whitespace()).is_some() {}
     let letter = chars.next().filter(char::is_ascii_alphabetic).ok_or(GridError::Syntax)?.to_ascii_uppercase();
     Ok((zone, letter))
@@ -626,6 +625,9 @@ pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
     while let Some(c) = chars.next_if(char::is_ascii_alphabetic) {
         word.push(c.to_ascii_uppercase());
     }
+    if !matches!(word.as_str(), "NORTH" | "SOUTH") && word.chars().count() != 1 {
+        return Err(GridError::Syntax);
+    }
     let rest: String = chars.collect();
     let nums: Vec<&str> = rest.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).collect();
     let [es, ns] = nums.as_slice() else { return Err(GridError::Syntax) };
@@ -637,6 +639,9 @@ pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
         s.parse::<f64>().ok().filter(|v| v.is_finite()).ok_or(GridError::Syntax)
     };
     let (easting, northing) = (number(es)?, number(ns)?);
+    if !(1..=60).contains(&zone) {
+        return Err(GridError::Zone);
+    }
     if !(0.0..1_000_000.0).contains(&easting) || !(0.0..=FALSE_NORTHING_SOUTH).contains(&northing) {
         return Err(GridError::OutsideZone);
     }
@@ -971,6 +976,10 @@ mod tests {
             ("123SMB", GridError::Syntax),
             ("0SMB", GridError::Zone),
             ("61SMB", GridError::Zone),
+            // The zone is judged once the text is written as a reference: a number past 60
+            // before a word is ordinary text.
+            ("75 Main St", GridError::Syntax),
+            ("99 Problems", GridError::Syntax),
             ("38IMB", GridError::Band),
             ("38OMB", GridError::Band),
             ("38ZMB", GridError::Polar),
@@ -1161,6 +1170,8 @@ mod tests {
             ("33 east 412345 5523456", GridError::Syntax),
             ("0U 412345 5523456", GridError::Zone),
             ("61U 412345 5523456", GridError::Zone),
+            ("75 Main St", GridError::Syntax),
+            ("64 Bit 32 16", GridError::Syntax),
             ("33I 412345 5523456", GridError::Band),
             ("33Z 412345 5523456", GridError::Polar),
             // 5,523 km north is 49.8° N: not band T (40°–48° N).

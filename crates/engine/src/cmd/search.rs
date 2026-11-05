@@ -372,15 +372,27 @@ pub fn parse_grid_reference(text: &str) -> Option<Coord> {
 }
 
 /// As [`parse_grid_reference`], with why a reference was refused: [`GridError::Syntax`] for text
-/// written as neither form, otherwise the reason of the form it was written in.
+/// written as neither form, otherwise the reason of the form it was written in. A 100 km square
+/// alone written with spaces (`5 Ave`, `4K TV`) is a number and a word as often as a reference,
+/// so one that names no square is [`GridError::Syntax`] too; written as one word (`38TMJ`), it
+/// says why.
 pub fn read_grid_reference(text: &str) -> Result<Coord, GridError> {
     match rustgis_geom::parse_mgrs(text) {
         Ok(m) => m.centre(),
         Err(mgrs) => match rustgis_geom::parse_utm(text) {
+            Err(GridError::Syntax) if spaced_square(text) => Err(GridError::Syntax),
             Err(GridError::Syntax) => Err(mgrs),
             utm => utm,
         },
     }
+}
+
+/// Whether `text` has spaces and no digits after its leading number: written so, an MGRS
+/// reference is a 100 km square alone.
+fn spaced_square(text: &str) -> bool {
+    let text = text.trim();
+    let after_zone = text.trim_start_matches(|c: char| c.is_ascii_digit());
+    text.contains(char::is_whitespace) && !after_zone.contains(|c: char| c.is_ascii_digit())
 }
 
 /// `lat, lon` rounded to six decimals (about 0.1 m), without trailing zeros.
@@ -671,6 +683,10 @@ mod tests {
             ("38SMB441408470", GridError::Digits),
             ("38TMB4414084706", GridError::BandMismatch),
             ("38TMJ", GridError::BandMismatch),
+            // A 100 km square written as one word, as a reference is, still says why.
+            ("38SAB", GridError::Square),
+            ("38zmb", GridError::Polar),
+            ("38S AB 44140 84706", GridError::Square),
             ("38Z 444141 3684706", GridError::Polar),
             ("38ZMB4414084706", GridError::Polar),
             ("99X 1 2", GridError::Zone),
@@ -680,7 +696,27 @@ mod tests {
             assert_eq!(search(&s, q, 50).grid_error, Some(why), "{q}");
         }
         // Text not written as a grid reference, and references that read, carry no reason.
-        for q in ["1C", "Paris", "Countries", "12 Main St", "2020", "40.7, -74.0", "38SMB", "38S 444141 3684706", "10 20"] {
+        // A number and a three-letter word (a polar band, a square letter the zone doesn't use, I
+        // or O, a zone past 60) is ordinary text, and so is a number past 60 before any words.
+        for q in [
+            "1C",
+            "Paris",
+            "Countries",
+            "12 Main St",
+            "2020",
+            "40.7, -74.0",
+            "38SMB",
+            "38S 444141 3684706",
+            "10 20",
+            "5 Ave",
+            "7 Bay",
+            "3 Rds",
+            "2 Oak",
+            "99 Ave",
+            "4K TV",
+            "75 Main St",
+            "99 Problems",
+        ] {
             assert_eq!(search(&s, q, 50).grid_error, None, "{q}");
         }
         let mut s = s;
@@ -691,6 +727,8 @@ mod tests {
         assert!(e.contains("nothing matches") && e.contains("33 south"), "{e}");
         let e = s.run("map.search", &json!({"query": "Zzyzx Qq", "go": true})).unwrap_err();
         assert_eq!(e, "nothing matches 'Zzyzx Qq'");
+        let e = s.run("map.search", &json!({"query": "5 Ave", "go": true})).unwrap_err();
+        assert_eq!(e, "nothing matches '5 Ave'");
         // MGRS-looking garbage never panics.
         let mut r = 1u64;
         let alphabet: Vec<char> = "0123456789 ACHINOSUVXZacz.-,°\u{0}é٣".chars().collect();

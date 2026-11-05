@@ -176,8 +176,10 @@ The [search box](#navigating) takes the same grid references, in any case:
 
 A reference that doesn't exist (square letters the zone doesn't use, a northing or a square
 outside the band, an odd number of digits, a place outside the zone) finds nothing rather than a
-place somewhere else, and the list says why; `map.search` returns the reason as `gridError`. On
-the map of another body, grid references find nothing.
+place somewhere else, and the list says why; `map.search` returns the reason as `gridError`. A
+100 km square written with spaces, such as `5 Ave` or `4K TV`, is as likely ordinary text, so one
+that names no square gives no reason; written as one word, `38TMJ`, it does. On the map of
+another body, grid references find nothing.
 
 ### Directions
 
