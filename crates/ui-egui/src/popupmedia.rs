@@ -20,7 +20,8 @@
 //! [`MAX_PICTURE_BYTES`], and decoded with the limits of [`crate::mapview::decode_picture`],
 //! its size checked before decoding. Each address's picture, or why there is none, is kept for
 //! the session ([`MAX_PICTURES`] of them, the least recently shown dropped first), so it isn't
-//! fetched again when the pop-up opens again, nor a failure every frame.
+//! fetched again when the pop-up opens again, nor a failure every frame; all go when the tile
+//! cache is cleared, as by a sign-out ([`Pictures::forget_if_cleared`]).
 
 use rustgis_engine::render::rustgis_tiles::{address, cache};
 
@@ -217,9 +218,21 @@ pub(crate) enum Shown {
 #[derive(Default)]
 pub(crate) struct Pictures {
     entries: Vec<(String, Entry)>,
+    /// [`cache::clears`] when [`Self::forget_if_cleared`] last looked.
+    clears: u64,
 }
 
 impl Pictures {
+    /// Forgets every picture (those being fetched too) when the tile cache was cleared since this
+    /// was last called, `clears` being [`cache::clears`]: a sign-out or a login that ends clears
+    /// it, and a picture may have been read with that login, so it goes with the cache's tiles.
+    pub(crate) fn forget_if_cleared(&mut self, clears: u64) {
+        if clears != self.clears {
+            self.entries.clear();
+            self.clears = clears;
+        }
+    }
+
     /// The picture at `url`. The first time it is asked for (or after it was dropped to make
     /// room), one from [`AUTO_HOST`] is started with `fetch`; any other is [`Shown::Offered`],
     /// not fetched, until [`Self::accept`]. A refused or failed one is kept like a picture, so
@@ -295,11 +308,23 @@ fn start(url: &str, fetch: impl FnOnce(&str, Landing)) -> Entry {
     Entry::Loading(landing)
 }
 
+/// A reader of a fetched picture's header, allowed the memory [`crate::mapview::decode_picture`]
+/// allows ([`crate::mapview::MAX_PICTURE_ALLOC`]): reading a PNG's header unpacks its colour
+/// profile, which a few megabytes can make hundreds of megabytes. Not its pixel limits, so a
+/// picture past them is still measured, and refused saying how large it is.
+fn header(bytes: &[u8]) -> Result<image::ImageReader<std::io::Cursor<&[u8]>>, Failure> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|_| Failure::NotPicture)?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(crate::mapview::MAX_PICTURE_ALLOC);
+    reader.limits(limits);
+    Ok(reader)
+}
+
 /// Decodes a fetched picture for the pop-up: refused when it isn't one, or when its header says
 /// it is larger than [`crate::mapview::decode_picture`] takes (before anything is decoded, so a
 /// small file can't unpack into a huge picture), and kept at most [`MAX_SIDE`] pixels a side.
 pub(crate) fn decode(bytes: &[u8]) -> Result<image::RgbaImage, Failure> {
-    let header = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|_| Failure::NotPicture)?;
+    let header = header(bytes)?;
     let Some(format) = header.format() else { return Err(Failure::NotPicture) };
     // A picture whose format has no decoder here says so, rather than that it isn't one.
     let (w, h) = header.into_dimensions().map_err(|e| match e {
@@ -327,8 +352,14 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<image::RgbaImage, Failure> {
 /// resolves to this computer or the local network is refused where it resolves, past what
 /// [`refusal`] can tell from the address.
 pub(crate) fn fetch(url: &str, landing: Landing) {
+    // The scheme in lowercase, as the downloads compare it: a redirect from `HTTPS://` down to
+    // `http://` is refused as one from `https://` is.
+    let url = match url.split_once("://") {
+        Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
+        None => url.to_string(),
+    };
     cache::download_public_limited(
-        url,
+        &url,
         MAX_PICTURE_BYTES,
         Box::new(move |r| {
             let r = r.map_err(Failure::Fetch).and_then(|bytes| decode(&bytes));
@@ -522,6 +553,91 @@ mod tests {
         assert_eq!(decode(whole.get(..whole.len() / 2).unwrap()), Err(Failure::NotPicture));
     }
 
+    /// PNG's CRC-32 of a chunk's type and data.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    /// A zlib stream unpacking into `n` zero bytes, in about 13 bits per 258 of them: a literal
+    /// zero, then copies of 258 bytes from one back, in a block of fixed Huffman codes (RFC 1951).
+    fn zlib_zeros(n: usize) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        let (mut acc, mut bits) = (0u64, 0u32);
+        // A Huffman code goes most significant bit first; other fields least significant first.
+        let mut put = |out: &mut Vec<u8>, v: u32, len: u32, code: bool| {
+            let v = if code { v.reverse_bits() >> (32 - len) } else { v };
+            acc |= u64::from(v) << bits;
+            bits += len;
+            while bits >= 8 {
+                out.push(acc as u8);
+                acc >>= 8;
+                bits -= 8;
+            }
+        };
+        put(&mut out, 1, 1, false); // the last block
+        put(&mut out, 1, 2, false); // fixed codes
+        let mut left = n;
+        while left > 0 {
+            if left > 258 && left < n {
+                put(&mut out, 0b1100_0101, 8, true); // a length of 258
+                put(&mut out, 0, 5, true); // from one byte back
+                left -= 258;
+            } else {
+                put(&mut out, 0x30, 8, true); // a literal zero
+                left -= 1;
+            }
+        }
+        put(&mut out, 0, 7, true); // end of block
+        put(&mut out, 0, 7, false);
+        // Adler-32 of `n` zero bytes.
+        out.extend_from_slice(&((((n % 65521) as u32) << 16) | 1).to_be_bytes());
+        out
+    }
+
+    /// A 1 × 1 PNG whose colour profile (iCCP chunk) unpacks into `profile` bytes.
+    fn png_with_profile(profile: usize) -> Vec<u8> {
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let chunk = |out: &mut Vec<u8>, kind: &[u8], data: &[u8]| {
+            out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+            let typed = [kind, data].concat();
+            out.extend_from_slice(&typed);
+            out.extend_from_slice(&crc32(&typed).to_be_bytes());
+        };
+        chunk(&mut out, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        chunk(&mut out, b"iCCP", &[b"icc\0\0".as_slice(), &zlib_zeros(profile)].concat());
+        // One row: no filter, one transparent pixel, as a stored block.
+        chunk(&mut out, b"IDAT", &[0x78, 0x01, 0x01, 5, 0, 0xfa, 0xff, 0, 0, 0, 0, 0, 0, 5, 0, 1]);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn a_picture_header_is_read_within_the_memory_decoding_takes() {
+        use image::ImageDecoder;
+        // A colour profile is read with the header: this PNG is well made.
+        let small = png_with_profile(3000);
+        let mut d = header(&small).unwrap().into_decoder().unwrap();
+        assert_eq!(d.icc_profile().unwrap().map(|p| p.len()), Some(3000));
+        assert_eq!(decode(&small).unwrap().dimensions(), (1, 1));
+        // A profile past the memory decoding may take, in far fewer bytes than are fetched, isn't
+        // unpacked by the header's reader (whose own limit would let the 4 MB fetched unpack
+        // into 512 MiB), and the picture still shows.
+        let past = usize::try_from(crate::mapview::MAX_PICTURE_ALLOC).unwrap() + (1 << 20);
+        let big = png_with_profile(past);
+        assert!(big.len() < MAX_PICTURE_BYTES / 8, "{}", big.len());
+        let mut d = header(&big).unwrap().into_decoder().unwrap();
+        assert_eq!(d.dimensions(), (1, 1));
+        assert_eq!(d.icc_profile().unwrap(), None);
+        assert_eq!(decode(&big).unwrap().dimensions(), (1, 1));
+    }
+
     #[test]
     fn only_the_asset_server_loads_by_itself() {
         for yes in [
@@ -653,6 +769,29 @@ mod tests {
         // Another address on that server still waits to be asked.
         assert!(matches!(pics.show(&ctx, "https://images.example.org/b.png", fake(&calls, None)), Shown::Offered));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn pictures_go_when_the_cache_is_cleared() {
+        let ctx = egui::Context::default();
+        let mut pics = Pictures::default();
+        let calls = std::cell::Cell::new(0);
+        let shown = "https://assets.rustgis.app/a.png";
+        let accepted = "https://images.example.org/b.png";
+        pics.forget_if_cleared(7);
+        pics.show(&ctx, shown, fake(&calls, Some(Ok(png(2, 2)))));
+        pics.accept(accepted, fake(&calls, Some(Ok(png(2, 2)))));
+        // The cache not cleared since: both kept.
+        pics.forget_if_cleared(7);
+        assert_eq!((calls.get(), pics.len()), (2, 2));
+        assert!(matches!(pics.show(&ctx, accepted, fake(&calls, None)), Shown::Ready(_)));
+        // Cleared (a sign-out): both forgotten; the asset server's picture is fetched again, the
+        // other waits to be asked again.
+        pics.forget_if_cleared(8);
+        assert_eq!(pics.len(), 0);
+        assert!(matches!(pics.show(&ctx, accepted, fake(&calls, None)), Shown::Offered));
+        assert!(matches!(pics.show(&ctx, shown, fake(&calls, Some(Ok(png(2, 2))))), Shown::Ready(_)));
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]

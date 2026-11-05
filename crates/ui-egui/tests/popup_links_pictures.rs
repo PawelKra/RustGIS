@@ -65,6 +65,14 @@ fn png(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
+fn webp(w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::RgbaImage::from_pixel(w, h, image::Rgba([200, 90, 40, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::WebP)
+        .unwrap();
+    out
+}
+
 /// The World Atlas with a point at 0,0 whose properties are `props`, and its pop-up open.
 fn popup(props: Value) -> egui_kittest::Harness<'static, RustGisApp> {
     let mut app = RustGisApp::with_sample();
@@ -186,7 +194,7 @@ fn a_picture_from_the_asset_server_shows_by_itself() {
     assert!(has_label(&h, "Loading picture"));
     assert!(h.query_by_label("Show Picture").is_none());
     assert!(h.query_by_label("Picture").is_none());
-    assert_eq!(answer(&asked, "galileo-earth.webp", || Ok(png(64, 48))), 1);
+    assert_eq!(answer(&asked, "galileo-earth.webp", || Ok(webp(64, 48))), 1);
     h.run_steps(3);
     h.get_by_label("Picture");
     assert!(!has_label(&h, "Loading picture"));
@@ -368,12 +376,59 @@ fn a_picture_kept_in_a_value_wins_over_one_on_the_web() {
     use base64::Engine;
     let _turn = turn();
     let asked = fake_fetcher();
-    let data = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png(16, 12)));
-    let mut h = popup(json!({"name": "Both", "thumbnail": data, "image_url": "https://assets.rustgis.app/images/web.jpg"}));
-    h.run_steps(4);
+    for (kind, bytes) in [("png", png(16, 12)), ("webp", webp(16, 12))] {
+        let data = format!("data:image/{kind};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        let mut h = popup(json!({"name": "Both", "thumbnail": data, "image_url": "https://assets.rustgis.app/images/web.jpg"}));
+        h.run_steps(4);
+        h.get_by_label("Picture");
+        assert!(asked.lock().unwrap().is_empty(), "the web picture was fetched beside a {kind} one");
+        assert!(!has_label(&h, "Loading picture"));
+        assert!(h.query_by_label("Show Picture").is_none());
+        h.get_by_role_and_label(Role::Link, "https://assets.rustgis.app/images/web.jpg");
+        // The value shows as the picture, not as its text.
+        assert!(!has_label(&h, &format!("data:image/{kind}")), "{kind}");
+    }
+}
+
+#[test]
+fn an_address_in_capitals_is_fetched_with_its_scheme_in_lowercase() {
+    let _turn = turn();
+    let asked = fake_fetcher();
+    // The downloads tell a redirect from https down to http by the scheme as written.
+    let mut h = popup(json!({"name": "Loud", "image": "HTTPS://ASSETS.RUSTGIS.APP/IMAGES/A.PNG"}));
+    h.run_steps(3);
+    assert_eq!(asked_urls(&asked), ["https://ASSETS.RUSTGIS.APP/IMAGES/A.PNG"]);
+    assert_eq!(answer(&asked, "A.PNG", || Ok(png(8, 8))), 1);
+    h.run_steps(3);
     h.get_by_label("Picture");
-    assert!(asked.lock().unwrap().is_empty(), "the web picture was fetched");
-    assert!(!has_label(&h, "Loading picture"));
-    assert!(h.query_by_label("Show Picture").is_none());
-    h.get_by_role_and_label(Role::Link, "https://assets.rustgis.app/images/web.jpg");
+    h.get_by_role_and_label(Role::Link, "HTTPS://ASSETS.RUSTGIS.APP/IMAGES/A.PNG");
+}
+
+#[test]
+fn pictures_go_with_an_arcgis_sign_out() {
+    let _turn = turn();
+    let asked = fake_fetcher();
+    let photo = "https://popup1465.example.org/server/rest/services/Sites/FeatureServer/0/1/attachments/2";
+    let mut h = popup(json!({"name": "Site", "photo": photo}));
+    // Signed in with a token, and the server's picture asked for and shown.
+    let root = h.state_mut().run("arcgis.token", json!({"url": photo, "token": "popup1465"})).unwrap()["server"].clone();
+    h.run_steps(2);
+    h.get_by_label("Show Picture").click();
+    h.run_steps(2);
+    assert_eq!(answer(&asked, "attachments/2", || Ok(png(8, 8))), 1);
+    h.run_steps(3);
+    h.get_by_label("Picture");
+    // Not signed out: kept.
+    reopen(&mut h);
+    h.get_by_label("Picture");
+    assert!(asked.lock().unwrap().is_empty());
+    // Signed out: what was read with the token goes, as the cached tiles do; the picture waits to
+    // be asked for again, and nothing is fetched by itself.
+    let out = h.state_mut().run("arcgis.signOut", json!({"portal": root})).unwrap();
+    assert_eq!(out["signedOut"], 1);
+    reopen(&mut h);
+    h.run_steps(5);
+    assert!(h.query_by_label("Picture").is_none());
+    h.get_by_label("Show Picture");
+    assert!(asked.lock().unwrap().is_empty(), "{:?}", asked_urls(&asked));
 }

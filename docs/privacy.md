@@ -46,11 +46,11 @@ still identify private data, so review copied diagnostics before sharing them.
   user name or subdomain; a redirect that server answers with is followed, as for any download
   (in the web app, by the browser). Any other picture is fetched only when you click
   **Show Picture** in the pop-up, which names the server first. Plain `http://` pictures and
-  pictures on this computer
-  or the local network are never fetched; on the desktop that includes a name, or a redirect, that
-  resolves to one. A picture kept in the data itself (a `data:image/…`
-  value) needs no request. A fetched picture is kept in memory for the session; the web app also
-  uses the browser's own cache. Links in the pop-up open only when you click them.
+  pictures on this computer or the local network are never fetched; on the desktop that includes
+  a name, or a redirect, that resolves to one. A picture kept in the data itself (a
+  `data:image/…` value) needs no request. A fetched picture is kept in memory for the session, or
+  until a sign-out or a login that ends clears the cached web tiles; the web app also uses the
+  browser's own cache. Links in the pop-up open only when you click them.
 - Web data, remote rasters, cloud storage, database connections and online catalogs contact
   their configured servers. Searches may send keywords, coordinates, an area of interest,
   dates or filters; authenticated connections also send the credentials or tokens required by

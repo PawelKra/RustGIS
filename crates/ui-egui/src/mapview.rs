@@ -3514,7 +3514,11 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     let picture = match (picture, &web_picture) {
         (Some(Ok(tex)), _) => Some(crate::popupmedia::Shown::Ready(tex)),
         (Some(Err(e)), _) => Some(crate::popupmedia::Shown::Failed(crate::popupmedia::Failure::Fetch(e))),
-        (None, Some(url)) => Some(app.map.pictures.show(ui.ctx(), url, crate::popupmedia::fetch)),
+        (None, Some(url)) => {
+            // Read before the cache was cleared (a sign-out), a picture goes with it.
+            app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
+            Some(app.map.pictures.show(ui.ctx(), url, crate::popupmedia::fetch))
+        }
         (None, None) => None,
     };
     let mut load_picture = false;
@@ -3771,10 +3775,10 @@ fn select_shown(app: &mut RustGisApp) {
     app.session.revision = app.session.revision.wrapping_add(1);
 }
 
-/// Whether an attribute value is a picture (a `data:image/png` or `jpeg` address, as a photo's
-/// thumbnail is kept).
+/// Whether an attribute value is a picture (a `data:image/jpeg`, `png` or `webp` address, as a
+/// photo's thumbnail is kept).
 pub(crate) fn is_picture(v: &str) -> bool {
-    v.starts_with("data:image/jpeg;base64,") || v.starts_with("data:image/png;base64,")
+    ["data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,"].iter().any(|p| v.starts_with(p))
 }
 
 /// The texture of a picture value, decoded once and kept while the same value is shown.
@@ -3807,6 +3811,8 @@ fn picture_texture(app: &mut RustGisApp, ctx: &egui::Context, value: &str) -> Re
 
 /// The largest picture the identify popup decodes, pixels a side.
 pub(crate) const MAX_PICTURE_SIDE: u32 = 2048;
+/// The most memory decoding a picture for the identify popup may take, in bytes.
+pub(crate) const MAX_PICTURE_ALLOC: u64 = 64 << 20;
 
 /// A picture kept with a feature, decoded for the identify popup. A project's value is hostile:
 /// its size is checked before anything is decoded, so a small compressed picture can't unpack
@@ -3816,7 +3822,7 @@ pub(crate) fn decode_picture(bytes: &[u8]) -> Result<image::RgbaImage, String> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_PICTURE_SIDE);
     limits.max_image_height = Some(MAX_PICTURE_SIDE);
-    limits.max_alloc = Some(64 << 20);
+    limits.max_alloc = Some(MAX_PICTURE_ALLOC);
     reader.limits(limits);
     Ok(reader.decode().map_err(|_| "the picture is too large to show, or isn't one".to_string())?.to_rgba8())
 }

@@ -105,6 +105,7 @@ fn lock() -> std::sync::MutexGuard<'static, Cache> {
 }
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static CLEARS: AtomicU64 = AtomicU64::new(0);
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 fn fetcher() -> &'static Mutex<Option<Arc<Fetcher>>> {
@@ -169,6 +170,13 @@ pub fn set_waker(f: impl Fn() + Send + Sync + 'static) {
 /// Goes up each time a fetch finishes: a map drawn at an older generation may now draw more.
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
+}
+
+/// How many times [`clear`] has run. What was read through the downloads before it and is kept
+/// elsewhere (the identify pop-up's pictures) goes too: it may have been read with a login that
+/// has since ended.
+pub fn clears() -> u64 {
+    CLEARS.load(Ordering::Relaxed)
 }
 
 /// How many fetches are under way. Once a fetch no longer counts, its [`generation`] shows.
@@ -280,6 +288,7 @@ pub fn clear() {
     crate::cog::forget();
     crate::warp::forget();
     rustgis_data::source::remote::forget();
+    CLEARS.fetch_add(1, Ordering::Relaxed);
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
