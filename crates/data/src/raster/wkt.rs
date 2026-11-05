@@ -11,6 +11,7 @@
 //! datums recover the same Helmert transformation as their bundled EPSG definition.
 
 use super::crs::{Crs, CustomCrs, epsg_proj4};
+use super::planetary;
 
 /// The most nested brackets read.
 const MAX_DEPTH: usize = 32;
@@ -235,7 +236,9 @@ pub fn crs_from_wkt(text: &str) -> Result<Crs, String> {
 }
 
 /// The coordinate system a WKT text describes, with a note when its datum has no conversion to
-/// WGS 84 available (for example, NAD 27), so positions may be off by up to a few hundred metres.
+/// WGS 84 available (for example, NAD 27), so positions may be off by up to a few hundred metres,
+/// or when it is another body's than the Earth's ([`planetary`]), whose longitude/latitude are
+/// read as they are. Longitudes counted west (a planetographic system's) are refused.
 pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
     let root = wkt1(parse(text)?, 0)?;
     if let Some(a) = root.child("AUTHORITY")
@@ -245,14 +248,49 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
         return Ok((crs, None));
     }
     match root.name.to_ascii_uppercase().as_str() {
-        "GEOGCS" => Ok((geographic(&root)?, datum_note(Some(&root)))),
+        "GEOGCS" => {
+            let crs = geographic(&root)?;
+            Ok((crs, note(crs, Some(&root))))
+        }
         "PROJCS" => {
             let crs = projected(&root)?;
-            let note = if matches!(crs, Crs::Custom(_)) { datum_note(root.child("GEOGCS")) } else { None };
+            let note = if matches!(crs, Crs::Custom(_)) { note(crs, root.child("GEOGCS")) } else { None };
             Ok((crs, note))
         }
         other => Err(format!("{other} coordinate systems aren't supported")),
     }
+}
+
+/// What reading `crs`, whose `GEOGCS` is `geog`, says: that it is another body's system, or that
+/// its datum has no conversion to WGS 84 ([`datum_note`]); not both, as another body has none.
+fn note(crs: Crs, geog: Option<&Node>) -> Option<String> {
+    if !crs.is_planetary() {
+        return datum_note(geog);
+    }
+    let system = match geog.and_then(|g| g.child("DATUM")).map(Node::title).filter(|d| !d.trim().is_empty()) {
+        Some(datum) => format!("{} (datum {datum})", crs.label()),
+        None => crs.label(),
+    };
+    Some(planetary::read_note(&system))
+}
+
+/// The datum (else the ellipsoid) of another body than the Earth that a WKT text names, by its
+/// ellipsoid's semi-major axis ([`planetary`]): for saying why a planetary system that can't be
+/// read is refused. `None` for the Earth's, and for text that isn't WKT.
+pub fn planetary_datum(text: &str) -> Option<String> {
+    fn find(n: &Node, depth: usize) -> Option<String> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        if let Some(e) = n.child_of(&["SPHEROID", "ELLIPSOID"])
+            && let Some(a) = e.num(0)
+            && planetary::off_earth(a * factor(e.child_of(&LENGTH_UNIT)).unwrap_or(1.0))
+        {
+            return Some(if n.title().trim().is_empty() { e.title() } else { n.title() }.to_string());
+        }
+        n.nodes().find_map(|c| find(c, depth + 1))
+    }
+    find(&parse(text).ok()?, 0)
 }
 
 /// The WKT1 form of a coordinate system: WKT1 as it is, WKT2 rewritten. A compound system (a
@@ -314,6 +352,11 @@ fn geographic2(g: &Node, top: bool) -> Result<Node, String> {
         && !kind.eq_ignore_ascii_case("ellipsoidal")
     {
         return Err(format!("{kind} coordinate systems aren't supported"));
+    }
+    // Longitudes counted west (planetographic ones, on most bodies) would be read as east, the
+    // data mirrored: as for a projected system's axes, WKT1 has no way to say so.
+    if top && reversed_axes(g) && epsg_id(g).and_then(Crs::from_epsg).is_none() {
+        return Err("axes pointing west or south aren't supported".into());
     }
     let unit = cs_unit(g, &ANGLE_UNIT);
     let mut items = Vec::new();
@@ -546,6 +589,10 @@ fn authority_code(a: &Node) -> Option<u32> {
 /// (which differ by a metre or so) from Greenwich, otherwise on the file's own datum and prime
 /// meridian.
 fn geographic(g: &Node) -> Result<Crs, String> {
+    // A WKT1 system's own axes, when it gives them: longitudes counted west would be mirrored.
+    if reversed_axes(g) {
+        return Err("axes pointing west or south aren't supported".into());
+    }
     if let Some(f) = g.child("UNIT").and_then(|u| u.num(0))
         && (f - 1f64.to_radians()).abs() > 1e-9
     {
@@ -1920,5 +1967,68 @@ mod tests {
         let again = to_wkt(read).unwrap();
         assert!(again.contains("DATUM[\"CH1903+\"") || again.contains("DATUM[\"CH1903\""), "{again}");
         assert!(crs_from_wkt(&again).is_ok(), "{again}");
+    }
+
+    /// Another body's system (Mars, IAU 2015) gets its own note instead of the datum note, and its
+    /// longitudes counted west are refused; no Earth system the bundle holds gets the note.
+    #[test]
+    fn planetary_systems_are_said_and_west_longitudes_refused() {
+        let esri = r#"GEOGCS["GCS_Mars_2015_-_Sphere_Ocentric",DATUM["D_Mars_2015_-_Sphere",SPHEROID["Mars_2015_-_Sphere",3396190.0,0.0]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#;
+        let (crs, note) = read_wkt(esri).unwrap();
+        let note = note.unwrap();
+        // (Named as the run's table first knew its definition.)
+        assert!(crs.is_planetary() && note.contains(&format!("{} (datum D_Mars_2015_-_Sphere)", crs.label())), "{note}");
+        assert!(!note.contains("few hundred metres"), "{note}");
+        assert_eq!(crs.custom_def().unwrap().proj4, "+proj=longlat +a=3396190 +b=3396190 +no_defs");
+        let projected =
+            format!(r#"PROJCS["Mars eqc",{esri},PROJECTION["Equirectangular"],PARAMETER["central_meridian",0],UNIT["metre",1]]"#);
+        let (crs, note) = read_wkt(&projected).unwrap();
+        assert!(crs.is_planetary() && !crs.is_geographic() && note.is_some_and(|n| n.contains("D_Mars_2015_-_Sphere")));
+        // Longitudes counted west, in WKT2 and WKT1, are refused; north/east axes are read.
+        let wkt2 = |lon: &str| {
+            format!(
+                r#"GEOGCRS["Mars (2015) / Ographic",DATUM["Mars (2015)",ELLIPSOID["Mars (2015)",3396.19,169.894447223612,LENGTHUNIT["kilometre",1000]]],PRIMEM["Reference Meridian",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,2],AXIS["geodetic latitude (Lat)",north,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["geodetic longitude (Lon)",{lon},ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],ID["IAU",49901,2015]]"#
+            )
+        };
+        assert_eq!(read_wkt(&wkt2("west")).unwrap_err(), "axes pointing west or south aren't supported");
+        assert_eq!(planetary_datum(&wkt2("west")).as_deref(), Some("Mars (2015)"));
+        assert!(read_wkt(&wkt2("east")).unwrap().0.is_planetary());
+        let wkt1 = esri
+            .replace("UNIT[\"Degree\",0.0174532925199433]]", "UNIT[\"Degree\",0.0174532925199433],AXIS[\"Lon\",WEST],AXIS[\"Lat\",NORTH]]");
+        assert_eq!(read_wkt(&wkt1).unwrap_err(), "axes pointing west or south aren't supported");
+        // An Earth geographic system with the usual axes is read as before.
+        assert_eq!(read_wkt(r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],UNIT["degree",0.0174532925199433],AXIS["Lat",NORTH],AXIS["Long",EAST]]"#).unwrap(), (Crs::LonLat, None));
+        // Earth datums aren't another body's; hostile text is nobody's.
+        for text in [
+            "",
+            "garbage",
+            "GEOGCS[",
+            r#"GEOGCS["x",DATUM["d",SPHEROID["s",NaN,0]]]"#,
+            r#"GEOGCS["x",DATUM["d",SPHEROID["s",-3396190,0]]]"#,
+        ] {
+            assert_eq!(planetary_datum(text), None, "{text}");
+        }
+        let deep = format!("{}{}", "A[".repeat(10_000), "]".repeat(10_000));
+        assert_eq!(planetary_datum(&deep), None);
+        // Every system in the bundle, written as WKT: never another body's datum. (Read back by
+        // its parameters for a sample only: each custom system read takes a place in the run's
+        // table.)
+        let mut written = 0;
+        for code in 1024..=u16::MAX {
+            let Some(wkt) = Crs::from_epsg(u32::from(code)).and_then(to_wkt) else { continue };
+            assert_eq!(planetary_datum(&wkt), None, "EPSG:{code}");
+            written += 1;
+        }
+        assert!(written > 3000, "{written}");
+        let mut sampled = 0;
+        for code in [4267u32, 4230, 4277, 27700, 2056, 31370, 28992, 3035, 2193, 32631, 26917, 3413, 5514, 4087, 8857, 3006] {
+            let Some(wkt) = Crs::from_epsg(code).and_then(to_wkt) else { continue };
+            let wkt = wkt.replace(&format!(",AUTHORITY[\"EPSG\",\"{code}\"]"), "");
+            let (crs, note) = read_wkt(&wkt).unwrap_or_else(|e| panic!("EPSG:{code}: {e}"));
+            assert!(!crs.is_planetary(), "EPSG:{code}");
+            assert!(!note.is_some_and(|n| n.contains("another body")), "EPSG:{code}");
+            sampled += 1;
+        }
+        assert!(sampled >= 12, "{sampled}");
     }
 }

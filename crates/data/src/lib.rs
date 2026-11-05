@@ -399,8 +399,10 @@ fn layer_list(names: &[&str]) -> String {
 /// read in place is its source's) written in `crs` says its geometry lacks, one notice per kind:
 /// Z or M values dropped on import ([`zm_export_note`]); positions only approximate, as their
 /// system had no shift to WGS 84 ([`raster::Crs::lacks_datum_shift`]; none when written back in
-/// it); and coordinates that aren't longitude/latitude (beyond ±180.5° or ±90.5°, as the
-/// readers check), which an export writes as if they were. `target` names what was written.
+/// it); another body's longitude/latitude written as the Earth's, or its system written without
+/// its body's name ([`raster::Crs::is_planetary`]); and coordinates that aren't
+/// longitude/latitude (beyond ±180.5° or ±90.5°, as the readers check), which an export writes as
+/// if they were. `target` names what was written.
 pub fn export_notes<'a>(
     layers: impl IntoIterator<Item = (&'a Dataset, rustgis_geom::Extent)>,
     target: &str,
@@ -422,6 +424,35 @@ pub fn export_notes<'a>(
             layer_list(&many.iter().map(|ds| ds.name.as_str()).collect::<Vec<_>>())
         )),
     }
+    // Another body's layers: written as the Earth's longitude/latitude, or in another body's
+    // system, whose WKT gives its datum only by the ellipsoid's axes (`raster::wkt::to_wkt`).
+    let (unnamed, relabelled): (Vec<&Dataset>, Vec<&Dataset>) =
+        layers.iter().map(|(ds, _)| *ds).filter(|ds| ds.crs.is_some_and(raster::Crs::is_planetary)).partition(|_| crs.is_planetary());
+    let written = if crs == raster::Crs::LonLat { "WGS 84 (EPSG:4326)".to_string() } else { crs.label() };
+    match relabelled.as_slice() {
+        [] => {}
+        [one] => notes.push(format!(
+            "{target}: {} is on another body than the Earth ({}), but its longitude/latitude are written as {written}",
+            one.name,
+            one.crs.map(raster::Crs::label).unwrap_or_default()
+        )),
+        many => notes.push(format!(
+            "{target}: {} are on other bodies than the Earth, but their longitude/latitude are written as {written}",
+            layer_list(&many.iter().map(|ds| ds.name.as_str()).collect::<Vec<_>>())
+        )),
+    }
+    match unnamed.as_slice() {
+        [] => {}
+        [one] => notes.push(format!(
+            "{target}: the coordinate system of {} ({}) is another body's, and the file gives its datum only by the ellipsoid's axes, without the body's or the datum's name",
+            one.name,
+            one.crs.map(raster::Crs::label).unwrap_or_default()
+        )),
+        many => notes.push(format!(
+            "{target}: the coordinate systems of {} are other bodies', and the file gives their datums only by the ellipsoids' axes, without the bodies' or the datums' names",
+            layer_list(&many.iter().map(|ds| ds.name.as_str()).collect::<Vec<_>>())
+        )),
+    }
     let outside = |e: &rustgis_geom::Extent| !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5);
     let names: Vec<&str> = layers.iter().filter(|(_, e)| outside(e)).map(|(ds, _)| ds.name.as_str()).collect();
     match names.as_slice() {
@@ -435,6 +466,13 @@ pub fn export_notes<'a>(
         )),
     }
     notes
+}
+
+/// Why exporting `ds` in `crs` would write other data than the layer's: a layer on another body
+/// projected onto another ellipsoid ([`raster::planetary::export_error`]). `None` when the export
+/// writes its numbers, which [`export_notes`] says when they go under another system's name.
+pub fn export_error(ds: &Dataset, crs: raster::Crs) -> Option<String> {
+    ds.crs.and_then(|from| raster::planetary::export_error(from, crs)).map(|e| format!("{}: {e}", ds.name))
 }
 
 impl Dataset {

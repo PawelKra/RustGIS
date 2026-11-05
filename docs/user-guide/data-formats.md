@@ -553,6 +553,19 @@ Coordinates beyond ±180.5° longitude or ±90.5° latitude (a CSV of eastings a
 `"crs"`, a Shapefile without its `.prj`) aren't longitude/latitude: an export says they're out of
 place, and Define Projection, below, places them.
 
+Coordinate systems of other bodies than the Earth (Mars, the Moon and the rest of the IAU's
+`IAU_2015` codes, or any datum whose ellipsoid isn't the Earth's) aren't read as such yet: every
+layer is placed on the Earth. A layer whose coordinates are the body's longitude/latitude, counted
+east (a geographic `.prj` or WKT, a GeoTIFF's own keys, an IAU code ending in `00` or `02`, or a
+projection RustGIS unprojects), is read as it is, and adding it says that the map, its scale bar and
+measurements take it for the Earth. One whose coordinates would be in the wrong place as
+longitude/latitude is refused, saying why: projected metres the reader can't convert (a GeoPackage,
+FlatGeobuf, GeoParquet or GeoJSON whose system is another body's projection, or a projection
+RustGIS doesn't read) and longitudes counted west (planetographic ones). Exporting such a layer as
+WGS 84 longitude/latitude says so; in its own system, the file gives its datum only by the
+ellipsoid's axes, and that is said too; projecting it onto another ellipsoid (the Earth's) is
+refused.
+
 ## Define Projection
 
 When a Shapefile's `.prj` is missing or incorrect, right-click its layer and choose

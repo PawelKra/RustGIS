@@ -18,6 +18,7 @@ pub mod gdal;
 pub mod geotiff;
 mod lzw;
 pub mod pam;
+pub mod planetary;
 pub mod wkt;
 pub mod zarr;
 
@@ -797,7 +798,7 @@ pub fn read_path(path: &Path) -> Result<Raster> {
                 return Err(DataError::Format("the ASCII grid is too large to open".into()));
             }
             let text = std::fs::read_to_string(path)?;
-            ascii::read_with_nodata(&text, &name, sidecar_crs(path), sidecar_nodata)?
+            ascii::read_with_nodata(&text, &name, sidecar_crs(path)?, sidecar_nodata)?
         }
         #[cfg(not(target_arch = "wasm32"))]
         _ if gdal::is_gdal_raster_name(&path.to_string_lossy()) => {
@@ -822,7 +823,7 @@ pub fn read_path(path: &Path) -> Result<Raster> {
         // The second read gives all the first did: the first goes before it, so two aren't held.
         drop(r);
         r = if ext == "asc" {
-            ascii::read_with_nodata(&std::fs::read_to_string(path)?, &name, sidecar_crs(path), nd)?
+            ascii::read_with_nodata(&std::fs::read_to_string(path)?, &name, sidecar_crs(path)?, nd)?
         } else {
             #[cfg(not(target_arch = "wasm32"))]
             let again = geotiff::read_file_with_nodata(path, &name, nd)?;
@@ -1130,8 +1131,17 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
 }
 
 /// The coordinate system in a `.prj` next to an ASCII grid, when it's one RustGIS understands.
-fn sidecar_crs(path: &Path) -> Option<Crs> {
-    wkt::crs_from_wkt(&read_prj(path)?).ok()
+/// Another body's that it doesn't is an error: read as longitude/latitude, the grid would be in
+/// the wrong place.
+fn sidecar_crs(path: &Path) -> Result<Option<Crs>> {
+    let Some(prj) = read_prj(path) else { return Ok(None) };
+    match wkt::crs_from_wkt(&prj) {
+        Ok(crs) => Ok(Some(crs)),
+        Err(e) => match wkt::planetary_datum(&prj) {
+            Some(datum) => Err(DataError::Format(format!("the .prj file: {}", planetary::refused(&format!("the datum {datum}"), &e)))),
+            None => Ok(None),
+        },
+    }
 }
 
 /// The text of the `.prj` next to a file (`None` when there's none, or it's too large to be one).
