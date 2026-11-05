@@ -62,7 +62,7 @@ fn hover_map(h: &mut egui_kittest::Harness<'_, RustGisApp>) {
 #[test]
 fn the_status_bar_reads_the_pointer_in_the_chosen_format_and_a_click_switches() {
     let mut h = harness(RustGisApp::with_sample());
-    // A view about 4 km across around Baghdad (38S MB 44140 84706, at 444141 3684706).
+    // A view about 4 km across around Baghdad (38S MB 44140 84706, at 38north 444141 3684706).
     h.state_mut().run("map.goToXY", json!({"lon": 44.4, "lat": 33.3, "scale": 10000})).unwrap();
     hover_map(&mut h);
     let at = h.state().map.pointer_lonlat.expect("the pointer is over the map");
@@ -77,7 +77,7 @@ fn the_status_bar_reads_the_pointer_in_the_chosen_format_and_a_click_switches() 
     hover_map(&mut h);
     assert_eq!(h.state().map.coord_format, CoordReadout::Utm);
     let utm = rustgis_engine::geom::format_utm(h.state().map.pointer_lonlat.unwrap()).unwrap();
-    assert!(utm.starts_with("38S 44"), "{utm}");
+    assert!(utm.starts_with("38north 44"), "{utm}");
     h.get_by_label(&utm).click();
     hover_map(&mut h);
     assert_eq!(h.state().map.coord_format, CoordReadout::Mgrs);

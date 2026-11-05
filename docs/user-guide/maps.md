@@ -144,9 +144,12 @@ choice is remembered and also sets the right-click menu's first row. The same pl
 | --- | --- | --- |
 | Decimal degrees | `15.3000° E  49.8500° N` | four decimal places |
 | DMS | `15°18′00.0″ E  49°51′00.0″ N` | degrees, minutes and seconds |
-| UTM | `33U 521567 5521996` | zone and latitude band, easting and northing in metres, rounded to the metre |
+| UTM | `33north 521567 5521996` | zone and hemisphere (`33south …` south of the equator), easting and northing in metres, rounded to the metre |
 | MGRS | `33U WR 21566 21996` | zone (two digits: `04Q FJ …`) and band, the 100 km square, easting and northing within it, truncated to the metre |
 
+UTM states the hemisphere, as GeographicLib's `GeoConvert -u -l` writes it, not the latitude band:
+in plain UTM a letter after the zone is commonly read as the hemisphere, so `38S` (band S, 32° N
+to 40° N) would be taken for the southern hemisphere, 10,000 km away. Latitude bands are MGRS's.
 UTM and MGRS are on WGS 84, with the zone exceptions for southern Norway (32V) and Svalbard (31X,
 33X, 35X and 37X), and cover 80° S to 84° N. Nearer the poles they would need the Universal Polar
 Stereographic grid, which RustGIS doesn't have: there the readout shows *No UTM here* (or
@@ -163,9 +166,10 @@ The [search box](#navigating) takes the same grid references, in any case:
   easting and half for the northing, and the search goes to the middle of the square they name.
   A 100 km square is also looked for in the attribute tables, since Sentinel-2 tiles are named
   after them.
-- **UTM** as the readout writes it, zone and latitude band: `33U 521567 5521996`; or the zone
-  and hemisphere spelt out: `33 north 521567 5521996`, `21 south 371625 6170423`. `33N` reads
-  as the northern hemisphere when the northing isn't in band N, since both readings agree.
+- **UTM** as the readout writes it, zone and hemisphere: `33north 521567 5521996`,
+  `21south 371625 6170423` (also with a space, `33 north …`); or zone and latitude band:
+  `33U 521567 5521996`. `33N` reads as the northern hemisphere when the northing isn't in band
+  N, since both readings agree.
   `S` after the zone is always band S (32° N to 40° N), as in `11S 384629 3768405` (Los
   Angeles); with a northing outside band S it could mean the southern hemisphere, so it finds
   nothing: write `south` instead.

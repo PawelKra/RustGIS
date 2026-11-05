@@ -18,7 +18,7 @@ pub enum CoordReadout {
     Decimal,
     /// `12°20′44.2″ E  45°40′44.0″ N`
     Dms,
-    /// `33U 412345 5523456`: zone and latitude band, easting and northing in metres.
+    /// `33north 412345 5523456`: zone and hemisphere, easting and northing in metres.
     Utm,
     /// `33U VP 12345 23456`: zone and band, the 100 km square, easting and northing to 1 m.
     Mgrs,
@@ -138,7 +138,8 @@ mod tests {
         let p = Coord::new(44.4, 33.3);
         assert_eq!(CoordReadout::Decimal.readout(Some(p), true), "44.4000° E  33.3000° N");
         assert_eq!(CoordReadout::Dms.readout(Some(p), true), "44°24′00.0″ E  33°18′00.0″ N");
-        assert_eq!(CoordReadout::Utm.readout(Some(p), true), "38S 444141 3684706");
+        assert_eq!(CoordReadout::Utm.readout(Some(p), true), "38north 444141 3684706");
+        assert_eq!(CoordReadout::Utm.readout(Some(Coord::new(-58.4, -34.6)), true), "21south 371625 6170423");
         assert_eq!(CoordReadout::Mgrs.readout(Some(p), true), "38S MB 44140 84706");
         for f in CoordReadout::ALL {
             for earth in [true, false] {

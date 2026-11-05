@@ -241,12 +241,22 @@ impl Utm {
     pub fn north(&self) -> bool {
         self.band >= 'N'
     }
+
+    /// The hemisphere spelt out, as the readout writes it after the zone: `north` or `south`.
+    pub fn hemisphere(&self) -> &'static str {
+        if self.north() { "north" } else { "south" }
+    }
 }
 
 impl fmt::Display for Utm {
-    /// `33U 412345 5523456`: zone and band, then easting and northing rounded to the metre.
+    /// `33north 412345 5523456`, `21south 371625 6170423`: the zone and the hemisphere spelt out
+    /// (GeographicLib's long form, as `GeoConvert -u -l` writes it), then the easting and northing
+    /// rounded to the metre. Latitude bands belong to MGRS: in plain UTM the letter after the zone
+    /// is commonly read as the hemisphere, so `38S` (band S, 32° N to 40° N) would be taken for
+    /// the southern hemisphere, and a single `S` can't be told apart from band S when the text is
+    /// read back. The spelt-out hemisphere reads one way only and parses back with [`parse_utm`].
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{} {:.0} {:.0}", self.zone, self.band, self.easting.round(), self.northing.round())
+        write!(f, "{}{} {:.0} {:.0}", self.zone, self.hemisphere(), self.easting.round(), self.northing.round())
     }
 }
 
@@ -291,7 +301,8 @@ pub fn from_utm(zone: u8, north: bool, easting: f64, northing: f64) -> Option<Co
     Some(Coord::new(wrap(central_meridian(zone) + dlon), lat))
 }
 
-/// A place as `33U 412345 5523456`; `None` outside 80° S to 84° N.
+/// A place as `33north 412345 5523456` (zone and hemisphere; see [`Utm`]'s `Display`); `None`
+/// outside 80° S to 84° N.
 pub fn format_utm(c: Coord) -> Option<String> {
     to_utm(c).map(|u| u.to_string())
 }
@@ -591,13 +602,13 @@ pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
     Ok(m)
 }
 
-/// Reads a UTM position: a zone, then a latitude band letter or the hemisphere spelt out, then
+/// Reads a UTM position: a zone, then the hemisphere spelt out or a latitude band letter, then
 /// the easting and northing in metres (decimals allowed; spaces or commas between). Accepted:
 ///
-/// - `33U 412345 5523456` or `33 U 412345 5523456`: zone and latitude band, as the readout
-///   writes it. The northing must fall in the band.
-/// - `33 north 412345 5523456`, `33 south 412345 4476544` (also `33north`, any case): zone and
-///   hemisphere.
+/// - `33north 412345 5523456`, `33south 412345 4476544` (also `33 north`, any case): zone and
+///   hemisphere, as the readout writes it.
+/// - `33U 412345 5523456` or `33 U 412345 5523456`: zone and latitude band. The northing must
+///   fall in the band.
 /// - `33N 412345 5523456`: band N lies wholly in the northern hemisphere, so a northing outside
 ///   band N is read as the northern hemisphere (both readings give the same place).
 ///
@@ -629,14 +640,28 @@ pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
     if !(0.0..1_000_000.0).contains(&easting) || !(0.0..=FALSE_NORTHING_SOUTH).contains(&northing) {
         return Err(GridError::OutsideZone);
     }
-    // A place from a hemisphere, checked against the band of its own latitude.
+    // A place from a hemisphere, checked against the band of its own latitude, or of a latitude
+    // within the metre it was rounded to: a readout just south of 72° N in zone 32, 34 or 36 can
+    // read back a hair north of it, where Svalbard's zones take over, and so can one by the edges
+    // of southern Norway's 32V. The band form allows the same.
     let by_hemisphere = |north: bool| -> Result<Coord, GridError> {
         let p = from_utm(zone, north, easting, northing).ok_or(GridError::OutsideZone)?;
         if p.y >= UTM_MAX_LAT + ROUNDING_DEG || p.y < UTM_MIN_LAT - ROUNDING_DEG {
             return Err(GridError::Polar);
         }
-        let band = latitude_band(p.y.clamp(UTM_MIN_LAT, UTM_MAX_LAT - 1e-9)).ok_or(GridError::Polar)?;
-        check_place(p, (p.y, p.y), zone, band, 1.0).map(|()| p)
+        let band_at = |lat: f64| latitude_band(lat.clamp(UTM_MIN_LAT, UTM_MAX_LAT - 1e-9)).ok_or(GridError::Polar);
+        let own = band_at(p.y)?;
+        let first = check_place(p, (p.y, p.y), zone, own, 1.0);
+        if first.is_ok() {
+            return Ok(p);
+        }
+        for lat in [p.y - ROUNDING_DEG, p.y + ROUNDING_DEG] {
+            let band = band_at(lat)?;
+            if band != own && check_place(p, (p.y, p.y), zone, band, 1.0).is_ok() {
+                return Ok(p);
+            }
+        }
+        first.map(|()| p)
     };
     match word.as_str() {
         "NORTH" => by_hemisphere(true),
@@ -688,7 +713,7 @@ mod tests {
         assert!((u.easting - 444_140.54).abs() < 0.005, "{}", u.easting);
         assert!((u.northing - 3_684_706.36).abs() < 0.005, "{}", u.northing);
         assert_eq!(to_mgrs(c(44.4, 33.3), 5).unwrap().compact(), "38SMB4414084706");
-        assert_eq!(format_utm(c(44.4, 33.3)).unwrap(), "38S 444141 3684706");
+        assert_eq!(format_utm(c(44.4, 33.3)).unwrap(), "38north 444141 3684706");
         assert_eq!(format_mgrs(c(44.4, 33.3)).unwrap(), "38S MB 44140 84706");
     }
 
@@ -875,7 +900,7 @@ mod tests {
         // More than five digits is clamped to five.
         assert_eq!(to_mgrs(p, 9).unwrap().digits, 5);
         // The UTM readout rounds instead.
-        assert_eq!(from_utm(38, true, 444_140.6, 3_684_706.4).map(format_utm), Some(Some("38S 444141 3684706".into())));
+        assert_eq!(from_utm(38, true, 444_140.6, 3_684_706.4).map(format_utm), Some(Some("38north 444141 3684706".into())));
         assert!(to_mgrs(c(0.0, 84.0), 5).is_none());
         assert!(format_mgrs(c(0.0, -85.0)).is_none());
     }
@@ -997,20 +1022,129 @@ mod tests {
         ] {
             assert!(near(parse_utm(&t).unwrap_or_else(|e| panic!("{t}: {e}"))), "{t}");
         }
-        // The southern hemisphere, by band or spelt out.
+        // The southern hemisphere, as the readout writes it, by band or spelt out with a space.
         let q = c(-58.4, -34.6);
         let s = to_utm(q).unwrap();
         assert_eq!((s.zone, s.band), (21, 'H'));
-        for t in [s.to_string(), format!("21 south {:.0} {:.0}", s.easting, s.northing)] {
+        assert!(s.to_string().starts_with("21south "), "{s}");
+        for t in [
+            s.to_string(),
+            format!("21H {:.0} {:.0}", s.easting, s.northing),
+            format!("21 south {:.0} {:.0}", s.easting, s.northing),
+            format!("21SOUTH {:.0} {:.0}", s.easting, s.northing),
+        ] {
             let got = parse_utm(&t).unwrap();
             assert!((got.x - q.x).abs() < 1e-5 && (got.y - q.y).abs() < 1e-5, "{t} {got:?}");
         }
-        // Band S (32°–40° N), as the readout writes Los Angeles.
+        // Los Angeles is in band S (32°–40° N): the readout writes the hemisphere, and band S
+        // typed by hand still reads as the band.
         let la = c(-118.25, 34.05);
         let l = to_utm(la).unwrap();
         assert_eq!((l.zone, l.band), (11, 'S'));
-        let got = parse_utm(&l.to_string()).unwrap();
-        assert!((got.x - la.x).abs() < 1e-5 && (got.y - la.y).abs() < 1e-5);
+        assert!(l.to_string().starts_with("11north "), "{l}");
+        let (e, n) = (l.easting.round(), l.northing.round());
+        for t in [l.to_string(), format!("11S {e} {n}"), format!("11s {e} {n}")] {
+            let got = parse_utm(&t).unwrap_or_else(|e| panic!("{t}: {e}"));
+            assert!((got.x - la.x).abs() < 1e-5 && (got.y - la.y).abs() < 1e-5, "{t}");
+        }
+    }
+
+    /// The readout states the hemisphere, never a band letter, and reads back through
+    /// [`parse_utm`] to within the half metre it is rounded to, in its own zone and hemisphere.
+    fn assert_readout_round_trips(p: Coord) {
+        let u = to_utm(p).unwrap_or_else(|| panic!("{p:?} is in UTM"));
+        let text = format_utm(p).unwrap();
+        let hemi = if p.y >= 0.0 { "north" } else { "south" };
+        assert!(text.starts_with(&format!("{}{hemi} ", u.zone)), "{text} at {p:?}");
+        assert_eq!(text, u.to_string());
+        let back = parse_utm(&text).unwrap_or_else(|e| panic!("{text} at {p:?}: {e}"));
+        let (e, n) = to_utm_in_zone(back, u.zone, p.y >= 0.0).unwrap();
+        assert!((e - u.easting).abs() <= 0.5 + 1e-6 && (n - u.northing).abs() <= 0.5 + 1e-6, "{text} at {p:?}: {e} {n}");
+        // As typed in another case, too.
+        assert_eq!(parse_utm(&text.to_uppercase()), Ok(back), "{text}");
+    }
+
+    #[test]
+    fn the_readout_writes_the_hemisphere_and_reads_back() {
+        // Baghdad in band S, Buenos Aires in band H, Sydney, Cape Town, Ushuaia, Reykjavik.
+        for p in [c(44.4, 33.3), c(-58.4, -34.6), c(151.2, -33.87), c(18.42, -33.92), c(-68.3, -54.8), c(-21.9, 64.15)] {
+            assert_readout_round_trips(p);
+        }
+        assert_eq!(format_utm(c(151.2, -33.87)).map(|t| t[..8].to_string()), Some("56south ".into()));
+        // Either side of the equator, including a place south of it whose northing rounds to the
+        // full 10,000 km false northing.
+        for lat in [-0.3, -1e-4, -1e-7, -1e-12, 0.0, 1e-12, 1e-7, 1e-4, 0.3] {
+            for lon in [-177.0, 0.0, 3.0, 5.99, 44.4, 179.9] {
+                assert_readout_round_trips(c(lon, lat));
+            }
+        }
+        let rounds_up = (1..400)
+            .map(|i| c(15.0, -1e-17 * f64::from(i) * 5.0))
+            .find(|p| to_utm(*p).is_some_and(|u| u.band == 'M' && u.northing.round() == FALSE_NORTHING_SOUTH))
+            .unwrap();
+        assert!(format_utm(rounds_up).unwrap().starts_with("33south 500000 10000000"), "{:?}", format_utm(rounds_up));
+        assert_readout_round_trips(rounds_up);
+        // Band X up to 84° N and band C down to 80° S, and the band edges between.
+        let metres = |m: f64| m / M_PER_DEG;
+        for lat in [UTM_MAX_LAT - metres(0.6), 83.9, 72.0, 72.0 - 1e-7, UTM_MIN_LAT, UTM_MIN_LAT + metres(0.6), -72.0, -72.0 - 1e-7] {
+            for lon in [-179.0, 4.0, 10.0, 25.0, 40.0, 100.0] {
+                assert_readout_round_trips(c(lon, lat));
+            }
+        }
+        // Zones 1–9 keep one digit, in both hemispheres.
+        for zone in 1u8..=9 {
+            for lat in [-45.0, -1.0, 1.0, 45.0] {
+                let p = c(central_meridian(zone) + 2.9, lat);
+                assert!(format_utm(p).unwrap().starts_with(&format!("{zone}{}", if lat > 0.0 { "north " } else { "south " })));
+                assert_readout_round_trips(p);
+            }
+        }
+        // Southern Norway's 32V and Svalbard's wide zones, also within a rounded metre of the
+        // parallels where the zones change (56°, 64° and 72° N), where the place read back can lie
+        // in the neighbouring band.
+        for p in [c(3.5, 60.0), c(11.9, 63.9), c(2.9, 60.0), c(8.9, 78.0), c(9.1, 78.0), c(41.9, 80.0)] {
+            assert_readout_round_trips(p);
+        }
+        for edge in [56.0, 64.0, 72.0] {
+            for off in [-1e-5, -1e-6, -1e-7, 0.0, 1e-7, 1e-6, 1e-5] {
+                for i in 0..=168 {
+                    assert_readout_round_trips(c(f64::from(i) * 0.25, edge + off));
+                }
+            }
+        }
+        let mut r = Lcg(31);
+        for _ in 0..20_000 {
+            let lat = UTM_MIN_LAT + r.next() * (UTM_MAX_LAT - UTM_MIN_LAT - 1e-6);
+            assert_readout_round_trips(c(-180.0 + r.next() * 360.0, lat));
+        }
+        // No band letter anywhere: a letter after the zone would read as a band or a hemisphere.
+        for p in [c(44.4, 33.3), c(-58.4, -34.6)] {
+            let text = format_utm(p).unwrap();
+            let zone_end = text.find(|ch: char| !ch.is_ascii_digit()).unwrap();
+            assert!(text[zone_end..].starts_with("north ") || text[zone_end..].starts_with("south "), "{text}");
+        }
+        // Where UTM has no zone the readout still writes nothing, and the hemisphere form of a
+        // polar position is refused.
+        for p in [c(0.0, 84.0), c(0.0, -80.000_1), c(0.0, 90.0)] {
+            assert!(format_utm(p).is_none(), "{p:?}");
+        }
+        let (e, n) = to_utm_in_zone(c(15.0, 84.05), 33, true).unwrap();
+        assert_eq!(parse_utm(&format!("33north {} {}", e.round(), n.round())), Err(GridError::Polar));
+        let (e, n) = to_utm_in_zone(c(15.0, -80.05), 33, false).unwrap();
+        assert_eq!(parse_utm(&format!("33south {} {}", e.round(), n.round())), Err(GridError::Polar));
+    }
+
+    /// The single letter `S` after a zone is still band S when typed: the readout's spelt-out
+    /// hemisphere doesn't loosen the refusal of a northing outside band S.
+    #[test]
+    fn a_typed_s_stays_band_s() {
+        let s = to_utm(c(-58.4, -34.6)).unwrap();
+        let (e, n) = (s.easting.round(), s.northing.round());
+        assert_eq!(parse_utm(&format!("21S {e} {n}")), Err(GridError::Ambiguous));
+        assert_eq!(parse_utm(&format!("21s {e} {n}")), Err(GridError::Ambiguous));
+        assert!(parse_utm(&format!("21south {e} {n}")).is_ok_and(|q| (q.y + 34.6).abs() < 1e-5));
+        // An abbreviation of a hemisphere other than the single letter isn't read.
+        assert_eq!(parse_utm(&format!("21sou {e} {n}")), Err(GridError::Syntax));
     }
 
     #[test]
@@ -1082,8 +1216,13 @@ mod tests {
         }
         assert_eq!(to_mgrs(c(central_meridian(9), 10.0), 0).unwrap().to_string(), "09P WM");
         assert_eq!(to_mgrs(c(central_meridian(10), 10.0), 0).unwrap().to_string(), "10P ES");
-        // UTM keeps the zone as it is numbered (EPSG:32604), like GeographicLib's `4n`.
-        assert!(format_utm(c(central_meridian(4), 20.0)).unwrap().starts_with("4Q "));
+        // UTM keeps the zone as it is numbered (EPSG:32604), like GeographicLib's `4n` and
+        // `4north`, and reads back.
+        let text = format_utm(c(central_meridian(4), 20.0)).unwrap();
+        assert!(text.starts_with("4north "), "{text}");
+        assert!(parse_utm(&text).is_ok_and(|q| (q.x - central_meridian(4)).abs() < 1e-5 && (q.y - 20.0).abs() < 1e-5), "{text}");
+        let text = format_utm(c(central_meridian(9), -20.0)).unwrap();
+        assert!(text.starts_with("9south "), "{text}");
     }
 
     /// Just south of the equator the northing rounds to the full false northing (10,000 km, which

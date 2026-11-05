@@ -593,6 +593,8 @@ mod tests {
         // GeographicLib's GeoConvert example, 33.3° N 44.4° E: 38n 444140.54 3684706.36,
         // 38SMB4414084706.
         for q in [
+            "38north 444141 3684706",
+            "38NORTH 444141 3684706",
             "38S 444141 3684706",
             "38s 444140.54, 3684706.36",
             "38 north 444141 3684706",
@@ -604,6 +606,11 @@ mod tests {
             let r = search(&s, q, 50);
             assert!(near(&r, 44.4, 33.3), "{q}: {r:?}");
         }
+        // The UTM readout of a southern place, zone and hemisphere, is found where it was read.
+        let ba = Coord::new(-58.4, -34.6);
+        let text = rustgis_geom::format_utm(ba).unwrap();
+        assert!(text.starts_with("21south "), "{text}");
+        assert!(near(&search(&s, &text, 50), ba.x, ba.y), "{text}");
         // A 100 km square is found at its centre.
         let r = search(&s, "38SMB", 50);
         let u = rustgis_geom::to_utm(match r.hits.first() {

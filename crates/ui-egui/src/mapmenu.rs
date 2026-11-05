@@ -275,8 +275,17 @@ mod tests {
         let p = Coord::new(44.4, 33.3);
         assert_eq!(coordinate_row(p, CoordReadout::Decimal, true), ("33.300000, 44.400000".into(), false));
         assert_eq!(coordinate_row(p, CoordReadout::Dms, true), ("44°24′00.0″ E  33°18′00.0″ N".into(), false));
-        assert_eq!(coordinate_row(p, CoordReadout::Utm, true), ("38S 444141 3684706".into(), false));
+        assert_eq!(coordinate_row(p, CoordReadout::Utm, true), ("38north 444141 3684706".into(), false));
         assert_eq!(coordinate_row(p, CoordReadout::Mgrs, true), ("38S MB 44140 84706".into(), false));
+        // What is copied as UTM or MGRS is found again by the search box, in both hemispheres.
+        for q in [p, Coord::new(-58.4, -34.6), Coord::new(151.2, -33.87), Coord::new(3.0, -1e-7), Coord::new(-21.9, 64.15)] {
+            for f in [CoordReadout::Utm, CoordReadout::Mgrs] {
+                let (text, fell_back) = coordinate_row(q, f, true);
+                assert!(!fell_back, "{text}");
+                let at = rustgis_engine::cmd::search::read_grid_reference(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+                assert!((at.x - q.x).abs() < 1e-4 && (at.y - q.y).abs() < 1e-4, "{text} {at:?}");
+            }
+        }
         // Where UTM has no zone, the row falls back to latitude and longitude (and says so).
         let pole = Coord::new(10.0, 86.0);
         for f in [CoordReadout::Utm, CoordReadout::Mgrs] {
