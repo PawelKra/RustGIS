@@ -15,8 +15,16 @@
 //! inverse starts from Snyder's footpoint latitude (the rectifying latitude μ of eq. 7-19 and the
 //! series of eqs. 3-24 and 3-26) and is finished by Newton's method with dM/dφ = ρ, the radius of
 //! curvature in the meridian (eq. 4-18), so that both directions agree to well under a millimetre.
+//! The series holds for ellipsoids up to [`MAX_ES`]; flatter ones (the giant planets') are refused.
 
 use crate::Coord;
+
+/// The largest eccentricity squared computed: e² = 0.02, a flattening of about 1/100. Up to it the
+/// terms the meridian-distance series leaves out stay under 2·10⁻¹⁰ of the semi-major axis (1.2 mm
+/// on a body the Earth's size; Mars, at e² = 0.0116, is under 10⁻¹¹). They grow as e¹⁰: 3.4 m on
+/// the Earth's axis at a flattening of 1/20, 100 m at 1/10 (Saturn's), so flatter ellipsoids are
+/// refused rather than approximated.
+pub const MAX_ES: f64 = 0.02;
 
 /// An equidistant cylindrical projection on an ellipsoid of semi-major axis `a` and eccentricity
 /// squared `es` (0 for a sphere), with its latitude of true scale, origin and false origin.
@@ -45,11 +53,12 @@ pub struct EquidistantCylindrical {
 
 impl EquidistantCylindrical {
     /// A projection on an ellipsoid of semi-major axis `a` (metres) and eccentricity squared `es`
-    /// (0 for a sphere). `None` for an impossible ellipsoid, a parameter that isn't finite, a
-    /// latitude of true scale at a pole (no scale along it) or an origin past one.
+    /// (0 for a sphere). `None` for an impossible ellipsoid or one flatter than [`MAX_ES`], a
+    /// parameter that isn't finite, a latitude of true scale at a pole (no scale along it) or an
+    /// origin past one.
     pub fn new(a: f64, es: f64, lat_ts: f64, lat0: f64, lon0: f64, x0: f64, y0: f64) -> Option<EquidistantCylindrical> {
         let finite = [a, es, lat_ts, lat0, lon0, x0, y0].iter().all(|v| v.is_finite());
-        if !finite || a <= 0.0 || !(0.0..1.0).contains(&es) || lat_ts.abs() >= 90.0 || lat0.abs() > 90.0 {
+        if !finite || a <= 0.0 || !(0.0..=MAX_ES).contains(&es) || lat_ts.abs() >= 90.0 || lat0.abs() > 90.0 {
             return None;
         }
         let s1 = lat_ts.to_radians().sin();
@@ -111,7 +120,7 @@ fn meridian_distance(a: f64, es: f64, phi: f64) -> f64 {
 /// The latitude (radians) whose meridian distance is `distance` metres: Snyder's footpoint
 /// latitude (eqs. 7-19, 3-24 and 3-26), refined by Newton's method on eq. 3-21 with its
 /// derivative, the meridian's radius of curvature ρ = a(1 − e²) / (1 − e²·sin²φ)^{3/2} (eq. 4-18).
-/// `None` when it doesn't settle.
+/// `None` when it doesn't settle within ten steps.
 fn latitude_of(a: f64, es: f64, distance: f64) -> Option<f64> {
     let (e2, e4, e6) = (es, es * es, es * es * es);
     // (A first guess: Newton's method below settles it on eq. 3-21 as computed here.)
@@ -134,10 +143,10 @@ fn latitude_of(a: f64, es: f64, distance: f64) -> Option<f64> {
             return None;
         }
         if step.abs() < 1e-14 {
-            break;
+            return Some(phi);
         }
     }
-    Some(phi)
+    None
 }
 
 #[cfg(test)]
@@ -189,6 +198,12 @@ mod tests {
                 assert!((series - exact).abs() < 1e-4, "{a} {d}°: {series} vs {exact}");
             }
         }
+        // At the flattest ellipsoid computed, within 2·10⁻¹⁰ of the semi-major axis (MAX_ES).
+        for d in (0..=90).step_by(5) {
+            let phi = f64::from(d).to_radians();
+            let (series, exact) = (meridian_distance(A, MAX_ES, phi), integrated(A, MAX_ES, phi));
+            assert!((series - exact).abs() < 2e-10 * A, "{d}°: {series} vs {exact}");
+        }
         // WGS 84's 45° parallel is 4 984 944.378 m from the equator along the meridian.
         assert!((meridian_distance(A, es_of(298.257_223_563), 45f64.to_radians()) - 4_984_944.378).abs() < 0.001);
     }
@@ -230,6 +245,21 @@ mod tests {
         assert!((far.x - (170.0 + 2f64.to_degrees() - 360.0)).abs() < 1e-9, "{far:?}");
     }
 
+    /// A latitude Newton's method doesn't settle on within its steps is no latitude, not its
+    /// last guess: on an ellipsoid as flat as e² = 0.96 it overshoots.
+    #[test]
+    fn unsettled_latitudes_are_none() {
+        let es = 0.96;
+        let pole = meridian_distance(A, es, std::f64::consts::FRAC_PI_2);
+        assert!((1..100).any(|k| latitude_of(A, es, pole * f64::from(k) / 100.0).is_none()));
+        // Where it settles, it is the latitude.
+        for k in 0..=100 {
+            let distance = meridian_distance(A, MAX_ES, std::f64::consts::FRAC_PI_2) * f64::from(k) / 100.0;
+            let phi = latitude_of(A, MAX_ES, distance).unwrap();
+            assert!((meridian_distance(A, MAX_ES, phi) - distance).abs() < 1e-6, "{k}");
+        }
+    }
+
     #[test]
     fn impossible_parameters_are_refused() {
         let es = es_of(298.257_223_563);
@@ -244,12 +274,16 @@ mod tests {
             (f64::NAN, es, 0.0, 0.0),
             (A, es, f64::INFINITY, 0.0),
             (f64::MAX, es, 0.0, 0.0),
+            // Flatter than the series holds for: Uranus (e² 0.045), Jupiter (0.126), Saturn (0.186).
+            (25_559_000.0, 0.045, 0.0, 0.0),
+            (71_492_000.0, 0.126, 0.0, 0.0),
+            (A, MAX_ES + 1e-9, 0.0, 0.0),
         ] {
             assert!(EquidistantCylindrical::new(a, es, ts, lat0, 0.0, 0.0, 0.0).is_none(), "{a} {es} {ts} {lat0}");
         }
         assert!(EquidistantCylindrical::new(A, es, 0.0, 0.0, f64::NAN, 0.0, 0.0).is_none());
         // A huge but finite false origin projects nothing that isn't finite.
-        let p = EquidistantCylindrical::new(A, 0.99, 0.0, 0.0, 0.0, 1e308, 1e308).unwrap();
+        let p = EquidistantCylindrical::new(A, MAX_ES, 0.0, 0.0, 0.0, 1e308, 1e308).unwrap();
         assert!(p.forward(Coord::new(180.0, 90.0)).is_none_or(|m| m.is_finite()));
         let _ = p.inverse(Coord::new(-1e308, -1e308));
     }

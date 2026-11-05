@@ -90,7 +90,9 @@ parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator (vari
 files and in GeoTIFF keys. Esri's orthographic is a spherical projection: on an ellipsoid it is
 refused, with a notice, rather than computed as EPSG's ellipsoidal one. The equidistant
 cylindrical projection (EPSG:4087, World Equidistant Cylindrical) is computed on its ellipsoid,
-as EPSG defines it, not on a sphere.
+as EPSG defines it, not on a sphere, both for data and for a map drawn in it (as is the
+Equirectangular preset). An ellipsoid flatter than about 1/100, such as Jupiter's or Saturn's, is
+refused in it rather than approximated.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
 the fallback. Keep the sidecar files together.

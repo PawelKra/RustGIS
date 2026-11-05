@@ -761,6 +761,11 @@ fn custom(p: &Node, method: &str) -> Result<Crs, String> {
         "EQUIDISTANT_CYLINDRICAL_SPHERICAL" if !sphere => {
             return Err("the Equidistant Cylindrical (Spherical) projection on an ellipsoid isn't supported".into());
         }
+        // A latitude of origin (PROJ's `+lat_0`, which GDAL writes as `latitude_of_origin`) moves
+        // the northings' origin.
+        "EQUIRECTANGULAR" | "EQUIDISTANT_CYLINDRICAL" | "PLATE_CARREE" | "EQUIDISTANT_CYLINDRICAL_SPHERICAL" if lat0 != 0.0 => {
+            format!("+proj=eqc +lat_ts={} +lat_0={lat0} {at}", lat1.unwrap_or(0.0))
+        }
         "EQUIRECTANGULAR" | "EQUIDISTANT_CYLINDRICAL" | "PLATE_CARREE" | "EQUIDISTANT_CYLINDRICAL_SPHERICAL" => {
             format!("+proj=eqc +lat_ts={} {at}", lat1.unwrap_or(0.0))
         }
@@ -1225,6 +1230,9 @@ pub fn to_wkt(crs: Crs) -> Option<String> {
         }
         "eqc" => {
             ps = vec![("standard_parallel_1", lat_ts.unwrap_or(0.0)), ("central_meridian", lon0)];
+            if lat0 != 0.0 {
+                ps.insert(0, ("latitude_of_origin", lat0));
+            }
             "Equirectangular"
         }
         "cea" => {
@@ -1404,7 +1412,8 @@ mod tests {
         // ellipsoid rather than computed as the ellipsoidal method 1028.
         let eqc_spherical = r#"METHOD["Equidistant Cylindrical (Spherical)",ID["EPSG",1029]]"#;
         let p = proj4(&wkt2(eqc_spherical, origin, "3396190,0")).unwrap();
-        assert!(p.starts_with("+proj=eqc +lat_ts=0 +lon_0=5"), "{p}");
+        // Its latitude of natural origin (PROJ's `+lat_0`) is kept.
+        assert!(p.starts_with("+proj=eqc +lat_ts=0 +lat_0=55 +lon_0=5"), "{p}");
         let e = proj4(&wkt2(eqc_spherical, origin, "6378137,298.257223563")).unwrap_err();
         assert!(e.contains("Equidistant Cylindrical (Spherical) projection on an ellipsoid isn't supported"), "{e}");
         let e = proj4(&wkt2(r#"METHOD["Orthographic (Spherical)"]"#, origin, "6378137,298.257223563")).unwrap_err();
@@ -1437,8 +1446,8 @@ mod tests {
         assert!((m.x - x).abs() < 0.001 && (m.y - y).abs() < 0.001, "{m:?} {x} {y}");
     }
 
-    /// Sinusoidal, Robinson and orthographic systems are written back to WKT and read again as
-    /// the same.
+    /// Sinusoidal, Robinson, orthographic and equidistant cylindrical systems are written back to
+    /// WKT and read again as the same.
     #[test]
     fn new_methods_are_written_back() {
         for (def, lonlat) in [
@@ -1446,6 +1455,9 @@ mod tests {
             ("+proj=robin +lon_0=150 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs", (170.0, 40.0)),
             ("+proj=ortho +lat_0=55 +lon_0=5 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs", (2.13, 53.81)),
             ("+proj=ortho +lat_0=0 +lon_0=0 +x_0=0 +y_0=0 +a=3396190 +b=3396190 +units=m +no_defs", (30.0, 20.0)),
+            // An equidistant cylindrical system's latitude of origin, on an ellipsoid and a sphere.
+            ("+proj=eqc +lat_ts=30 +lat_0=10 +lon_0=10 +x_0=1000 +y_0=2000 +datum=WGS84 +units=m +no_defs", (12.0, 40.0)),
+            ("+proj=eqc +lat_ts=0 +lat_0=-20 +lon_0=0 +x_0=0 +y_0=0 +R=3396190 +units=m +no_defs", (30.0, 20.0)),
         ] {
             let crs = Crs::parse(def).unwrap();
             let wkt = to_wkt(crs).unwrap_or_else(|| panic!("{def}"));

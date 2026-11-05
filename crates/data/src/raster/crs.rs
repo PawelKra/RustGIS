@@ -407,13 +407,25 @@ pub(crate) fn transformer_of(def: &str) -> Result<Transformer, String> {
     if let Some(sinu) = rustgis_geom::Sinusoidal::from_proj4(def) {
         return Ok(Transformer { kind: Kind::Sinusoidal(sinu?) });
     }
-    let wgs84 = || proj4rs::Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs").map_err(|e| e.to_string());
-    if let Some(eqc) = EllipsoidalEqc::from_proj4(def) {
-        return Ok(Transformer { kind: Kind::Eqc { eqc: Box::new(eqc?), wgs84: Box::new(wgs84()?) } });
+    if let Some(eqc) = ellipsoidal_eqc(def) {
+        return eqc;
     }
     let native = proj4rs::Proj::from_proj_string(def).map_err(|e| e.to_string())?;
     let geographic = def.contains("+proj=longlat");
     Ok(Transformer { kind: Kind::Proj { native: Box::new(native), wgs84: Box::new(wgs84()?), geographic } })
+}
+
+fn wgs84() -> Result<proj4rs::Proj, String> {
+    proj4rs::Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs").map_err(|e| e.to_string())
+}
+
+/// The transformer for a PROJ definition of an equidistant cylindrical projection on an
+/// ellipsoid (EPSG:4087's), computed on it: `None` for any other definition, `eqc` on a sphere
+/// included. A map drawn in such a system uses it too (rustgis-map's `Projector`), so the map,
+/// the data read in the system and a raster drawn in its own coordinates all agree.
+pub fn ellipsoidal_eqc(def: &str) -> Option<Result<Transformer, String>> {
+    let eqc = EllipsoidalEqc::from_proj4(def)?;
+    Some(eqc.and_then(|eqc| Ok(Transformer { kind: Kind::Eqc { eqc: Box::new(eqc), wgs84: Box::new(wgs84()?) } })))
 }
 
 /// An equidistant cylindrical projection on an ellipsoid (EPSG method 1028), which proj4rs
@@ -431,22 +443,20 @@ struct EllipsoidalEqc {
 
 impl EllipsoidalEqc {
     /// The projection a PROJ definition describes when it is `+proj=eqc` on an ellipsoid: `None`
-    /// for any other projection, and for `eqc` on a sphere, which proj4rs computes exactly; an
-    /// error for one it can't compute (axes other than east and north, `+over`, a latitude of
-    /// true scale that isn't a number of degrees).
+    /// for any other projection, and for `eqc` on a sphere, which proj4rs computes exactly (with
+    /// its axes and `+over`, as before); an error for one it can't compute (axes other than east
+    /// and north, `+over`, a latitude of true scale that isn't a number of degrees, an ellipsoid
+    /// flatter than [`rustgis_geom::eqc::MAX_ES`]).
     fn from_proj4(def: &str) -> Option<Result<EllipsoidalEqc, String>> {
+        // Every parameter, however many: a datum shift or `+lat_ts` late in a long definition is
+        // still the definition's.
         let tokens: Vec<(&str, &str)> =
-            def.split_whitespace().take(64).map(|t| t.trim_start_matches('+')).map(|t| t.split_once('=').unwrap_or((t, ""))).collect();
+            def.split_whitespace().map(|t| t.trim_start_matches('+')).map(|t| t.split_once('=').unwrap_or((t, ""))).collect();
         if !tokens.iter().any(|(k, v)| *k == "proj" && *v == "eqc") {
             return None;
         }
         let built = (|| {
             let native = proj4rs::Proj::from_proj_string(def).map_err(|e| e.to_string())?;
-            if !native.is_normalized_axis() || tokens.iter().any(|(k, _)| *k == "over") {
-                return Err(
-                    "an equidistant cylindrical projection on an ellipsoid takes axes east and north only, with no +over".to_string()
-                );
-            }
             // The datum: every parameter but the projection's own.
             const PROJECTION: [&str; 13] =
                 ["proj", "lat_ts", "lat_0", "lon_0", "x_0", "y_0", "units", "to_meter", "k", "k_0", "axis", "type", "wktext"];
@@ -463,6 +473,18 @@ impl EllipsoidalEqc {
             if ((a - b) / a).abs() < 1e-12 {
                 return Ok(None);
             }
+            if !native.is_normalized_axis() || tokens.iter().any(|(k, _)| *k == "over") {
+                return Err(
+                    "an equidistant cylindrical projection on an ellipsoid takes axes east and north only, with no +over".to_string()
+                );
+            }
+            let es = 1.0 - (b / a) * (b / a);
+            if es > rustgis_geom::eqc::MAX_ES {
+                return Err(format!(
+                    "an equidistant cylindrical projection on an ellipsoid flatter than about 1/100 isn't supported (this one's is 1/{:.1})",
+                    a / (a - b)
+                ));
+            }
             let lat_ts = match tokens.iter().find(|(k, _)| *k == "lat_ts") {
                 Some((_, v)) => v.parse::<f64>().ok().filter(|v| v.is_finite()).ok_or_else(|| format!("+lat_ts={v} isn't a number"))?,
                 None => 0.0,
@@ -473,7 +495,7 @@ impl EllipsoidalEqc {
             }
             let eqc = rustgis_geom::EquidistantCylindrical::new(
                 a,
-                1.0 - (b / a) * (b / a),
+                es,
                 lat_ts,
                 native.latitude_of_origin().to_degrees(),
                 native.longitude_of_origin().to_degrees(),
@@ -695,6 +717,22 @@ mod tests {
         assert!((shifted.x - plain.x).abs() + (shifted.y - plain.y).abs() > 1e-4, "no shift: {shifted:?}");
     }
 
+    /// Every parameter of a long definition is read: a latitude of true scale and a datum shift
+    /// after 64 others place points as they do at its start.
+    #[test]
+    fn equidistant_cylindrical_reads_a_long_definition_whole() {
+        let padding = "+no_defs ".repeat(70);
+        let tail = "+lat_ts=60 +towgs84=100,-50,30";
+        let (short, long) = (format!("+proj=eqc +ellps=GRS80 {tail}"), format!("+proj=eqc +ellps=GRS80 {padding}{tail}"));
+        let lonlat = Coord::new(10.0, 45.0);
+        let at = |def: &str| Crs::parse(def).and_then(Crs::transformer).unwrap_or_else(|e| panic!("{e}")).from_lonlat(lonlat).unwrap();
+        let (a, b) = (at(&short), at(&long));
+        assert!((a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9, "{a:?} {b:?}");
+        // And that is with the scale at 60°: half the equator's easting.
+        let at_equator = at("+proj=eqc +ellps=GRS80 +towgs84=100,-50,30");
+        assert!((a.x / at_equator.x - 0.5).abs() < 0.01, "{a:?} {at_equator:?}");
+    }
+
     /// Definitions it can't compute are refused, saying why, and hostile ones never panic.
     #[test]
     fn equidistant_cylindrical_hostile_definitions() {
@@ -711,6 +749,16 @@ mod tests {
         ] {
             assert!(Crs::parse(refused).is_err(), "{refused}");
         }
+        // On a sphere, axes and +over stay proj4rs's, as before the ellipsoidal form.
+        for sphere in ["+proj=eqc +R=3396190 +over +no_defs", "+proj=eqc +R=3396190 +axis=wsu +no_defs"] {
+            let t = Crs::parse(sphere).and_then(Crs::transformer).unwrap_or_else(|e| panic!("{sphere}: {e}"));
+            assert_eq!(format!("{t:?}"), "Transformer(proj)", "{sphere}");
+        }
+        // Flatter than the meridian-distance series holds for (Jupiter's 1/15.4): refused, saying
+        // so, not approximated.
+        let e = Crs::parse("+proj=eqc +a=71492000 +b=66854000 +no_defs").unwrap_err();
+        assert!(e.contains("flatter than about 1/100") && e.contains("1/15.4"), "{e}");
+        assert!(Crs::parse("+proj=eqc +a=3396190 +b=3376200 +no_defs").is_ok(), "Mars");
         for odd in [
             "+proj=eqc +a=1e308 +rf=1.0000001",
             "+proj=eqc +a=-1 +b=5",
