@@ -98,8 +98,9 @@ pub(crate) fn picture_field(name: &str) -> bool {
 /// Whether a web address's path (not its host, query or fragment) ends as a picture file does.
 pub(crate) fn picture_path(url: &str) -> bool {
     let Some(rest) = after_scheme(url) else { return false };
+    // The query and fragment go first: a slash in them (`?next=/a.jpg`) doesn't start a path.
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
     let Some((_, path)) = rest.split_once('/') else { return false };
-    let path = path.split(['?', '#']).next().unwrap_or_default();
     PICTURE_ENDINGS
         .iter()
         .any(|end| path.len() > end.len() && path.get(path.len() - end.len()..).is_some_and(|t| t.eq_ignore_ascii_case(end)))
@@ -424,6 +425,9 @@ mod tests {
             "https://example.png/",
             "https://x.org/page?file=a.jpg",
             "https://x.org/a#b.png",
+            // A slash in the query or fragment doesn't start a path.
+            "https://x.org?next=/a.jpg",
+            "https://x.org#/a.jpg",
             "https://x.org/.png",
             "https://x.org/a.jpgx",
             "not a url.png",
@@ -445,6 +449,8 @@ mod tests {
         // A page or a credit is not a picture; nor is a picture field that holds no address.
         assert_eq!(pick(&[("image_page_url", "https://x.org/details/1"), ("image_credit", "NASA/JPL")]), None);
         assert_eq!(pick(&[("image", "photo.jpg"), ("photo", "javascript:alert(1)")]), None);
+        // A link whose query names a picture file is a link, not a picture.
+        assert_eq!(pick(&[("website", "https://assets.rustgis.app?next=/a.jpg")]), None);
         // A plain http picture field is chosen (and then refused, saying why).
         assert_eq!(pick(&[("photo", "http://x.org/p")]), Some("http://x.org/p"));
         assert_eq!(refusal("http://x.org/p"), Some(Failure::NotHttps));
