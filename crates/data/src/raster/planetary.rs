@@ -130,6 +130,27 @@ pub fn refused(system: &str, why: &str) -> String {
 /// is refused.
 pub const PROJECTED: &str = "its coordinates are projected, in metres";
 
+/// Why a geodetic system in geocentric X/Y/Z (Cartesian) coordinates is refused.
+pub const GEOCENTRIC: &str = "its coordinates are geocentric X/Y/Z, in metres";
+
+/// The name of a PROJJSON axis `unit` that isn't the degree (`"radian"`, or
+/// `{"name": "grad", "conversion_factor": 0.0157…}`), `None` for the degree. A unit given by its
+/// factor is the degree when that is π/180 radians, whatever its name.
+fn not_degrees(unit: &serde_json::Value) -> Option<String> {
+    let name = |n: &str| n.trim().chars().take(40).collect::<String>();
+    let degree = |n: &str| matches!(n.trim().to_ascii_lowercase().as_str(), "degree" | "degrees" | "deg");
+    if let Some(n) = unit.as_str() {
+        return (!degree(n)).then(|| name(n));
+    }
+    let n = unit.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+    match unit.get("conversion_factor").and_then(serde_json::Value::as_f64) {
+        // Named by its factor when the name says nothing or says the degree.
+        Some(f) => ((f - 1f64.to_radians()).abs() > 1e-12)
+            .then(|| if n.trim().is_empty() || degree(n) { format!("units of {f} radians") } else { name(n) }),
+        None => (!degree(n)).then(|| if n.trim().is_empty() { "an unnamed unit".to_string() } else { name(n) }),
+    }
+}
+
 /// Why a planetographic system given only by a code is refused.
 pub const OGRAPHIC: &str = "its planetographic longitudes may count west";
 
@@ -182,8 +203,10 @@ pub fn declared(authority: Option<&str>, code: Option<i64>, wkt: Option<&str>) -
 
 /// A GeoParquet column's `crs` (PROJJSON) when it is another body's: by its `id` (an IAU code),
 /// else by its ellipsoid's semi-major axis or radius, in metres. GeoParquet's readers convert only
-/// EPSG codes, so only planetocentric longitude/latitude is read (as it is): a projected system,
-/// or longitudes counted west or latitudes south, is refused, whatever its code says.
+/// EPSG codes, so only planetocentric longitude/latitude in degrees is read (as it is): a projected
+/// system, geocentric X/Y/Z (a geodetic system's Cartesian coordinates), longitudes counted west or
+/// latitudes south, or longitude/latitude in another unit than degrees (radians, grads), is
+/// refused, whatever its code says.
 pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
     let id = crs.get("id");
     let authority = id.and_then(|i| i.get("authority")).and_then(serde_json::Value::as_str);
@@ -197,14 +220,26 @@ pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
     };
     let kind = crs.get("type").and_then(serde_json::Value::as_str);
     let geographic = matches!(kind, Some("GeographicCRS" | "GeodeticCRS"));
-    // Longitudes counted west or latitudes counted south, which would be read mirrored.
-    let mirrored = crs.get("coordinate_system").and_then(|cs| cs.get("axis")).and_then(serde_json::Value::as_array).and_then(|axes| {
-        axes.iter().find_map(|a| match a.get("direction").and_then(serde_json::Value::as_str).map(str::to_ascii_lowercase).as_deref() {
-            Some("west") => Some("its longitudes count west"),
-            Some("south") => Some("its latitudes count south"),
-            _ => None,
-        })
+    let cs = crs.get("coordinate_system");
+    let axes = cs.and_then(|cs| cs.get("axis")).and_then(serde_json::Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let direction = |a: &serde_json::Value| a.get("direction").and_then(serde_json::Value::as_str).map(str::to_ascii_lowercase);
+    // What would put its coordinates in the wrong place read as longitude/latitude in degrees:
+    // geocentric X/Y/Z in metres, longitudes counted west or latitudes counted south (read
+    // mirrored), or longitude/latitude in another unit (an ellipsoidal height's metres are no
+    // matter).
+    let cartesian =
+        cs.and_then(|cs| cs.get("subtype")).and_then(serde_json::Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case("cartesian"));
+    let mirrored = axes.iter().find_map(|a| match direction(a).as_deref() {
+        Some("west") => Some("its longitudes count west".to_string()),
+        Some("south") => Some("its latitudes count south".to_string()),
+        _ => None,
     });
+    let unit = axes
+        .iter()
+        .filter(|a| matches!(direction(a).as_deref(), Some("north" | "south" | "east" | "west")))
+        .find_map(|a| not_degrees(a.get("unit")?))
+        .map(|u| format!("its longitude/latitude are in {u}, not degrees"));
+    let misread = if cartesian { Some(GEOCENTRIC.to_string()) } else { mirrored.or(unit) };
     if let (Some(a), Some(c)) = (authority, code)
         && let Some((_, iau)) = iau_code(a, c)
     {
@@ -214,8 +249,8 @@ pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
             IauKind::Ocentric if matches!(kind, Some("ProjectedCRS" | "DerivedProjectedCRS")) => {
                 Declared::Refused(refused(&system, PROJECTED))
             }
-            IauKind::Ocentric => match mirrored {
-                Some(why) => Declared::Refused(refused(&system, why)),
+            IauKind::Ocentric => match misread {
+                Some(why) => Declared::Refused(refused(&system, &why)),
                 None => Declared::LonLat { note: code_note(&system), crs: None },
             },
             IauKind::Ographic => Declared::Refused(refused(&system, OGRAPHIC)),
@@ -238,9 +273,9 @@ pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
     if !off_earth(metres) {
         return None;
     }
-    Some(match mirrored {
+    Some(match misread {
         _ if !geographic => Declared::Refused(refused(&system, PROJECTED)),
-        Some(why) => Declared::Refused(refused(&system, why)),
+        Some(why) => Declared::Refused(refused(&system, &why)),
         None => Declared::LonLat { note: ellipsoid_note(&system), crs: None },
     })
 }
@@ -388,6 +423,37 @@ mod tests {
             r#"{"type":"ProjectedCRS","name":"eqc","base_crs":{"name":"Mars","datum":{"name":"Mars","ellipsoid":{"name":"Mars","semi_major_axis":3396190,"inverse_flattening":169.8944}}},"conversion":{"name":"x"}}"#,
         );
         assert!(refused(projjson(&projected)));
+        // Geocentric X/Y/Z, and longitude/latitude in another unit than degrees, by code or by
+        // ellipsoid; degrees by name or factor, and a height in metres, are read.
+        let axes = |kind: &str, subtype: &str, unit: &str, id: &str| {
+            json(&format!(
+                r#"{{"type":"{kind}","name":"m","datum":{{"name":"Mars","ellipsoid":{{"name":"Mars","radius":3396190}}}},"coordinate_system":{{"subtype":"{subtype}","axis":[{{"name":"lat","direction":"north","unit":{unit}}},{{"name":"lon","direction":"east","unit":{unit}}},{{"name":"h","direction":"up","unit":"metre"}}]}}{id}}}"#
+            ))
+        };
+        let why = |d: Option<Declared>| match d {
+            Some(Declared::Refused(e)) => e,
+            other => format!("{other:?}"),
+        };
+        for id in ["", r#","id":{"authority":"IAU_2015","code":49900}"#] {
+            assert!(why(projjson(&axes("GeodeticCRS", "Cartesian", r#""metre""#, id))).contains(GEOCENTRIC), "{id}");
+            assert!(why(projjson(&axes("GeodeticCRS", "cartesian", r#""degree""#, id))).contains(GEOCENTRIC), "{id}");
+            assert!(why(projjson(&axes("GeographicCRS", "ellipsoidal", r#""radian""#, id))).contains("in radian, not degrees"), "{id}");
+            let grad = r#"{"name":"grad","conversion_factor":0.015707963267949}"#;
+            assert!(why(projjson(&axes("GeographicCRS", "ellipsoidal", grad, id))).contains("in grad, not degrees"), "{id}");
+            let unnamed = r#"{"conversion_factor":1}"#;
+            assert!(why(projjson(&axes("GeographicCRS", "ellipsoidal", unnamed, id))).contains("units of 1 radians"), "{id}");
+            // A unit named degree but sized otherwise is what its factor says.
+            let liar = r#"{"name":"degree","conversion_factor":1}"#;
+            assert!(why(projjson(&axes("GeographicCRS", "ellipsoidal", liar, id))).contains("in units of 1 radians, not degrees"), "{id}");
+            for unit in [r#""degree""#, r#""Degrees""#, r#"{"name":"degree"}"#, r#"{"name":"deg","conversion_factor":0.0174532925199433}"#]
+            {
+                assert!(lonlat(projjson(&axes("GeographicCRS", "ellipsoidal", unit, id))), "{unit} {id}");
+                assert!(lonlat(projjson(&axes("GeodeticCRS", "spherical", unit, id))), "{unit} {id}");
+            }
+        }
+        // Junk units are no unit RustGIS knows, not a crash.
+        assert!(refused(projjson(&axes("GeographicCRS", "ellipsoidal", "[1,2]", ""))));
+        assert!(refused(projjson(&axes("GeographicCRS", "ellipsoidal", r#"{"conversion_factor":"x"}"#, ""))));
         // The definition goes before the code, as in WKT: a projected or mirrored one under a
         // planetocentric code is refused.
         assert!(refused(projjson(&json(r#"{"type":"ProjectedCRS","id":{"authority":"IAU_2015","code":49900}}"#))));

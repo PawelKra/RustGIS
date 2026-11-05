@@ -281,7 +281,9 @@ fn planetary_axes(keys: &[u16], doubles: &[f64], ascii: &str) -> Option<(f64, f6
 
 /// A geographic file's own system when it is another body's: its ellipsoid by its axes, named by
 /// its citation (`GCS Name = Mars (2015) - Sphere / Ocentric|…`), with the keys it came in. `None`
-/// for the Earth's.
+/// for the Earth's. One whose cells would be in the wrong place read as longitude/latitude in
+/// degrees is an error: a planetographic one (by its citation, as GDAL names an IAU `…01` system;
+/// GeoTIFF has no key for longitudes counted west), or one in other angular units than degrees.
 fn planetary_geographic(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Option<Crs>> {
     let Some((a, b)) = planetary_axes(keys, doubles, ascii) else { return Ok(None) };
     let citation = match geokey(keys, doubles, ascii, 2049) {
@@ -293,6 +295,28 @@ fn planetary_geographic(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Op
         "" => format!("Geographic coordinate system (semi-major axis {a} m)"),
         name => name.to_string(),
     };
+    // By a word of its own (`Mars (2015) / Ographic`, `GCS_Mars_2000_Ographic`, `planetographic`),
+    // not one that merely ends so (`cartographic`).
+    let ographic = |w: &str| w.eq_ignore_ascii_case("ographic") || w.eq_ignore_ascii_case("planetographic");
+    if first.split(|c: char| !c.is_ascii_alphanumeric()).any(ographic) {
+        return Err(err(super::planetary::refused(&label, super::planetary::OGRAPHIC)));
+    }
+    let degree = |f: f64| (f - 1f64.to_radians()).abs() < 1e-12;
+    let unit = match geokey(keys, doubles, ascii, 2054) {
+        // Degrees, the default; 9122 is the degree "supplier to define representation".
+        None | Some(KeyValue::Short(9102 | 9122)) => None,
+        Some(KeyValue::Short(32767)) => match geokey(keys, doubles, ascii, 2055) {
+            Some(KeyValue::Double(f)) if degree(f) => None,
+            Some(KeyValue::Double(f)) => Some(format!("units of {f} radians")),
+            _ => Some("a user-defined unit of no size".to_string()),
+        },
+        Some(KeyValue::Short(code)) => Some(format!("GeogAngularUnits {code}")),
+        Some(_) => Some("an unreadable GeogAngularUnits".to_string()),
+    };
+    if let Some(unit) = unit {
+        let why = format!("its longitude/latitude are in {unit}, not degrees");
+        return Err(err(super::planetary::refused(&label, &why)));
+    }
     // A prime meridian other than the body's reference one, in degrees.
     let pm = match geokey(keys, doubles, ascii, 2061) {
         Some(KeyValue::Double(pm)) if pm.is_finite() && pm != 0.0 => format!(" +pm={pm}"),

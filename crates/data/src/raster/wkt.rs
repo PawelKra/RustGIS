@@ -2021,7 +2021,9 @@ mod tests {
         }
         assert!(written > 3000, "{written}");
         let mut sampled = 0;
-        for code in [4267u32, 4230, 4277, 27700, 2056, 31370, 28992, 3035, 2193, 32631, 26917, 3413, 5514, 4087, 8857, 3006] {
+        // (Not UTM zone 31N: the table names a definition after its first reader, and
+        // `written_wkt_reads_back_as_the_same_system` names that one My_Grid.)
+        for code in [4267u32, 4230, 4277, 27700, 2056, 31370, 28992, 3035, 2193, 32634, 26917, 3413, 5514, 4087, 8857, 3006] {
             let Some(wkt) = Crs::from_epsg(code).and_then(to_wkt) else { continue };
             let wkt = wkt.replace(&format!(",AUTHORITY[\"EPSG\",\"{code}\"]"), "");
             let (crs, note) = read_wkt(&wkt).unwrap_or_else(|e| panic!("EPSG:{code}: {e}"));

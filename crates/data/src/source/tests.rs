@@ -357,6 +357,59 @@ fn geoparquet_planetary_systems_are_said_or_refused() {
     assert!(said[0].contains("its ellipsoid says so") && !said[0].contains("code"), "{said:?}");
     write_parquet_typed(&p, false, r#"["Point"],"crs":{"type":"GeographicCRS","name":"WGS 84","id":{"authority":"EPSG","code":4326}}"#);
     assert!(open_path(&p, None).unwrap().info().notes.is_empty());
+
+    // Its coordinate system's own axes, by code or by ellipsoid: geocentric X/Y/Z, and
+    // longitude/latitude in another unit than degrees, would be read as degrees, so are refused.
+    let axes = |kind: &str, id: &str, cs: &str| {
+        format!(
+            r#"["Point"],"crs":{{"type":"{kind}","name":"Mars (2015)","datum":{{"type":"GeodeticReferenceFrame","name":"Mars (2015) - Sphere","ellipsoid":{{"name":"Mars (2015) - Sphere","radius":3396190}}}},"coordinate_system":{cs}{id}}}"#
+        )
+    };
+    const IAU: &str = r#","id":{"authority":"IAU","version":2015,"code":49900}"#;
+    let lonlat = |lat: &str, lon: &str| {
+        format!(
+            r#"{{"subtype":"ellipsoidal","axis":[{{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":{lat}}},{{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":{lon}}}]}}"#
+        )
+    };
+    let xyz = r#"{"subtype":"Cartesian","axis":[{"name":"Geocentric X","abbreviation":"X","direction":"geocentricX","unit":"metre"},{"name":"Geocentric Y","abbreviation":"Y","direction":"geocentricY","unit":"metre"},{"name":"Geocentric Z","abbreviation":"Z","direction":"geocentricZ","unit":"metre"}]}"#;
+    let grad = r#"{"type":"AngularUnit","name":"grad","conversion_factor":0.015707963267949}"#;
+    let degree = r#"{"type":"AngularUnit","name":"degree","conversion_factor":0.0174532925199433}"#;
+    for id in ["", IAU] {
+        for (kind, cs, why) in [
+            ("GeodeticCRS", xyz.to_string(), "geocentric X/Y/Z"),
+            ("GeographicCRS", lonlat(r#""radian""#, r#""radian""#), "in radian, not degrees"),
+            ("GeographicCRS", lonlat(r#""degree""#, grad), "in grad, not degrees"),
+        ] {
+            write_parquet_typed(&p, false, &axes(kind, id, &cs));
+            let e = open_path(&p, None).err().unwrap().to_string();
+            assert!(e.contains("belongs to another body than the Earth") && e.contains(why), "{kind} {id}: {e}");
+            let bytes = std::fs::read(&p).unwrap();
+            assert!(open_bytes("mars.parquet", bytes, None).err().unwrap().to_string().contains(why), "{kind} {id}");
+        }
+        // Degrees, by name or by factor; a geodetic system on ellipsoidal or spherical axes; and an
+        // ellipsoidal height in metres: read, with the notice.
+        let height = lonlat(r#""degree""#, r#""degree""#)
+            .replace("]}", r#",{"name":"Ellipsoidal height","abbreviation":"h","direction":"up","unit":"metre"}]}"#);
+        for (kind, cs) in [
+            ("GeodeticCRS", lonlat(r#""degree""#, r#""degree""#)),
+            ("GeodeticCRS", lonlat(r#""degree""#, r#""degree""#).replace("ellipsoidal", "spherical")),
+            ("GeographicCRS", lonlat(degree, r#"{"name":"degree"}"#)),
+            ("GeographicCRS", lonlat(r#""Degree""#, r#""deg""#)),
+            ("GeographicCRS", height),
+        ] {
+            write_parquet_typed(&p, false, &axes(kind, id, &cs));
+            let src = open_path(&p, None).unwrap_or_else(|e| panic!("{kind} {cs} {id}: {e}"));
+            assert_eq!(src.info().notes.iter().filter(|m| body(m)).count(), 1, "{kind} {cs} {id}: {:?}", src.info().notes);
+            let (ds, _) = materialize(src.as_ref()).unwrap();
+            assert_eq!(ds.features.len(), points().len());
+        }
+    }
+    // An Earth system, in radians or as X/Y/Z, says nothing of bodies (it is read as before).
+    for cs in [lonlat(r#""radian""#, r#""radian""#), xyz.to_string()] {
+        write_parquet_typed(&p, false, &axes("GeographicCRS", "", &cs).replace("3396190", "6378137"));
+        let notes = open_path(&p, None).unwrap().info().notes.clone();
+        assert!(!notes.iter().any(body), "{notes:?}");
+    }
 }
 
 #[test]

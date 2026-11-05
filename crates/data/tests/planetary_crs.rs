@@ -464,6 +464,74 @@ fn a_geographic_mars_geotiff_is_its_own_system_not_wgs_84_and_keeps_it_when_writ
     assert!(bare.crs.is_planetary() && bare.crs.label().contains("2631200"), "{}", bare.crs.label());
 }
 
+/// A geographic Mars GeoTIFF whose cells would be in the wrong place read as degrees counted east
+/// is refused: a planetographic citation (GeoTIFF has no key for longitudes counted west) or
+/// angles in another unit; degrees, by code or by size, and a planetocentric citation, are read.
+#[test]
+fn a_planetographic_or_non_degree_mars_geotiff_is_refused() {
+    let read = |keys: &[u16], doubles: &[f64], citation: &str| raster::read_bytes("mars.tif", &geotiff(-180.0, keys, doubles, citation));
+    let ographic =
+        "GCS Name = Mars (2015) / Ographic|Datum = Mars (2015)|Ellipsoid = Mars (2015)|Primem = Reference Meridian|AUnits = degree|";
+    let e = read(&mars_geographic_keys(ographic), &[3_396_190.0, 169.894_447_223_612], ographic).unwrap_err().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic") && e.contains("Mars (2015) / Ographic"), "{e}");
+    // GeogAngularUnits, by code: radians and grads refused, the two degree codes read.
+    let with_unit = |unit: u16| {
+        let mut keys = mars_geographic_keys(MARS_CITATION);
+        let at = keys.iter().position(|k| *k == 2054).unwrap();
+        keys[at + 3] = unit;
+        keys
+    };
+    for (unit, ok) in [(9101, false), (9105, false), (9102, true), (9122, true)] {
+        match read(&with_unit(unit), &[3_396_190.0, 0.0], MARS_CITATION) {
+            Ok(r) => {
+                assert!(ok && r.crs.is_planetary(), "{unit}");
+                assert_eq!(planetary_notes(&r.lost).len(), 1, "{unit}: {:?}", r.lost);
+            }
+            Err(e) => assert!(!ok && e.to_string().contains(&format!("GeogAngularUnits {unit}, not degrees")), "{unit}: {e}"),
+        }
+    }
+    // A user-defined unit, by its size in radians (GeogAngularUnitSize).
+    let sized = |size: Option<f64>| {
+        let mut keys = with_unit(32767);
+        let mut doubles = vec![3_396_190.0, 0.0];
+        if let Some(size) = size {
+            let at = keys.iter().position(|k| *k == 2054).unwrap() + 4;
+            keys.splice(at..at, [2055, 34736, 1, 2]);
+            keys[3] += 1;
+            doubles.push(size);
+        }
+        read(&keys, &doubles, MARS_CITATION)
+    };
+    assert!(sized(Some(1f64.to_radians())).unwrap().crs.is_planetary());
+    assert!(sized(Some(1.0)).unwrap_err().to_string().contains("units of 1 radians, not degrees"));
+    assert!(sized(None).unwrap_err().to_string().contains("a user-defined unit of no size"));
+    // No GeogAngularUnits at all: degrees. A planetocentric citation, and none (named by its axis,
+    // which says "Geographic"; on a body no other test reads, Europa, as the run's table names a
+    // system as it first knew it), are read.
+    let mut keys = mars_geographic_keys(MARS_CITATION);
+    let at = keys.iter().position(|k| *k == 2054).unwrap();
+    keys.drain(at..at + 4);
+    keys[3] -= 1;
+    assert!(read(&keys, &[3_396_190.0, 0.0], MARS_CITATION).unwrap().crs.is_planetary());
+    let bare = read(&mars_geographic_keys(""), &[1_560_800.0, 0.0], "").unwrap();
+    assert!(bare.crs.is_planetary() && bare.crs.label().contains("Geographic"), "{}", bare.crs.label());
+    // By a word of its own, not one that merely ends so.
+    for (named, refused) in [
+        ("GCS Name = GCS_Mars_2000_Geographic|", false),
+        ("GCS Name = Mars cartographic grid|", false),
+        ("GCS Name = Mars photographic mosaic|", false),
+        ("GCS Name = GCS_Mars_2000_Ographic|", true),
+        ("GCS Name = Mars planetographic|", true),
+    ] {
+        let r = read(&mars_geographic_keys(named), &[3_396_190.0, 0.0], named);
+        assert_eq!(r.as_ref().err().is_some_and(|e| e.to_string().contains("planetographic")), refused, "{named}");
+        assert_eq!(r.is_ok(), !refused, "{named}");
+    }
+    // An Earth file's units are what they were (GeogAngularUnits isn't read for the Earth).
+    let earth = read(&with_unit(9101), &[6_378_137.0, 298.257_223_563], "").unwrap();
+    assert!(!earth.crs.is_planetary());
+}
+
 #[test]
 fn geotiff_axes_of_the_earth_stay_wgs_84_and_feet_are_converted() {
     // A geographic file with its own Earth ellipsoid (Clarke 1866) is read as it was.
@@ -529,6 +597,54 @@ fn an_ascii_grid_with_a_mars_prj_is_said_or_refused() {
     assert!(e.contains(ANOTHER_BODY) && e.contains("Bonne"), "{e}");
     let earth = raster::read_path(&dir.path().join("earth.asc")).unwrap();
     assert!(planetary_notes(&earth.lost).is_empty(), "{:?}", earth.lost);
+    assert!(!earth.lost.iter().any(|l| l.contains(".prj")), "{:?}", earth.lost);
+}
+
+/// An Earth `.prj` next to an ASCII grid that RustGIS can't read leaves the grid in
+/// longitude/latitude, and says so, as a Shapefile's does; one it reads, or none, says nothing.
+#[test]
+fn an_ascii_grid_whose_earth_prj_is_not_read_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let grid = "ncols 2\nnrows 2\nxllcorner 10\nyllcorner 10\ncellsize 1\n1 2\n3 4\n";
+    const GEOCENTRIC: &str =
+        r#"GEOCCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["metre",1]]"#;
+    let write = |name: &str, prj: Option<&str>| {
+        let path = dir.path().join(format!("{name}.asc"));
+        std::fs::write(&path, grid).unwrap();
+        if let Some(prj) = prj {
+            std::fs::write(dir.path().join(format!("{name}.prj")), prj).unwrap();
+        }
+        path
+    };
+    let said =
+        |r: &raster::Raster| r.lost.iter().filter(|l| l.contains("the .prj file") && l.contains("read as longitude/latitude")).count();
+    for (name, prj, why) in [("geocentric", GEOCENTRIC, "GEOCCS"), ("junk", "not a coordinate system", "")] {
+        let r = raster::read_path(&write(name, Some(prj))).unwrap();
+        assert_eq!(r.crs, Crs::LonLat, "{name}");
+        assert_eq!(said(&r), 1, "{name}: {:?}", r.lost);
+        assert!(r.lost.iter().any(|l| l.contains(why)), "{name}: {:?}", r.lost);
+        assert!(planetary_notes(&r.lost).is_empty(), "{name}: {:?}", r.lost);
+    }
+    // One that isn't text (not UTF-8) is said too.
+    let binary = write("binary", None);
+    std::fs::write(dir.path().join("binary.prj"), [0xff, 0xfe, 0x00, 0x47]).unwrap();
+    let r = raster::read_path(&binary).unwrap();
+    assert_eq!(said(&r), 1, "{:?}", r.lost);
+    assert!(r.lost.iter().any(|l| l.contains("can't be read as text")), "{:?}", r.lost);
+    // Read again for a sidecar's no-data that only another band gives: still said, once.
+    let again = write("again", Some(GEOCENTRIC));
+    std::fs::write(
+        dir.path().join("again.asc.aux.xml"),
+        r#"<PAMDataset><PAMRasterBand band="2"><NoDataValue>3</NoDataValue></PAMRasterBand></PAMDataset>"#,
+    )
+    .unwrap();
+    assert_eq!(said(&raster::read_path(&again).unwrap()), 1);
+    // A .prj it reads, and none at all, say nothing of it.
+    for (name, prj) in [("wgs84", Some(raster::wkt::to_wkt(Crs::LonLat).unwrap())), ("none", None)] {
+        let r = raster::read_path(&write(name, prj.as_deref())).unwrap();
+        assert_eq!(r.crs, Crs::LonLat, "{name}");
+        assert_eq!(said(&r), 0, "{name}: {:?}", r.lost);
+    }
 }
 
 #[test]

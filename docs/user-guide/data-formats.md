@@ -561,8 +561,9 @@ projection RustGIS unprojects), is read as it is, and adding it says that the ma
 measurements take it for the Earth. One whose coordinates would be in the wrong place as
 longitude/latitude is refused, saying why: projected metres the reader can't convert (a
 FlatGeobuf, GeoParquet or GeoJSON whose system is another body's projection, a GeoPackage one known
-only by its IAU code, or a projection RustGIS doesn't read) and longitudes counted west
-(planetographic ones). Exporting such a layer as WGS 84 longitude/latitude says so; in its own system, the file gives its datum only by the
+only by its IAU code, or a projection RustGIS doesn't read), geocentric X/Y/Z (a GeoParquet
+system), longitude/latitude in another unit than degrees (a GeoParquet or GeoTIFF one), and
+longitudes counted west (planetographic ones). Exporting such a layer as WGS 84 longitude/latitude says so; in its own system, the file gives its datum only by the
 ellipsoid's axes, and that is said too; projecting it onto another ellipsoid (the Earth's) is
 refused. A layer known to be another body's only by an IAU code, or by an ellipsoid its reader
 doesn't keep (GeoParquet), keeps no system, so its export can't tell: adding it says that an export
