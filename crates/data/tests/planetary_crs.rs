@@ -177,7 +177,8 @@ fn geojson_iau_codes_are_read_said_or_refused() {
         assert_eq!(said.len(), 1, "{name}: {:?}", report.messages);
         assert!(!report.messages.iter().any(|m| m.contains("only EPSG codes")), "{name}: {:?}", report.messages);
         // Known only by its code, the layer keeps no system: the notice says what an export writes.
-        assert!(said[0].contains("an export writes its coordinates as WGS 84"), "{said:?}");
+        assert!(said[0].contains("an export takes its coordinates for WGS 84"), "{said:?}");
+        assert!(said[0].contains("one in a projection projects them as the Earth's"), "{said:?}");
         // In place too.
         let path = dir.path().join("mars.geojson");
         std::fs::write(&path, &text).unwrap();
@@ -240,23 +241,43 @@ fn geopackage_iau_systems_are_read_said_or_refused() {
         // A definition gives the layer its system, not WGS 84's name.
         assert_eq!(ds.crs.is_some_and(Crs::is_planetary), name != "code", "{name}");
     }
-    // Mars metres would be read as degrees: refused, whether its definition or code says so.
-    let metres = [(-7_930_954.0, 1_105_492.0), (4_591_220.0, 1_093_043.0)];
-    for (name, srs) in
-        [("eqc", ("IAU_2015", 49910, MARS_EQC)), ("eqc_code", ("IAU_2015", 49910, "undefined")), ("eqc_none", ("NONE", 1, MARS_EQC))]
-    {
+    // Mars metres: a projection its definition gives, and RustGIS reads, is unprojected on the
+    // body's sphere, with the notice, on the desktop and in the browser, whatever the code says.
+    let mem =
+        |path: &Path| source::gpkg_mem::GpkgMemSource::open_shared(source::Shared(std::sync::Arc::new(std::fs::read(path).unwrap())), None);
+    let r = 3_396_190.0f64;
+    let metres = LONLAT.map(|(lon, lat)| (r * lon.to_radians(), r * lat.to_radians()));
+    for (name, srs) in [("eqc", ("IAU_2015", 49910, MARS_EQC)), ("eqc_none", ("NONE", 1, MARS_EQC))] {
         let path = geopackage(dir.path(), name, metres, srs);
-        let e = io::read_path(&path).unwrap_err().to_string();
-        assert!(e.contains(ANOTHER_BODY) && e.contains("metres") && e.contains("srs_id 990001"), "{name}: {e}");
-        let bytes = source::Shared(std::sync::Arc::new(std::fs::read(&path).unwrap()));
-        let e = source::gpkg_mem::GpkgMemSource::open_shared(bytes, None).err().unwrap().to_string();
-        assert!(e.contains(ANOTHER_BODY) && e.contains("metres"), "{name}: {e}");
+        let (ds, report) = io::read_path(&path).unwrap();
+        for (got, (lon, lat)) in points(&ds).into_iter().zip(LONLAT) {
+            assert!((got.x - lon).abs() < 1e-9 && (got.y - lat).abs() < 1e-9, "{name}: {got:?}");
+        }
+        assert_eq!(planetary_notes(&report.messages).len(), 1, "{name}: {:?}", report.messages);
+        assert!(datum_notes(&report.messages).is_empty(), "{name}: {:?}", report.messages);
+        assert!(ds.crs.is_some_and(|c| c.is_planetary() && !c.is_geographic()), "{name}");
+        assert_eq!(planetary_notes(&mem(&path).unwrap().info().notes).len(), 1, "{name}");
     }
-    // An Earth system without an EPSG code says what it said before.
+    // Refused, as they would be in the wrong place: a projection its definition gives that
+    // RustGIS doesn't read, and one only its IAU code says.
+    let bonne = [(1_000_000.0, 2_000_000.0), (-500_000.0, 10.0)];
+    for (name, native, srs, why) in [
+        ("bonne", bonne, ("NONE", 1, MARS_BONNE), "Bonne"),
+        ("bonne_iau", bonne, ("IAU_2015", 49900, MARS_BONNE), "Bonne"),
+        ("eqc_code", metres, ("IAU_2015", 49910, "undefined"), "metres"),
+    ] {
+        let path = geopackage(dir.path(), name, native, srs);
+        let e = io::read_path(&path).unwrap_err().to_string();
+        assert!(e.contains(ANOTHER_BODY) && e.contains(why) && e.contains("srs_id 990001"), "{name}: {e}");
+        let e = mem(&path).err().unwrap().to_string();
+        assert!(e.contains(ANOTHER_BODY) && e.contains(why), "{name}: {e}");
+    }
+    // An Earth system without an EPSG code is read by its definition, saying nothing of bodies.
     let path = geopackage(dir.path(), "earth", LONLAT, ("NONE", 1, NAD27_ESRI));
-    let (_, report) = io::read_path(&path).unwrap();
+    let (ds, report) = io::read_path(&path).unwrap();
+    assert_eq!(ds.features.len(), 2);
     assert!(planetary_notes(&report.messages).is_empty(), "{:?}", report.messages);
-    assert!(report.messages.iter().any(|m| m.contains("no EPSG code")), "{:?}", report.messages);
+    assert!(planetary_notes(&mem(&path).unwrap().info().notes).is_empty());
 }
 
 /// A FlatGeobuf of `native` points whose header names its system by `org` and `code`, with `wkt`,
@@ -565,4 +586,85 @@ fn exports_say_what_they_write_instead_of_another_body_s_system() {
     let projected = io::project(&layer, eqc).unwrap();
     let x = points(&projected)[0].x;
     assert!((x - 3_396_190.0 * (-133.8f64).to_radians()).abs() < 1e-3, "{x}");
+}
+
+#[test]
+fn an_epsg_code_that_is_not_converted_leaves_another_body_s_definition_to_say() {
+    // An EPSG organization with a code RustGIS doesn't convert would otherwise be read as
+    // longitude/latitude with only "unknown coordinate system": its definition still says the body.
+    const UNKNOWN: i32 = 104_971;
+    assert!(Crs::from_epsg(UNKNOWN as u32).is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let metres = [(-7_930_954.0, 1_105_492.0), (4_591_220.0, 1_093_043.0)];
+    let mem =
+        |path: &Path| source::gpkg_mem::GpkgMemSource::open_shared(source::Shared(std::sync::Arc::new(std::fs::read(path).unwrap())), None);
+    // GeoPackage, desktop and browser: the definition is read (Mars metres unprojected on its
+    // sphere, Mars longitude/latitude kept), with the notice; one it doesn't read is refused.
+    let r = 3_396_190.0f64;
+    let eqc = LONLAT.map(|(lon, lat)| (r * lon.to_radians(), r * lat.to_radians()));
+    for (name, native, wkt) in [("epsg_eqc", eqc, MARS_EQC), ("epsg_mars", LONLAT, MARS_WKT2)] {
+        let path = geopackage(dir.path(), name, native, ("EPSG", i64::from(UNKNOWN), wkt));
+        let (ds, report) = io::read_path(&path).unwrap();
+        for (got, (lon, lat)) in points(&ds).into_iter().zip(LONLAT) {
+            assert!((got.x - lon).abs() < 1e-9 && (got.y - lat).abs() < 1e-9, "{name}: {got:?}");
+        }
+        assert_eq!(planetary_notes(&report.messages).len(), 1, "{name}: {:?}", report.messages);
+        assert!(!report.messages.iter().any(|m| m.contains("unknown coordinate system")), "{name}: {:?}", report.messages);
+        assert!(ds.crs.is_some_and(Crs::is_planetary), "{name}");
+        assert_eq!(planetary_notes(&mem(&path).unwrap().info().notes).len(), 1, "{name}");
+    }
+    let path = geopackage(dir.path(), "epsg_bonne", metres, ("EPSG", i64::from(UNKNOWN), MARS_BONNE));
+    let e = io::read_path(&path).unwrap_err().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("Bonne"), "{e}");
+    let e = mem(&path).err().unwrap().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("Bonne"), "{e}");
+    // An Earth definition under the same code says nothing of bodies.
+    let path = geopackage(dir.path(), "epsg_earth", LONLAT, ("EPSG", i64::from(UNKNOWN), NAD27_ESRI));
+    let (ds, report) = io::read_path(&path).unwrap();
+    assert_eq!(ds.features.len(), 2);
+    assert!(planetary_notes(&report.messages).is_empty(), "{:?}", report.messages);
+    assert!(planetary_notes(&mem(&path).unwrap().info().notes).is_empty());
+    // A code that converts is read by it, as always.
+    let path = geopackage(dir.path(), "epsg_known", LONLAT, ("EPSG", 4326, NAD27_ESRI));
+    assert!(planetary_notes(&io::read_path(&path).unwrap().1.messages).is_empty());
+
+    // FlatGeobuf: the same.
+    let path = dir.path().join("epsg.fgb");
+    flatgeobuf(&path, metres, Some("EPSG"), UNKNOWN, Some(MARS_EQC));
+    let e = io::read_path(&path).unwrap_err().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("metres"), "{e}");
+    flatgeobuf(&path, LONLAT, Some("EPSG"), UNKNOWN, Some(MARS_WKT2));
+    let (ds, report) = io::read_path(&path).unwrap();
+    assert_eq!(planetary_notes(&report.messages).len(), 1, "{:?}", report.messages);
+    assert!(ds.crs.is_some_and(Crs::is_planetary));
+    flatgeobuf(&path, LONLAT, None, UNKNOWN, Some(MARS_ESRI));
+    assert_eq!(planetary_notes(&io::read_path(&path).unwrap().1.messages).len(), 1);
+    flatgeobuf(&path, LONLAT, Some("EPSG"), UNKNOWN, Some(NAD27_ESRI));
+    let (_, report) = io::read_path(&path).unwrap();
+    assert!(planetary_notes(&report.messages).is_empty(), "{:?}", report.messages);
+    assert!(report.messages.iter().any(|m| m.contains(&format!("EPSG:{UNKNOWN}"))), "{:?}", report.messages);
+    flatgeobuf(&path, LONLAT, Some("EPSG"), 4326, Some(NAD27_ESRI));
+    assert!(planetary_notes(&io::read_path(&path).unwrap().1.messages).is_empty());
+}
+
+#[test]
+fn geotiff_axes_in_a_unit_that_is_not_sized_are_not_taken_for_metres() {
+    // Mars equirectangular with its radius in kilometres, declared by a GeogLinearUnits code that
+    // isn't read (9030, the nautical mile) and no GeogLinearUnitSize: taken for metres, the
+    // sphere would be 3.4 km across and the cells in the wrong place.
+    let keys: Vec<u16> = vec![
+        1, 1, 0, 9, 1024, 0, 1, 1, 1025, 0, 1, 1, 2048, 0, 1, 32767, 2052, 0, 1, 9030, 2057, 34736, 1, 0, 3072, 0, 1, 32767, 3074, 0, 1,
+        32767, 3075, 0, 1, 17, 3076, 0, 1, 9001,
+    ];
+    let e = raster::read_bytes("km.tif", &geotiff(-1_000_000.0, &keys, &[3_396.19], "")).unwrap_err().to_string();
+    assert!(e.contains("GeogLinearUnits 9030"), "{e}");
+    // A unit it sizes (GeogLinearUnitSize, metres per unit) is converted.
+    let mut sized = keys.clone();
+    sized[3] += 1;
+    sized.extend([2053, 34736, 1, 1]);
+    let r = raster::read_bytes("sized.tif", &geotiff(-1_000_000.0, &sized, &[6_792_380.0, 0.5], "")).unwrap();
+    assert!(r.crs.is_planetary() && r.crs.custom_def().unwrap().proj4.contains("+a=3396190 "), "{}", r.crs.custom_def().unwrap().proj4);
+    // Axes that are the Earth's in metres whatever unit is declared: read as before.
+    let r = raster::read_bytes("earth.tif", &geotiff(-1_000_000.0, &keys, &[6_378_137.0], "")).unwrap();
+    assert!(!r.crs.is_planetary() && r.lost.is_empty(), "{:?}", r.lost);
 }

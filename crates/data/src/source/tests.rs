@@ -329,18 +329,32 @@ fn geoparquet_planetary_systems_are_said_or_refused() {
         ds.features.iter().filter_map(|f| f.geometry.as_ref()?.label_point()).collect::<Vec<_>>(),
         points().iter().map(|p| p.0).collect::<Vec<_>>()
     );
-    for (kind, code, lon, why) in [("ProjectedCRS", 49910, "east", "metres"), ("GeographicCRS", 49901, "west", "west")] {
+    // The definition goes before the code: a projected or mirrored one under a planetocentric
+    // code is refused too.
+    for (kind, code, lon, why) in [
+        ("ProjectedCRS", 49910, "east", "metres"),
+        ("GeographicCRS", 49901, "west", "west"),
+        ("ProjectedCRS", 49900, "east", "metres"),
+        ("GeographicCRS", 49900, "west", "west"),
+    ] {
         write_parquet_typed(&p, false, &mars(kind, code, lon));
         let e = open_path(&p, None).err().unwrap().to_string();
-        assert!(e.contains("belongs to another body than the Earth") && e.contains(why), "{e}");
+        assert!(e.contains("belongs to another body than the Earth") && e.contains(why), "{kind} {code} {lon}: {e}");
     }
-    // By its ellipsoid alone (no IAU code), and an Earth one.
-    write_parquet_typed(
-        &p,
-        false,
-        &mars("GeographicCRS", 49900, "east").replace(r#","id":{"authority":"IAU","version":2015,"code":49900}"#, ""),
-    );
-    assert_eq!(open_path(&p, None).unwrap().info().notes.iter().filter(|m| body(m)).count(), 1);
+    let no_id = |s: String| s.replace(r#","id":{"authority":"IAU","version":2015,"code":49900}"#, "");
+    // Latitudes counted south, by code or by ellipsoid.
+    for crs in [mars("GeographicCRS", 49900, "east"), no_id(mars("GeographicCRS", 49900, "east"))] {
+        write_parquet_typed(&p, false, &crs.replace(r#""direction":"north""#, r#""direction":"south""#));
+        let e = open_path(&p, None).err().unwrap().to_string();
+        assert!(e.contains("belongs to another body than the Earth") && e.contains("south"), "{e}");
+    }
+    // By its ellipsoid alone (no IAU code): said by the ellipsoid, not by a code it hasn't; and an
+    // Earth one.
+    write_parquet_typed(&p, false, &no_id(mars("GeographicCRS", 49900, "east")));
+    let notes = open_path(&p, None).unwrap().info().notes.clone();
+    let said: Vec<&String> = notes.iter().filter(|m| body(m)).collect();
+    assert_eq!(said.len(), 1, "{notes:?}");
+    assert!(said[0].contains("its ellipsoid says so") && !said[0].contains("code"), "{said:?}");
     write_parquet_typed(&p, false, r#"["Point"],"crs":{"type":"GeographicCRS","name":"WGS 84","id":{"authority":"EPSG","code":4326}}"#);
     assert!(open_path(&p, None).unwrap().info().notes.is_empty());
 }

@@ -93,10 +93,21 @@ pub fn read_note(system: &str) -> String {
 }
 
 /// [`read_note`] for a system known only by its code: the layer keeps no system (RustGIS has no
-/// definition of the body to give it), so this says up front what an export writes.
+/// definition of the body to give it), so this says up front what an export does, which the
+/// export itself can't tell.
 pub fn code_note(system: &str) -> String {
+    unkept_note(system, "only its code says so, which the layer doesn't keep")
+}
+
+/// [`code_note`] for a system known by its ellipsoid, in a definition the reader doesn't convert
+/// (GeoParquet's PROJJSON without an EPSG code).
+pub fn ellipsoid_note(system: &str) -> String {
+    unkept_note(system, "its ellipsoid says so, but the layer doesn't keep its system")
+}
+
+fn unkept_note(system: &str, why: &str) -> String {
     format!(
-        "{}; only its code says so, which the layer doesn't keep: an export writes its coordinates as WGS 84 longitude/latitude",
+        "{}; {why}: an export takes its coordinates for WGS 84 longitude/latitude, and one in a projection projects them as the Earth's",
         read_note(system)
     )
 }
@@ -171,7 +182,8 @@ pub fn declared(authority: Option<&str>, code: Option<i64>, wkt: Option<&str>) -
 
 /// A GeoParquet column's `crs` (PROJJSON) when it is another body's: by its `id` (an IAU code),
 /// else by its ellipsoid's semi-major axis or radius, in metres. GeoParquet's readers convert only
-/// EPSG codes, so only planetocentric longitude/latitude is read (as it is).
+/// EPSG codes, so only planetocentric longitude/latitude is read (as it is): a projected system,
+/// or longitudes counted west or latitudes south, is refused, whatever its code says.
 pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
     let id = crs.get("id");
     let authority = id.and_then(|i| i.get("authority")).and_then(serde_json::Value::as_str);
@@ -183,17 +195,34 @@ pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
         _ if name.trim().is_empty() => "its coordinate system".to_string(),
         _ => name.trim().to_string(),
     };
+    let kind = crs.get("type").and_then(serde_json::Value::as_str);
+    let geographic = matches!(kind, Some("GeographicCRS" | "GeodeticCRS"));
+    // Longitudes counted west or latitudes counted south, which would be read mirrored.
+    let mirrored = crs.get("coordinate_system").and_then(|cs| cs.get("axis")).and_then(serde_json::Value::as_array).and_then(|axes| {
+        axes.iter().find_map(|a| match a.get("direction").and_then(serde_json::Value::as_str).map(str::to_ascii_lowercase).as_deref() {
+            Some("west") => Some("its longitudes count west"),
+            Some("south") => Some("its latitudes count south"),
+            _ => None,
+        })
+    });
     if let (Some(a), Some(c)) = (authority, code)
-        && let Some((_, kind)) = iau_code(a, c)
+        && let Some((_, iau)) = iau_code(a, c)
     {
-        return Some(match kind {
-            IauKind::Ocentric => Declared::LonLat { note: code_note(&system), crs: None },
+        // The definition goes before the code: a projected or mirrored system under a
+        // planetocentric code is what it says.
+        return Some(match iau {
+            IauKind::Ocentric if matches!(kind, Some("ProjectedCRS" | "DerivedProjectedCRS")) => {
+                Declared::Refused(refused(&system, PROJECTED))
+            }
+            IauKind::Ocentric => match mirrored {
+                Some(why) => Declared::Refused(refused(&system, why)),
+                None => Declared::LonLat { note: code_note(&system), crs: None },
+            },
             IauKind::Ographic => Declared::Refused(refused(&system, OGRAPHIC)),
             IauKind::Projected => Declared::Refused(refused(&system, PROJECTED)),
         });
     }
     // A projected system's ellipsoid is its base system's.
-    let geographic = matches!(crs.get("type").and_then(serde_json::Value::as_str), Some("GeographicCRS" | "GeodeticCRS"));
     let base = if geographic { Some(crs) } else { crs.get("base_crs") };
     let datum = base.and_then(|b| b.get("datum").or_else(|| b.get("datum_ensemble")));
     let ellipsoid = datum.and_then(|d| d.get("ellipsoid"));
@@ -209,15 +238,10 @@ pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
     if !off_earth(metres) {
         return None;
     }
-    let west = crs.get("coordinate_system").and_then(|cs| cs.get("axis")).and_then(serde_json::Value::as_array).is_some_and(|axes| {
-        axes.iter().any(|a| a.get("direction").and_then(serde_json::Value::as_str).is_some_and(|d| d.eq_ignore_ascii_case("west")))
-    });
-    Some(if !geographic {
-        Declared::Refused(refused(&system, PROJECTED))
-    } else if west {
-        Declared::Refused(refused(&system, "its longitudes count west"))
-    } else {
-        Declared::LonLat { note: code_note(&system), crs: None }
+    Some(match mirrored {
+        _ if !geographic => Declared::Refused(refused(&system, PROJECTED)),
+        Some(why) => Declared::Refused(refused(&system, why)),
+        None => Declared::LonLat { note: ellipsoid_note(&system), crs: None },
     })
 }
 
@@ -364,6 +388,31 @@ mod tests {
             r#"{"type":"ProjectedCRS","name":"eqc","base_crs":{"name":"Mars","datum":{"name":"Mars","ellipsoid":{"name":"Mars","semi_major_axis":3396190,"inverse_flattening":169.8944}}},"conversion":{"name":"x"}}"#,
         );
         assert!(refused(projjson(&projected)));
+        // The definition goes before the code, as in WKT: a projected or mirrored one under a
+        // planetocentric code is refused.
+        assert!(refused(projjson(&json(r#"{"type":"ProjectedCRS","id":{"authority":"IAU_2015","code":49900}}"#))));
+        let mut west = sphere("GeographicCRS", "west", "3396190");
+        west["id"] = json(r#"{"authority":"IAU_2015","code":49900}"#);
+        assert!(refused(projjson(&west)));
+        let mut east = sphere("GeographicCRS", "east", "3396190");
+        east["id"] = json(r#"{"authority":"IAU_2015","code":49900}"#);
+        assert!(lonlat(projjson(&east)));
+        // Latitudes counted south, by code or by ellipsoid.
+        let south = |v: &serde_json::Value| json(&v.to_string().replace(r#""direction":"north""#, r#""direction":"south""#));
+        for v in [&east, &sphere("GeographicCRS", "east", "3396190")] {
+            match projjson(&south(v)) {
+                Some(Declared::Refused(e)) => assert!(e.contains("latitudes count south"), "{e}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // The notice says what told the body: the code, or the ellipsoid (with no code to name).
+        let note = |v: &serde_json::Value| match projjson(v) {
+            Some(Declared::LonLat { note, crs: None }) => note,
+            other => panic!("{other:?}"),
+        };
+        assert!(note(&east).contains("only its code says so"), "{}", note(&east));
+        let by_ellipsoid = note(&sphere("GeographicCRS", "east", "3396190"));
+        assert!(by_ellipsoid.contains("its ellipsoid says so") && !by_ellipsoid.contains("code"), "{by_ellipsoid}");
         // EPSG systems, junk and nothing say no body.
         assert!(projjson(&json(r#"{"type":"GeographicCRS","id":{"authority":"EPSG","code":4326}}"#)).is_none());
         assert!(projjson(&json(r#"{"datum":{"ellipsoid":{"radius":"x"}}}"#)).is_none());

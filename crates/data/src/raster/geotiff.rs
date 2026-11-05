@@ -369,19 +369,29 @@ fn proj4_of_keys(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<(String, 
         None => return Err(err("the file's own projection isn't described in its keys")),
     };
     // The datum or ellipsoid, by code or by its axes, in metres.
-    let axis_m = num(2057).and_then(|a| axis_unit(keys, doubles, ascii, a)).unwrap_or(1.0);
     let earth = match (short(2048), short(2050), short(2056)) {
         (Some(4326), _, _) | (_, Some(6326), _) | (_, _, Some(7030)) => "+datum=WGS84".to_string(),
         (Some(4269), _, _) | (_, Some(6269), _) | (_, _, Some(7019)) => "+ellps=GRS80 +towgs84=0,0,0".to_string(),
         (Some(4267), _, _) | (_, Some(6267), _) | (_, _, Some(7008)) => "+ellps=clrk66".to_string(),
-        _ => match (num(2057).map(|a| a * axis_m), num(2059), num(2058).map(|b| b * axis_m)) {
-            (Some(a), Some(rf), _) if a > 0.0 && rf > 0.0 => format!("+a={a} +rf={rf}"),
-            (Some(a), _, Some(b)) if a > 0.0 && b > 0.0 => format!("+a={a} +b={b}"),
-            // Another body's sphere (no flattening, or 0): not WGS 84, which would read its
-            // metres as the Earth's ([`super::planetary`]).
-            (Some(a), rf, None) if super::planetary::off_earth(a) && rf.is_none_or(|rf| rf == 0.0) => format!("+a={a} +b={a}"),
-            _ => "+datum=WGS84".to_string(),
-        },
+        _ => {
+            // Axes in a unit the keys don't size can't be taken for metres: the ellipsoid, and so
+            // every cell, would be another size.
+            let axis_m = match num(2057) {
+                Some(a) => axis_unit(keys, doubles, ascii, a).ok_or_else(|| {
+                    let unit = short(2052).map(|u| format!(" (GeogLinearUnits {u})")).unwrap_or_default();
+                    err(format!("the file's ellipsoid axes are in a unit{unit} that isn't supported"))
+                })?,
+                None => 1.0,
+            };
+            match (num(2057).map(|a| a * axis_m), num(2059), num(2058).map(|b| b * axis_m)) {
+                (Some(a), Some(rf), _) if a > 0.0 && rf > 0.0 => format!("+a={a} +rf={rf}"),
+                (Some(a), _, Some(b)) if a > 0.0 && b > 0.0 => format!("+a={a} +b={b}"),
+                // Another body's sphere (no flattening, or 0): not WGS 84, which would read its
+                // metres as the Earth's ([`super::planetary`]).
+                (Some(a), rf, None) if super::planetary::off_earth(a) && rf.is_none_or(|rf| rf == 0.0) => format!("+a={a} +b={a}"),
+                _ => "+datum=WGS84".to_string(),
+            }
+        }
     };
     let label = text(3073).or_else(|| text(1026)).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "Custom projection".into());
     Ok((format!("{proj} {earth} {units} +no_defs"), label))

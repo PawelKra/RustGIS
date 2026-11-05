@@ -559,12 +559,15 @@ layer is placed on the Earth. A layer whose coordinates are the body's longitude
 east (a geographic `.prj` or WKT, a GeoTIFF's own keys, an IAU code ending in `00` or `02`, or a
 projection RustGIS unprojects), is read as it is, and adding it says that the map, its scale bar and
 measurements take it for the Earth. One whose coordinates would be in the wrong place as
-longitude/latitude is refused, saying why: projected metres the reader can't convert (a GeoPackage,
-FlatGeobuf, GeoParquet or GeoJSON whose system is another body's projection, or a projection
-RustGIS doesn't read) and longitudes counted west (planetographic ones). Exporting such a layer as
-WGS 84 longitude/latitude says so; in its own system, the file gives its datum only by the
+longitude/latitude is refused, saying why: projected metres the reader can't convert (a
+FlatGeobuf, GeoParquet or GeoJSON whose system is another body's projection, a GeoPackage one known
+only by its IAU code, or a projection RustGIS doesn't read) and longitudes counted west
+(planetographic ones). Exporting such a layer as WGS 84 longitude/latitude says so; in its own system, the file gives its datum only by the
 ellipsoid's axes, and that is said too; projecting it onto another ellipsoid (the Earth's) is
-refused.
+refused. A layer known to be another body's only by an IAU code, or by an ellipsoid its reader
+doesn't keep (GeoParquet), keeps no system, so its export can't tell: adding it says that an export
+takes its coordinates for WGS 84 longitude/latitude, and that one in a projection projects them as
+the Earth's.
 
 ## Define Projection
 
