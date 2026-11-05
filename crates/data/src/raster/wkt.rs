@@ -1081,7 +1081,12 @@ pub fn to_wkt(crs: Crs) -> Option<String> {
     let ellps = text("ellps").or(datum.map(|d| d.2));
     let known = ellps.and_then(|e| ELLIPSOIDS.iter().find(|r| r.0.eq_ignore_ascii_case(e)));
     let ellps_name = known.map_or("unnamed", |r| r.1);
-    let (a, b) = proj.ellipse_parameters();
+    // proj4rs computes `eqc` on a sphere of the semi-major axis and gives that sphere, but RustGIS
+    // computes it on the datum's ellipsoid (`crs::ellipsoidal_eqc`), the one written here.
+    let (a, b) = match text("proj") {
+        Some("eqc") => super::crs::eqc_geographic(&def).ok()?.ellipse_parameters(),
+        _ => proj.ellipse_parameters(),
+    };
     // A named ellipsoid's flattening as published; else from its axes (PROJ keeps a and b).
     let rf = match known {
         Some(k) if text("rf").is_none() && text("b").is_none() => k.2,
@@ -1458,6 +1463,10 @@ mod tests {
             // An equidistant cylindrical system's latitude of origin, on an ellipsoid and a sphere.
             ("+proj=eqc +lat_ts=30 +lat_0=10 +lon_0=10 +x_0=1000 +y_0=2000 +datum=WGS84 +units=m +no_defs", (12.0, 40.0)),
             ("+proj=eqc +lat_ts=0 +lat_0=-20 +lon_0=0 +x_0=0 +y_0=0 +R=3396190 +units=m +no_defs", (30.0, 20.0)),
+            // An unnamed ellipsoid by its axes and flattening (Mars's IAU 2015 ellipsoid), which
+            // proj4rs's own eqc replaces with a sphere: the ellipsoid is the one written.
+            ("+proj=eqc +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +a=3396190 +rf=169.894447223612 +units=m +no_defs", (12.0, 40.0)),
+            ("+proj=eqc +lat_ts=20 +lon_0=0 +x_0=0 +y_0=0 +a=6378137 +b=6356752.314245 +units=m +no_defs", (12.0, 40.0)),
         ] {
             let crs = Crs::parse(def).unwrap();
             let wkt = to_wkt(crs).unwrap_or_else(|| panic!("{def}"));

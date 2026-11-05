@@ -100,7 +100,7 @@ fn clean(messages: &[String]) {
     assert!(messages.is_empty(), "{messages:?}");
 }
 
-/// No "isn't supported": a Mars file still gets PR-independent datum notes.
+/// No "isn't supported": a Mars file may still get datum notes, which don't depend on the method.
 fn read_as_projected(messages: &[String]) {
     assert!(!messages.iter().any(|m| m.contains("isn't supported") || m.contains("read as longitude/latitude")), "{messages:?}");
 }

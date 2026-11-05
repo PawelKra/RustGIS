@@ -428,6 +428,22 @@ pub fn ellipsoidal_eqc(def: &str) -> Option<Result<Transformer, String>> {
     Some(eqc.and_then(|eqc| Ok(Transformer { kind: Kind::Eqc { eqc: Box::new(eqc), wgs84: Box::new(wgs84()?) } })))
 }
 
+/// Longitude/latitude on the datum (its ellipsoid, shift to WGS 84 and prime meridian) of a PROJ
+/// definition of an equidistant cylindrical projection: every parameter but the projection's own.
+/// proj4rs replaces the ellipsoid of the projection itself with a sphere of its semi-major axis.
+pub(crate) fn eqc_geographic(def: &str) -> Result<proj4rs::Proj, String> {
+    const PROJECTION: [&str; 13] =
+        ["proj", "lat_ts", "lat_0", "lon_0", "x_0", "y_0", "units", "to_meter", "k", "k_0", "axis", "type", "wktext"];
+    let datum: Vec<String> = def
+        .split_whitespace()
+        .map(|t| t.trim_start_matches('+'))
+        .map(|t| t.split_once('=').unwrap_or((t, "")))
+        .filter(|(k, _)| !PROJECTION.contains(k))
+        .map(|(k, v)| if v.is_empty() { format!("+{k}") } else { format!("+{k}={v}") })
+        .collect();
+    proj4rs::Proj::from_proj_string(&format!("+proj=longlat {}", datum.join(" "))).map_err(|e| e.to_string())
+}
+
 /// An equidistant cylindrical projection on an ellipsoid (EPSG method 1028), which proj4rs
 /// computes on a sphere of the semi-major axis only: the projection by
 /// [`rustgis_geom::EquidistantCylindrical`], the datum (its ellipsoid, shift to WGS 84 and prime
@@ -457,15 +473,7 @@ impl EllipsoidalEqc {
         }
         let built = (|| {
             let native = proj4rs::Proj::from_proj_string(def).map_err(|e| e.to_string())?;
-            // The datum: every parameter but the projection's own.
-            const PROJECTION: [&str; 13] =
-                ["proj", "lat_ts", "lat_0", "lon_0", "x_0", "y_0", "units", "to_meter", "k", "k_0", "axis", "type", "wktext"];
-            let datum: Vec<String> = tokens
-                .iter()
-                .filter(|(k, _)| !PROJECTION.contains(k))
-                .map(|(k, v)| if v.is_empty() { format!("+{k}") } else { format!("+{k}={v}") })
-                .collect();
-            let geo = proj4rs::Proj::from_proj_string(&format!("+proj=longlat {}", datum.join(" "))).map_err(|e| e.to_string())?;
+            let geo = eqc_geographic(def)?;
             let (a, b) = geo.ellipse_parameters();
             if !(a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0) {
                 return Err("the ellipsoid's axes aren't usable".into());
