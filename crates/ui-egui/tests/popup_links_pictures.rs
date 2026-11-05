@@ -313,6 +313,37 @@ fn an_answer_that_is_not_a_picture_says_so() {
 }
 
 #[test]
+fn a_picture_in_a_format_not_read_here_says_so() {
+    let _turn = turn();
+    let asked = fake_fetcher();
+    let mut h = popup(json!({"name": "Scan", "image": "https://assets.rustgis.app/scan"}));
+    h.run_steps(2);
+    let mut bmp = b"BM".to_vec();
+    bmp.resize(64, 0);
+    assert_eq!(answer(&asked, "scan", || Ok(bmp.clone())), 1);
+    h.run_steps(3);
+    h.get_by_label("Picture unavailable: BMP pictures aren't supported");
+    assert!(!has_label(&h, "not a picture"));
+}
+
+#[test]
+fn a_plain_http_picture_does_not_hide_an_https_one() {
+    let _turn = turn();
+    let asked = fake_fetcher();
+    // `photo` comes before `thumbnail`, but only the thumbnail can be fetched.
+    let url = "https://assets.rustgis.app/images/p.jpg";
+    let mut h = popup(json!({"name": "Old and new", "photo": "http://old.example/p", "thumbnail": url}));
+    h.run_steps(3);
+    assert_eq!(asked_urls(&asked), [url]);
+    assert!(!has_label(&h, "only https:// pictures are fetched"));
+    assert_eq!(answer(&asked, "p.jpg", || Ok(png(20, 10))), 1);
+    h.run_steps(3);
+    h.get_by_label("Picture");
+    // The plain address stays a link.
+    h.get_by_role_and_label(Role::Link, "http://old.example/p");
+}
+
+#[test]
 fn local_and_plain_http_pictures_are_never_fetched() {
     let _turn = turn();
     let asked = fake_fetcher();

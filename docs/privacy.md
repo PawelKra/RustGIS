@@ -43,8 +43,10 @@ still identify private data, so review copied diagnostics before sharing them.
   data chooses, your IP address and that the picture was viewed, so it could be used to see who
   opens a file. The pop-up fetches a picture as it opens only when the address is
   `https://assets.rustgis.app/…`: exactly that host (in any case), over `https://`, with no port,
-  user name or subdomain. Any other picture is fetched only when you click **Show Picture** in
-  the pop-up, which names the server first. Plain `http://` pictures and pictures on this computer
+  user name or subdomain; a redirect that server answers with is followed, as for any download
+  (in the web app, by the browser). Any other picture is fetched only when you click
+  **Show Picture** in the pop-up, which names the server first. Plain `http://` pictures and
+  pictures on this computer
   or the local network are never fetched; on the desktop that includes a name, or a redirect, that
   resolves to one. A picture kept in the data itself (a `data:image/…`
   value) needs no request. A fetched picture is kept in memory for the session; the web app also

@@ -4,13 +4,16 @@
 //! the `https://` address in a field named as one (`image`, `image_url`, `photo`, `photo_url`,
 //! `picture`, `picture_url`, `thumbnail` or `thumbnail_url`, in any case, with or without the
 //! `_`, `-` or space), or else from the first address whose path ends in `.jpg`, `.jpeg`, `.png`
-//! or `.webp`.
+//! or `.webp`, the fields taken in the order of their names. One that would be fetched
+//! (`https://`, not on this computer or the local network) comes before one that wouldn't, so a
+//! plain `http://` address doesn't hide an `https://` picture.
 //!
 //! Fetching a picture named by the data tells its server who opened the file and when, so only
 //! RustGIS's own asset server ([`AUTO_HOST`], exactly, over `https://`: [`loads_by_itself`]) is
-//! fetched as the pop-up opens. A picture anywhere else shows a **Show Picture** button and
-//! nothing is fetched until it is clicked. A plain `http://` picture, or one on this computer or
-//! the local network, is never fetched; the pop-up says so.
+//! fetched as the pop-up opens; a redirect it answers with is followed, as for any download. A
+//! picture anywhere else shows a **Show Picture** button and nothing is fetched until it is
+//! clicked. A plain `http://` picture, or one on this computer or the local network, is never
+//! fetched; the pop-up says so.
 //!
 //! A picture is fetched through the tile cache's downloads (worker threads natively, the
 //! browser's fetch on the web, where the browser's own HTTP cache applies), at most
@@ -107,11 +110,14 @@ pub(crate) fn picture_path(url: &str) -> bool {
 }
 
 /// The web address the pop-up shows a picture from, among a feature's text values (name,
-/// value): a link in a picture field first, else the first link whose path is a picture file's.
+/// value): a link in a picture field first, else the first link whose path is a picture file's;
+/// and before either, one that would be fetched ([`refusal`] has nothing against it), so a plain
+/// `http://` or local address is chosen (to say why it isn't fetched) only when no other is.
 pub(crate) fn picture_link<'a>(attrs: impl Iterator<Item = (&'a str, &'a str)> + Clone) -> Option<&'a str> {
-    let mut links = attrs.filter_map(|(k, v)| Some((k, web_link(v)?)));
-    let named = links.clone().find(|(k, _)| picture_field(k));
-    named.or_else(|| links.find(|(_, v)| picture_path(v))).map(|(_, v)| v)
+    // Each candidate: whether its field is named as a picture's, and its address.
+    let candidates = attrs.filter_map(|(k, v)| Some((picture_field(k), web_link(v)?))).filter(|(named, v)| *named || picture_path(v));
+    let first = |named: bool, fetched: bool| candidates.clone().find(|(n, v)| *n == named && (!fetched || refusal(v).is_none()));
+    first(true, true).or_else(|| first(false, true)).or_else(|| first(true, false)).or_else(|| first(false, false)).map(|(_, v)| v)
 }
 
 /// The one host whose pictures the pop-up fetches without being asked: RustGIS's own asset
@@ -144,6 +150,8 @@ pub(crate) enum Failure {
     Fetch(String),
     /// What came back isn't a picture that decodes.
     NotPicture,
+    /// A picture in a format that isn't read here (its name, such as `BMP` or `TIFF`).
+    Unsupported(String),
     /// A picture of more pixels than are decoded (width, height), refused before decoding.
     TooLarge(u32, u32),
     /// Only `https://` pictures are fetched.
@@ -161,6 +169,9 @@ impl Failure {
                 crate::i18n::fmt("Picture unavailable: {reason}", &[("reason", &reason)])
             }
             Failure::NotPicture => crate::i18n::fmt("Picture unavailable: not a picture", &[]),
+            Failure::Unsupported(format) => {
+                crate::i18n::fmt("Picture unavailable: {format} pictures aren't supported", &[("format", format)])
+            }
             Failure::TooLarge(w, h) => crate::i18n::fmt(
                 "Picture unavailable: {w} × {h} pixels is larger than {max} × {max}",
                 &[("w", &w.to_string()), ("h", &h.to_string()), ("max", &MAX_DECODED_SIDE.to_string())],
@@ -289,10 +300,14 @@ fn start(url: &str, fetch: impl FnOnce(&str, Landing)) -> Entry {
 /// small file can't unpack into a huge picture), and kept at most [`MAX_SIDE`] pixels a side.
 pub(crate) fn decode(bytes: &[u8]) -> Result<image::RgbaImage, Failure> {
     let header = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|_| Failure::NotPicture)?;
-    if header.format().is_none() {
-        return Err(Failure::NotPicture);
-    }
-    let (w, h) = header.into_dimensions().map_err(|_| Failure::NotPicture)?;
+    let Some(format) = header.format() else { return Err(Failure::NotPicture) };
+    // A picture whose format has no decoder here says so, rather than that it isn't one.
+    let (w, h) = header.into_dimensions().map_err(|e| match e {
+        image::ImageError::Unsupported(u) if matches!(u.kind(), image::error::UnsupportedErrorKind::Format(_)) => {
+            Failure::Unsupported(format!("{format:?}").to_uppercase())
+        }
+        _ => Failure::NotPicture,
+    })?;
     if w > MAX_DECODED_SIDE || h > MAX_DECODED_SIDE {
         return Err(Failure::TooLarge(w, h));
     }
@@ -453,6 +468,21 @@ mod tests {
         assert_eq!(pick(&[("website", "https://assets.rustgis.app?next=/a.jpg")]), None);
         // A plain http picture field is chosen (and then refused, saying why).
         assert_eq!(pick(&[("photo", "http://x.org/p")]), Some("http://x.org/p"));
+        // ...but not over a picture that would be fetched, in either kind of candidate.
+        assert_eq!(
+            pick(&[("photo", "http://old.example/p"), ("thumbnail", "https://images.example.org/p.jpg")]),
+            Some("https://images.example.org/p.jpg")
+        );
+        assert_eq!(pick(&[("a", "http://x.org/1.jpg"), ("b", "https://x.org/2.jpg")]), Some("https://x.org/2.jpg"));
+        assert_eq!(pick(&[("image", "https://192.168.1.2/p.jpg"), ("photo", "https://x.org/p")]), Some("https://x.org/p"));
+        // A file address that would be fetched over a picture field that wouldn't.
+        assert_eq!(pick(&[("a", "https://x.org/1.jpg"), ("photo", "http://x.org/p")]), Some("https://x.org/1.jpg"));
+        // None would be: a picture field's first, to say why.
+        assert_eq!(
+            pick(&[("a", "http://x.org/1.jpg"), ("photo", "https://localhost/p"), ("thumbnail", "http://x.org/t")]),
+            Some("https://localhost/p")
+        );
+        assert_eq!(pick(&[("a", "http://x.org/1.jpg"), ("b", "http://x.org/2.jpg")]), Some("http://x.org/1.jpg"));
         assert_eq!(refusal("http://x.org/p"), Some(Failure::NotHttps));
         assert_eq!(refusal("https://192.168.1.2/p.jpg"), Some(Failure::Local));
         assert_eq!(refusal("https://localhost/p.jpg"), Some(Failure::Local));
@@ -479,6 +509,14 @@ mod tests {
         assert_eq!(Failure::TooLarge(4000, 3000).line(), "Picture unavailable: 4000 × 3000 pixels is larger than 2048 × 2048");
         assert_eq!(decode(b"<html>Not found</html>"), Err(Failure::NotPicture));
         assert_eq!(decode(&[]), Err(Failure::NotPicture));
+        // A picture whose format isn't read here says so, not that it isn't a picture.
+        let mut bmp = b"BM".to_vec();
+        bmp.resize(64, 0);
+        assert_eq!(decode(&bmp), Err(Failure::Unsupported("BMP".into())));
+        let mut tiff = b"II*\0".to_vec();
+        tiff.resize(64, 0);
+        assert_eq!(decode(&tiff), Err(Failure::Unsupported("TIFF".into())));
+        assert_eq!(Failure::Unsupported("BMP".into()).line(), "Picture unavailable: BMP pictures aren't supported");
         // A picture cut short doesn't decode.
         let whole = png(64, 64);
         assert_eq!(decode(whole.get(..whole.len() / 2).unwrap()), Err(Failure::NotPicture));
