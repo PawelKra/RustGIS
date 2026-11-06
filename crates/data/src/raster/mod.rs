@@ -1139,9 +1139,10 @@ fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Resul
     Ok(r)
 }
 
-/// The coordinate system in a `.prj` next to an ASCII grid, when it's one RustGIS understands;
-/// else why it isn't (an Earth one, which the grid is read without, saying so). Another body's
-/// that it doesn't is an error: read as longitude/latitude, the grid would be in the wrong place.
+/// The coordinate system in the `.prj` next to an ASCII grid, when RustGIS understands it. Else
+/// why it doesn't, so the grid is read without it and says so. Another body's system RustGIS
+/// doesn't understand is an error instead, because the grid would land in the wrong place as
+/// longitude/latitude.
 fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
     let Some(prj) = read_prj(path) else {
         // One that is there but can't be read as text (not UTF-8, too large to be one) is said too.
@@ -1150,8 +1151,8 @@ fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
     };
     match wkt::crs_from_wkt(&prj) {
         Ok(crs) => Ok((Some(crs), None)),
-        Err(e) => match wkt::planetary_datum(&prj) {
-            Some(datum) => Err(DataError::Format(format!("the .prj file: {}", planetary::refused(&format!("the datum {datum}"), &e)))),
+        Err(e) => match planetary::refused_wkt(&prj, &e) {
+            Some(refused) => Err(DataError::Format(format!("the .prj file: {refused}"))),
             None => Ok((None, Some(e))),
         },
     }

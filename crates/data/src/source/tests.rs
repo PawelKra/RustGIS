@@ -354,7 +354,7 @@ fn geoparquet_planetary_systems_are_said_or_refused() {
     let notes = open_path(&p, None).unwrap().info().notes.clone();
     let said: Vec<&String> = notes.iter().filter(|m| body(m)).collect();
     assert_eq!(said.len(), 1, "{notes:?}");
-    assert!(said[0].contains("its ellipsoid says so") && !said[0].contains("code"), "{said:?}");
+    assert!(said[0].contains("as only its ellipsoid says") && !said[0].contains("code"), "{said:?}");
     write_parquet_typed(&p, false, r#"["Point"],"crs":{"type":"GeographicCRS","name":"WGS 84","id":{"authority":"EPSG","code":4326}}"#);
     assert!(open_path(&p, None).unwrap().info().notes.is_empty());
 

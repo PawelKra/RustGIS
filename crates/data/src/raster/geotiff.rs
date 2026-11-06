@@ -66,6 +66,22 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
     // A projected file with a user-defined projection (the NLCD's Albers, say) defines it in its
     // keys: read as its own system, never as the geographic system it's based on.
     let user_defined = key(1024) == Some(1) && key(3072).is_none_or(|c| !usable(&c));
+    let citation = |k: u16| match geokey(&keys, &gdoubles, &gascii, k) {
+        Some(KeyValue::Ascii(t)) if !t.trim().is_empty() => Some(t),
+        _ => None,
+    };
+    // PCSCitation, else GTCitation.
+    let system = || citation(3073).or_else(|| citation(1026)).unwrap_or_else(|| "the file's own projection".into());
+    // A projection of another body's planetographic longitude/latitude is refused when a citation
+    // says so, as GDAL names one. GeoTIFF has no key for axis directions, and PROJ gives such a
+    // projection westings.
+    if user_defined
+        && planetary_axes(&keys, &gdoubles, &gascii).is_some()
+        // PCSCitation, GTCitation, GeogCitation.
+        && [3073, 1026, 2049].into_iter().filter_map(citation).any(|t| super::planetary::ographic_name(&t))
+    {
+        return Err(err(super::planetary::refused(&system(), super::planetary::OGRAPHIC_PROJECTED)));
+    }
     // A projection the keys don't describe well enough is left unknown (the open goes on, and fails
     // later only if the coordinates aren't degrees), its reason kept for the message.
     let mut custom_error = None;
@@ -81,9 +97,10 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
         let code = key(3072).filter(usable).or(key(2048).filter(usable)).map(u32::from);
         (code, code.and_then(Crs::from_epsg))
     };
-    // Another body's system ([`super::planetary`]): a geographic one is its own system, not WGS 84
-    // (its longitude/latitude are read as they are, and a GeoTIFF written from it keeps its keys);
-    // a projection of it that can't be read is refused, as its metres would be read as degrees.
+    // Another body's system ([`super::planetary`]). A geographic one is its own system, not WGS 84:
+    // its longitude/latitude are read as they are, and a GeoTIFF written from it keeps its keys.
+    // A projection of it that can't be read is refused, because its metres would be read as
+    // degrees.
     let crs = match crs {
         None if geographic_model && key(2048).is_none_or(|c| !usable(&c)) => planetary_geographic(&keys, &gdoubles, &gascii)?.or(crs),
         crs => crs,
@@ -91,12 +108,7 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
     if let Some(e) = &custom_error
         && planetary_axes(&keys, &gdoubles, &gascii).is_some()
     {
-        let system = geokey(&keys, &gdoubles, &gascii, 3073)
-            .or_else(|| geokey(&keys, &gdoubles, &gascii, 1026))
-            .and_then(|v| if let KeyValue::Ascii(t) = v { Some(t) } else { None })
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| "the file's own projection".into());
-        return Err(err(super::planetary::refused(&system, e.strip_prefix("GeoTIFF: ").unwrap_or(e))));
+        return Err(err(super::planetary::refused(&system(), e.strip_prefix("GeoTIFF: ").unwrap_or(e))));
     }
 
     // A TIFF with none of the GeoTIFF tags is a scan; one with only some of them is damaged.
@@ -241,18 +253,21 @@ fn geokey(keys: &[u16], doubles: &[f64], ascii: &str, k: u16) -> Option<KeyValue
     }
 }
 
-/// Metres per unit of the ellipsoid's axes in a file's keys (GeogLinearUnits; metres when it isn't
-/// given), whose semi-major axis is `a`: 1 when `a` is the Earth's in metres already, which some
-/// writers give whatever unit they declare. `None` for a unit the keys don't size.
+/// Metres per unit of the ellipsoid's axes in a file's keys (GeogLinearUnits, metres when it isn't
+/// given). `a` is the semi-major axis as the keys give it. When that is already the Earth's in
+/// metres, the factor is 1, because some writers give metres whatever unit they declare. `None`
+/// for a unit the keys don't size.
 fn axis_unit(keys: &[u16], doubles: &[f64], ascii: &str, a: f64) -> Option<f64> {
     if !super::planetary::off_earth(a) {
         return Some(1.0);
     }
+    // GeogLinearUnits
     match geokey(keys, doubles, ascii, 2052) {
-        None | Some(KeyValue::Short(9001)) => Some(1.0),
-        Some(KeyValue::Short(9002)) => Some(0.3048),
-        Some(KeyValue::Short(9003)) => Some(1200.0 / 3937.0),
-        Some(KeyValue::Short(9036)) => Some(1000.0),
+        None | Some(KeyValue::Short(9001)) => Some(1.0),      // metre
+        Some(KeyValue::Short(9002)) => Some(0.3048),          // foot
+        Some(KeyValue::Short(9003)) => Some(1200.0 / 3937.0), // US survey foot
+        Some(KeyValue::Short(9036)) => Some(1000.0),          // kilometre
+        // GeogLinearUnitSize
         _ => match geokey(keys, doubles, ascii, 2053) {
             Some(KeyValue::Double(f)) if f.is_finite() && f > 0.0 => Some(f),
             _ => None,
@@ -268,9 +283,10 @@ fn planetary_axes(keys: &[u16], doubles: &[f64], ascii: &str) -> Option<(f64, f6
         Some(KeyValue::Double(v)) if v.is_finite() && v > 0.0 => Some(v),
         _ => None,
     };
-    let raw = num(2057)?;
+    let raw = num(2057)?; // GeogSemiMajorAxis
     let to_m = axis_unit(keys, doubles, ascii, raw)?;
     let a = raw * to_m;
+    // GeogSemiMinorAxis, GeogInvFlattening
     let b = match (num(2058), num(2059)) {
         (Some(b), _) => b * to_m,
         (None, Some(rf)) => a - a / rf,
@@ -281,11 +297,14 @@ fn planetary_axes(keys: &[u16], doubles: &[f64], ascii: &str) -> Option<(f64, f6
 
 /// A geographic file's own system when it is another body's: its ellipsoid by its axes, named by
 /// its citation (`GCS Name = Mars (2015) - Sphere / Ocentric|…`), with the keys it came in. `None`
-/// for the Earth's. One whose cells would be in the wrong place read as longitude/latitude in
-/// degrees is an error: a planetographic one (by its citation, as GDAL names an IAU `…01` system;
-/// GeoTIFF has no key for longitudes counted west), or one in other angular units than degrees.
+/// for the Earth's. It is an error when its cells would land in the wrong place as
+/// longitude/latitude in degrees:
+/// - a planetographic system, told by its citation as GDAL names an IAU `…01` system (GeoTIFF has
+///   no key for longitudes counted west);
+/// - other angular units than degrees.
 fn planetary_geographic(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Option<Crs>> {
     let Some((a, b)) = planetary_axes(keys, doubles, ascii) else { return Ok(None) };
+    // GeogCitation
     let citation = match geokey(keys, doubles, ascii, 2049) {
         Some(KeyValue::Ascii(t)) => t,
         _ => String::new(),
@@ -295,16 +314,15 @@ fn planetary_geographic(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Op
         "" => format!("Geographic coordinate system (semi-major axis {a} m)"),
         name => name.to_string(),
     };
-    // By a word of its own (`Mars (2015) / Ographic`, `GCS_Mars_2000_Ographic`, `planetographic`),
-    // not one that merely ends so (`cartographic`).
-    let ographic = |w: &str| w.eq_ignore_ascii_case("ographic") || w.eq_ignore_ascii_case("planetographic");
-    if first.split(|c: char| !c.is_ascii_alphanumeric()).any(ographic) {
+    if super::planetary::ographic_name(first) {
         return Err(err(super::planetary::refused(&label, super::planetary::OGRAPHIC)));
     }
     let degree = |f: f64| (f - 1f64.to_radians()).abs() < 1e-12;
+    // GeogAngularUnits
     let unit = match geokey(keys, doubles, ascii, 2054) {
-        // Degrees, the default; 9122 is the degree "supplier to define representation".
+        // Degrees, the default (9102); 9122 is the degree "supplier to define representation".
         None | Some(KeyValue::Short(9102 | 9122)) => None,
+        // User-defined, sized by GeogAngularUnitSize in radians.
         Some(KeyValue::Short(32767)) => match geokey(keys, doubles, ascii, 2055) {
             Some(KeyValue::Double(f)) if degree(f) => None,
             Some(KeyValue::Double(f)) => Some(format!("units of {f} radians")),
@@ -317,7 +335,7 @@ fn planetary_geographic(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Op
         let why = format!("its longitude/latitude are in {unit}, not degrees");
         return Err(err(super::planetary::refused(&label, &why)));
     }
-    // A prime meridian other than the body's reference one, in degrees.
+    // A prime meridian other than the body's reference one, in degrees (GeogPrimeMeridianLong).
     let pm = match geokey(keys, doubles, ascii, 2061) {
         Some(KeyValue::Double(pm)) if pm.is_finite() && pm != 0.0 => format!(" +pm={pm}"),
         _ => String::new(),

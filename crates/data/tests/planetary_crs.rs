@@ -77,7 +77,7 @@ fn a_mars_shapefile_is_read_as_its_longitude_latitude_with_one_planetary_notice(
         assert_eq!(points(&ds), LONLAT.map(|(x, y)| Coord::new(x, y)).to_vec(), "{name}");
         let said = planetary_notes(&report.messages);
         assert_eq!(said.len(), 1, "{name}: {:?}", report.messages);
-        assert!(said[0].contains(datum) && said[0].contains("scale bar"), "{name}: {said:?}");
+        assert!(said[0].contains(datum) && said[0].contains("drawn and measured"), "{name}: {said:?}");
         // Not the Earth's datum note as well: it doesn't apply to another body.
         assert!(datum_notes(&report.messages).is_empty(), "{name}: {:?}", report.messages);
         let crs = ds.crs.unwrap();
@@ -116,7 +116,7 @@ fn longitudes_counted_west_and_unread_mars_projections_are_refused() {
     let bonne = shapefile(dir.path(), "bonne", [(1_000_000.0, 2_000_000.0), (-500_000.0, 10.0)], MARS_BONNE);
     for (path, why) in [(&west, "west"), (&bonne, "Bonne")] {
         let e = io::read_path(path).unwrap_err().to_string();
-        assert!(e.contains(ANOTHER_BODY) && e.contains(why) && e.contains("aren't read yet"), "{e}");
+        assert!(e.contains(ANOTHER_BODY) && e.contains(why) && e.contains("wrong place"), "{e}");
         let e = source::open_path(path, None).err().unwrap().to_string();
         assert!(e.contains(ANOTHER_BODY) && e.contains(why), "{e}");
     }
@@ -126,6 +126,142 @@ fn longitudes_counted_west_and_unread_mars_projections_are_refused() {
     assert_eq!(ds.features.len(), 2);
     assert!(report.messages.iter().any(|m| m.contains("Bonne") && m.contains("read as longitude/latitude")), "{:?}", report.messages);
     assert!(planetary_notes(&report.messages).is_empty());
+}
+
+/// Mars planetographic as Esri WKT, named as [`MARS_ESRI`] is: an Esri `.prj` has no axes, so
+/// nothing says its longitudes count east.
+const MARS_OGRAPHIC_ESRI: &str = r#"GEOGCS["GCS_Mars_2015_Ographic",DATUM["D_Mars_2015",SPHEROID["Mars_2015",3396190.0,169.894447223612]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#;
+
+/// A planetographic system, or a projection of one, whose axes don't say they count east is
+/// refused (most bodies' planetographic longitudes count west, and PROJ gives a projection of them
+/// westings), by its name, its IAU code or its geographic system; one whose axes say east is read.
+#[test]
+fn planetographic_systems_without_east_axes_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = 3_396_190.0f64;
+    let metres = LONLAT.map(|(lon, lat)| (r * lon.to_radians(), r * lat.to_radians()));
+    let with_axes = |wkt: &str, axes: &str| format!("{},{axes}]", wkt.strip_suffix(']').unwrap());
+    let east_north = r#"AXIS["Lon",EAST],AXIS["Lat",NORTH]"#;
+    let unnamed = MARS_OGRAPHIC_ESRI.replace("GCS_Mars_2015_Ographic", "GCS_Mars");
+    let eqc_on = |geogcs: &str, name: &str| {
+        MARS_EQC.replace("Mars_2015_-_Sphere_Ocentric_Equirectangular_clon0", name).replace(
+            r#"GEOGCS["GCS_Mars_2015_-_Sphere_Ocentric",DATUM["D_Mars_2015_-_Sphere",SPHEROID["Mars_2015_-_Sphere",3396190.0,0.0]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#,
+            geogcs,
+        )
+    };
+    let wkt2_eqc = |base: &str, x: &str| {
+        format!(
+            r#"PROJCRS["Mars (2015) / Ographic / Equirectangular, clon = 0",BASEGEOGCRS["{base}",DATUM["Mars (2015)",ELLIPSOID["Mars (2015)",3396190,169.894447223612,LENGTHUNIT["metre",1]]],PRIMEM["Reference Meridian",0,ANGLEUNIT["degree",0.0174532925199433]]],CONVERSION["Equirectangular, clon = 0",METHOD["Equidistant Cylindrical",ID["EPSG",1028]],PARAMETER["Latitude of 1st standard parallel",0,ANGLEUNIT["degree",0.0174532925199433]],PARAMETER["Longitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433]],PARAMETER["False easting",0,LENGTHUNIT["metre",1]],PARAMETER["False northing",0,LENGTHUNIT["metre",1]]],CS[Cartesian,2],AXIS["{x}",{x},ORDER[1],LENGTHUNIT["metre",1]],AXIS["northing",north,ORDER[2],LENGTHUNIT["metre",1]]]"#
+        )
+    };
+    let without_axes = MARS_WEST.replace(r#"CS[ellipsoidal,2],"#, "").replace(
+        r#"AXIS["geodetic latitude (Lat)",north,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["geodetic longitude (Lon)",west,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],"#,
+        "",
+    );
+    assert!(!without_axes.contains("AXIS"), "{without_axes}");
+    // Refused: longitude/latitude by its name or its IAU code (WKT1 and WKT2), and projections of it
+    // by their own name, IAU code or axes, or by their geographic system's name or axes.
+    let refused: Vec<(&str, String, [(f64, f64); 2], &str)> = vec![
+        ("esri", MARS_OGRAPHIC_ESRI.to_string(), LONLAT, "planetographic longitudes may count west"),
+        ("code", with_axes(&unnamed, r#"AUTHORITY["IAU_2015","49901"]"#), LONLAT, "planetographic longitudes"),
+        ("wkt2", without_axes.clone(), LONLAT, "planetographic longitudes"),
+        ("eqc_base", eqc_on(MARS_OGRAPHIC_ESRI, "Mars_Equirectangular"), metres, "x coordinates may count west"),
+        ("eqc_name", eqc_on(&unnamed, "Mars_2015_Ographic_Equirectangular_clon0"), metres, "x coordinates may count west"),
+        (
+            "eqc_code",
+            with_axes(&eqc_on(&unnamed, "Mars_Equirectangular"), r#"AUTHORITY["IAU_2015","49911"]"#),
+            metres,
+            "x coordinates may count west",
+        ),
+        (
+            "eqc_west_base",
+            eqc_on(&with_axes(&unnamed, r#"AXIS["Lon",WEST],AXIS["Lat",NORTH]"#), "Mars_Equirectangular"),
+            metres,
+            "x coordinates may count west",
+        ),
+        ("eqc_westing", with_axes(MARS_EQC, r#"AXIS["Westing",WEST],AXIS["Northing",NORTH]"#), metres, "west or south"),
+        ("wkt2_eqc_westing", wkt2_eqc("Mars (2015) / Ographic", "west"), metres, "west or south"),
+    ];
+    for (name, prj, native, why) in &refused {
+        let path = shapefile(dir.path(), name, *native, prj);
+        let e = io::read_path(&path).unwrap_err().to_string();
+        assert!(e.contains(ANOTHER_BODY) && e.contains(why) && e.contains("wrong place"), "{name}: {e}");
+        let e = source::open_path(&path, None).err().unwrap().to_string();
+        assert!(e.contains(ANOTHER_BODY) && e.contains(why), "{name}: {e}");
+    }
+    // Read, with the planetary notice: axes that say east, and planetocentric names and codes.
+    let read: Vec<(&str, String, [(f64, f64); 2])> = vec![
+        ("esri_east", with_axes(MARS_OGRAPHIC_ESRI, east_north), LONLAT),
+        ("wkt2_east", MARS_WEST.replace(",west,", ",east,"), LONLAT),
+        ("ocentric_code", with_axes(&unnamed, r#"AUTHORITY["IAU_2015","49900"]"#), LONLAT),
+        ("eqc_easting", eqc_on(&with_axes(MARS_OGRAPHIC_ESRI, east_north), "Mars_Equirectangular"), metres),
+        (
+            "eqc_base_easting",
+            with_axes(&eqc_on(MARS_OGRAPHIC_ESRI, "Mars_Equirectangular"), r#"AXIS["Easting",EAST],AXIS["Northing",NORTH]"#),
+            metres,
+        ),
+        ("eqc_ocentric_code", with_axes(MARS_EQC, r#"AUTHORITY["IAU_2015","49910"]"#), metres),
+        ("wkt2_eqc_easting", wkt2_eqc("Mars (2015) / Ographic", "east"), metres),
+    ];
+    for (name, prj, native) in &read {
+        let path = shapefile(dir.path(), name, *native, prj);
+        let (ds, report) = io::read_path(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (got, (lon, lat)) in points(&ds).into_iter().zip(LONLAT) {
+            assert!((got.x - lon).abs() < 1e-6 && (got.y - lat).abs() < 1e-6, "{name}: {got:?}");
+        }
+        assert_eq!(planetary_notes(&report.messages).len(), 1, "{name}: {:?}", report.messages);
+        let src = source::open_path(&path, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(planetary_notes(&src.info().notes).len(), 1, "{name}: {:?}", src.info().notes);
+    }
+    // The Earth's: its own IAU planetographic system (named so, without axes), and a name that
+    // merely ends so, as before.
+    let earth = [
+        r#"GEOGCS["Earth (2015) / Ographic",DATUM["Earth (2015)",SPHEROID["Earth (2015)",6378136.6,298.257]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433],AUTHORITY["IAU_2015","39901"]]"#,
+        r#"GEOGCS["Cartographic",DATUM["d",SPHEROID["Clarke_1866",6378206.4,294.9786982]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#,
+    ];
+    for (i, prj) in earth.iter().enumerate() {
+        let path = shapefile(dir.path(), &format!("earth{i}"), [(5.0, 50.0), (6.0, 51.0)], prj);
+        let (ds, report) = io::read_path(&path).unwrap_or_else(|e| panic!("{prj}: {e}"));
+        assert_eq!(ds.features.len(), 2);
+        assert!(planetary_notes(&report.messages).is_empty(), "{prj}: {:?}", report.messages);
+        assert!(!report.messages.iter().any(|m| m.contains("planetographic")), "{prj}: {:?}", report.messages);
+    }
+    // An Earth system with longitudes counted west: read as longitude/latitude, saying so, as
+    // before. A projection on such a system is read as before (only another body's is refused).
+    let wgs84 = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    let west = with_axes(wgs84, r#"AXIS["Lon",WEST],AXIS["Lat",NORTH]"#);
+    let path = shapefile(dir.path(), "earth_west", LONLAT, &west);
+    let (ds, report) = io::read_path(&path).unwrap();
+    assert_eq!(points(&ds), LONLAT.map(|(x, y)| Coord::new(x, y)).to_vec());
+    let said = |notes: &[String]| notes.iter().filter(|m| m.contains("west or south") && m.contains("read as longitude/latitude")).count();
+    assert_eq!(said(&report.messages), 1, "{:?}", report.messages);
+    assert!(planetary_notes(&report.messages).is_empty(), "{:?}", report.messages);
+    let src = source::open_path(&path, None).unwrap();
+    assert_eq!(said(&src.info().notes), 1, "{:?}", src.info().notes);
+    let a = 6_378_137.0f64;
+    let earth_metres = LONLAT.map(|(lon, lat)| (a * lon.to_radians(), a * lat.to_radians()));
+    let earth_eqc = eqc_on(&west, "World_Equidistant_Cylindrical");
+    assert!(earth_eqc.contains("WGS_1984") && earth_eqc.contains("WEST"), "{earth_eqc}");
+    let path = shapefile(dir.path(), "earth_eqc_west", earth_metres, &earth_eqc);
+    let (ds, report) = io::read_path(&path).unwrap();
+    for (got, (lon, lat)) in points(&ds).into_iter().zip(LONLAT) {
+        assert!((got.x - lon).abs() < 1e-6 && (got.y - lat).abs() < 1e-6, "{got:?}");
+    }
+    assert!(planetary_notes(&report.messages).is_empty() && said(&report.messages) == 0, "{:?}", report.messages);
+    // In a GeoPackage, on the desktop and in the browser: the same definition, under its own code.
+    let mem =
+        |path: &Path| source::gpkg_mem::GpkgMemSource::open_shared(source::Shared(std::sync::Arc::new(std::fs::read(path).unwrap())), None);
+    let path = geopackage(dir.path(), "ographic", LONLAT, ("IAU_2015", 49901, MARS_OGRAPHIC_ESRI));
+    let e = io::read_path(&path).unwrap_err().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
+    let e = mem(&path).err().unwrap().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
+    let east = with_axes(MARS_OGRAPHIC_ESRI, east_north);
+    let path = geopackage(dir.path(), "ographic_east", LONLAT, ("IAU_2015", 49901, &east));
+    let (ds, report) = io::read_path(&path).unwrap();
+    assert_eq!(points(&ds), LONLAT.map(|(x, y)| Coord::new(x, y)).to_vec());
+    assert_eq!(planetary_notes(&report.messages).len(), 1, "{:?}", report.messages);
+    assert_eq!(planetary_notes(&mem(&path).unwrap().info().notes).len(), 1);
 }
 
 #[test]
@@ -177,8 +313,8 @@ fn geojson_iau_codes_are_read_said_or_refused() {
         assert_eq!(said.len(), 1, "{name}: {:?}", report.messages);
         assert!(!report.messages.iter().any(|m| m.contains("only EPSG codes")), "{name}: {:?}", report.messages);
         // Known only by its code, the layer keeps no system: the notice says what an export writes.
-        assert!(said[0].contains("an export takes its coordinates for WGS 84"), "{said:?}");
-        assert!(said[0].contains("one in a projection projects them as the Earth's"), "{said:?}");
+        assert!(said[0].contains("as only its code says"), "{said:?}");
+        assert!(said[0].contains("exported as if on the Earth"), "{said:?}");
         // In place too.
         let path = dir.path().join("mars.geojson");
         std::fs::write(&path, &text).unwrap();
@@ -429,10 +565,10 @@ fn a_geographic_mars_geotiff_is_its_own_system_not_wgs_84_and_keeps_it_when_writ
             assert_eq!(mars.pixel_at(at), earth.pixel_at(at), "{west}: {at:?}");
             assert!(mars.pixel_at(at).is_some(), "{west}: {at:?}");
         }
-        // Written as a GeoTIFF, it is Mars still, by the keys it came in.
+        // Written as a GeoTIFF, it is Mars still (the keys it came in: below, on a body of its own).
         let again = raster::read_bytes("again.tif", &raster::geotiff::write(&mars, 0).unwrap()).unwrap();
         assert_eq!(again.crs, mars.crs);
-        assert_eq!(again.crs.custom_def().unwrap().geokeys, keys);
+        assert!(again.crs.is_planetary() && again.crs.is_geographic());
         assert_eq!(planetary_notes(&again.lost).len(), 1);
         // A cloud-optimised one, drawn in place, says it as well.
         let cog = raster::cogwrite::write(&mars, 0).unwrap();
@@ -452,6 +588,20 @@ fn a_geographic_mars_geotiff_is_its_own_system_not_wgs_84_and_keeps_it_when_writ
         };
         assert!(layout.lost.is_empty(), "{:?}", layout.lost);
     }
+    // Written back with the keys, axes and citation it came in, as the written file holds them. (On
+    // a body no other test reads, Callisto: the run's table keeps the keys a system first came in.)
+    let citation = "GCS Name = Callisto (2015) - Sphere / Ocentric|Datum = Callisto (2015) - Sphere|Ellipsoid = Callisto (2015) - Sphere|Primem = Reference Meridian|AUnits = degree|";
+    let keys = mars_geographic_keys(citation);
+    let callisto = raster::read_bytes("callisto.tif", &geotiff(-180.0, &keys, &[2_410_300.0, 0.0], citation)).unwrap();
+    assert_eq!(callisto.crs.custom_def().unwrap().proj4, "+proj=longlat +a=2410300 +b=2410300 +no_defs");
+    let written = raster::geotiff::write(&callisto, 0).unwrap();
+    let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(&written)).unwrap();
+    let tag = |dec: &mut tiff::decoder::Decoder<_>, t: u16| dec.find_tag(tiff::tags::Tag::Unknown(t)).unwrap().unwrap();
+    assert_eq!(tag(&mut dec, 34735).into_u16_vec().unwrap(), keys);
+    assert_eq!(tag(&mut dec, 34736).into_f64_vec().unwrap(), [2_410_300.0, 0.0]);
+    assert_eq!(tag(&mut dec, 34737).into_string().unwrap().trim_end_matches('\0'), citation);
+    let again = raster::read_bytes("again.tif", &written).unwrap();
+    assert_eq!((again.crs, again.crs.label()), (callisto.crs, "Callisto (2015) - Sphere / Ocentric".to_string()));
     // Named by its citation, else by its axis (on a body no other test reads: the run's table
     // names a system as it first knew it).
     let named = raster::read_bytes(
@@ -569,6 +719,31 @@ fn a_mars_projection_in_a_geotiff_is_said_or_refused() {
     let r = raster::read_bytes("eqc.tif", &geotiff(-1_000_000.0, &eqc, &[3_396_190.0], "")).unwrap();
     assert!(r.crs.is_planetary() && !r.crs.is_geographic());
     assert_eq!(planetary_notes(&r.lost).len(), 1, "{:?}", r.lost);
+    // A projection of planetographic longitude/latitude, by a citation (GeoTIFF has no key for its
+    // axes, which PROJ makes westings): refused; a planetocentric one is read.
+    let cited_on = |a: f64, key: u16, citation: &str| {
+        let mut keys = eqc.clone();
+        let at = keys.chunks(4).position(|k| k[0] > key).unwrap() * 4;
+        keys.splice(at..at, [key, 34737, citation.len() as u16, 0]);
+        keys[3] += 1;
+        raster::read_bytes("cited.tif", &geotiff(-1_000_000.0, &keys, &[a], citation))
+    };
+    let cited = |key: u16, citation: &str| cited_on(3_396_190.0, key, citation);
+    for (key, citation) in [
+        (2049, "GCS Name = Mars (2015) / Ographic|Datum = Mars (2015)|"),
+        (3073, "Mars (2015) / Ographic / Equirectangular, clon = 0|"),
+        (1026, "Mars_2015_Ographic_Equirectangular_clon0|"),
+    ] {
+        let e = cited(key, citation).unwrap_err().to_string();
+        assert!(e.contains(ANOTHER_BODY) && e.contains("x coordinates may count west"), "{key}: {e}");
+    }
+    for (key, citation) in [(2049, "GCS Name = Mars (2015) - Sphere / Ocentric|"), (3073, "Mars cartographic grid|")] {
+        let r = cited(key, citation).unwrap_or_else(|e| panic!("{key}: {e}"));
+        assert!(r.crs.is_planetary() && planetary_notes(&r.lost).len() == 1, "{key}: {:?}", r.lost);
+    }
+    // On the Earth, such a citation changes nothing.
+    let earth = cited_on(6_378_137.0, 3073, "Ographic test grid|").unwrap();
+    assert!(!earth.crs.is_planetary() && earth.lost.is_empty(), "{:?}", earth.lost);
     // A transformation RustGIS doesn't read (23, the New Zealand Map Grid's): refused on Mars, even
     // where the numbers look like degrees, as they are metres.
     let mut unread = eqc.clone();

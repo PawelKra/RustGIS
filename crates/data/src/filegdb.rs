@@ -212,9 +212,9 @@ fn wkids(t: &[u8], x: &[u8]) -> Vec<(String, u32)> {
 /// The coordinate system Esri data names: by its EPSG or Esri `code` (a WKID), else from its `wkt`,
 /// with the transformer to longitude/latitude. `(None, None)` for longitude/latitude, and for a
 /// system that can't be read, which `report` says; coordinates are then read as longitude/latitude.
-/// Another body's system that can't be read is an error instead: read as longitude/latitude, its
-/// coordinates would be in the wrong place. The File Geodatabase and ArcGIS protocol buffer readers
-/// share it.
+/// Another body's system that can't be read is an error instead, because its coordinates would
+/// land in the wrong place as longitude/latitude. The File Geodatabase and ArcGIS protocol buffer
+/// readers share it.
 pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadReport) -> Result<(Option<Crs>, Option<Transformer>)> {
     use crate::raster::planetary;
     // By its code, else from the WKT.
@@ -240,8 +240,8 @@ pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadRe
                 }
             }
             Err(e) => {
-                if let Some(datum) = crate::raster::wkt::planetary_datum(wkt) {
-                    return Err(DataError::Format(format!("coordinate system: {}", planetary::refused(&format!("the datum {datum}"), &e))));
+                if let Some(refused) = planetary::refused_wkt(wkt, &e) {
+                    return Err(DataError::Format(format!("coordinate system: {refused}")));
                 }
                 report.messages.push(format!("coordinate system: {e}; coordinates are read as longitude/latitude"));
                 (None, None)

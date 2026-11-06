@@ -829,8 +829,8 @@ fn clip(s: &str) -> String {
 /// whatever the axis order of the EPSG definition, as the legacy GeoJSON text says.
 ///
 /// An IAU code (another body's system, as GDAL writes `urn:ogc:def:crs:IAU_2015::49900`) is read
-/// as longitude/latitude with a notice when it is planetocentric; any other is an error, as its
-/// coordinates would be in the wrong place ([`planetary::declared`]).
+/// as longitude/latitude with a notice when it is planetocentric. Any other IAU code is an error,
+/// because its coordinates would land in the wrong place ([`planetary::declared`]).
 pub(crate) fn declared_crs(root: &Map<String, Json>, messages: &mut Vec<String>) -> Result<Option<(Crs, crate::raster::Transformer)>> {
     let Some(decl) = root.get("crs").filter(|v| !v.is_null()) else { return Ok(None) };
     if let Some(name) = decl.get("properties").and_then(|p| p.get("name")).and_then(Json::as_str).filter(|n| n.len() <= CRS_NAME_MAX)
@@ -2250,8 +2250,8 @@ fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: Option<Crs>)
 
 /// Converts a Shapefile's coordinates to longitude/latitude, from the coordinate system in its
 /// `.prj`: `None` for longitude/latitude, or when there's no `.prj` or it isn't understood (said in
-/// the report). Another body's system that can't be read is an error: read as longitude/latitude,
-/// its coordinates would be in the wrong place.
+/// the report). Another body's system that can't be read is an error, because its coordinates
+/// would land in the wrong place as longitude/latitude.
 fn shapefile_crs(prj: Option<&str>, report: &mut ReadReport) -> Result<Option<(Crs, crate::raster::Transformer)>> {
     let Some(prj) = prj else { return Ok(None) };
     let crs = match crate::raster::wkt::read_wkt(prj) {
@@ -2262,8 +2262,8 @@ fn shapefile_crs(prj: Option<&str>, report: &mut ReadReport) -> Result<Option<(C
             c
         }
         Err(e) => {
-            if let Some(datum) = crate::raster::wkt::planetary_datum(prj) {
-                return Err(DataError::Format(format!("the .prj file: {}", planetary::refused(&format!("the datum {datum}"), &e))));
+            if let Some(refused) = planetary::refused_wkt(prj, &e) {
+                return Err(DataError::Format(format!("the .prj file: {refused}")));
             }
             report.messages.push(format!("the .prj file: {e}; coordinates are read as longitude/latitude"));
             return Ok(None);

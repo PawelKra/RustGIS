@@ -369,8 +369,8 @@ impl Crs {
     /// no known shift writes, as `+a`/`+rf` even on WGS 84's axes (SVY21's), and the reading says
     /// so. `+ellps=WGS84` and `+ellps=GRS80` alone need no shift (GRS 80 datums the reader knows
     /// get a null one), nor does a Mercator on Web Mercator's sphere of radius 6378137 m. Written
-    /// back in the same system, positions come back exact. Another body's system has no shift to
-    /// WGS 84 to lack ([`Crs::is_planetary`], said otherwise).
+    /// back in the same system, positions come back exact. False for another body's system
+    /// ([`Crs::is_planetary`]): it has no shift to WGS 84 at all, and its own notice says so.
     pub fn lacks_datum_shift(self) -> bool {
         let Some(def) = self.custom_def().filter(|_| !self.is_planetary()) else { return false };
         let keys: Vec<&str> = def.proj4.split_whitespace().collect();

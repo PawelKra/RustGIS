@@ -76,16 +76,16 @@ impl FgbSource {
         // The code is an EPSG one only when the organization is EPSG (or not given, which means EPSG).
         let epsg_org = h.crs().is_none_or(|c| c.org().is_none_or(|o| o.eq_ignore_ascii_case("epsg")));
         let code = h.crs().map(|c| c.code()).and_then(|c| u32::try_from(c).ok()).filter(|c| *c > 0 && epsg_org);
-        // Another body's system (an IAU organization, or its WKT says so) is said, or refused when
-        // its coordinates aren't longitude/latitude: whenever there's no EPSG code to convert by,
-        // as one RustGIS doesn't know would be read as longitude/latitude.
-        let planetary = match h.crs() {
+        // Another body's system (an IAU organization, or WKT that says so) is said, or refused when
+        // its coordinates aren't longitude/latitude. It is checked whenever there's no EPSG code
+        // RustGIS converts, because an unknown code is read as longitude/latitude too.
+        let other_body = match h.crs() {
             Some(c) if code.and_then(Crs::from_epsg).is_none() => {
                 Reproject::planetary("its coordinate system", c.org(), Some(i64::from(c.code())), c.wkt(), &mut notes)
             }
             _ => None,
         };
-        let reproject = match planetary {
+        let reproject = match other_body {
             Some(r) => r?,
             None => {
                 if !epsg_org && let Some(org) = h.crs().and_then(|c| c.org()) {

@@ -1,25 +1,24 @@
 //! Coordinate systems of other bodies than the Earth (Mars, the Moon, other planets and their
 //! moons), as the IAU defines them: the `IAU_2015` authority of PROJ and GDAL.
 //!
-//! RustGIS has no model of other bodies' coordinates yet (opengeos/RustGIS#1448): every layer is
-//! read as the Earth's longitude/latitude. So a planetary system is only reported, and what its
-//! coordinates mean is left as it was. Such a system has no shift to WGS 84, so its
-//! longitude/latitude pass through the conversion unchanged. A geographic one, or a projected one
-//! RustGIS unprojects, is therefore read with a notice that the map, its scale bar and
-//! measurements take it for the Earth. Where reading it as longitude/latitude would put the data
-//! in the wrong place (metres read as degrees, or longitudes counted west read as east), the data
-//! is refused instead.
+//! RustGIS has no model of other bodies' coordinates yet (opengeos/RustGIS#1448). Every layer is
+//! read as the Earth's longitude/latitude, so a planetary system is only reported:
+//! - Its longitude/latitude, or a projection RustGIS unprojects, are read as they are, with a
+//!   notice that the map, its scale bar and measurements take them for the Earth's. This works
+//!   because such a system has no shift to WGS 84, so the conversion leaves its numbers unchanged.
+//! - Data that would land in the wrong place as longitude/latitude is refused: metres that would
+//!   be read as degrees, or longitudes counted west that would be read as east.
 //!
 //! A system is another body's when:
 //! - its ellipsoid's semi-major axis is outside [`EARTH_SEMI_MAJOR`] (6 350 to 6 400 km). Every
-//!   Earth ellipsoid and sphere in the EPSG and ESRI definitions RustGIS bundles lies inside it (a
-//!   test checks each one), and Venus, the body nearest the Earth in size, has a radius of
+//!   Earth ellipsoid and sphere in the EPSG and ESRI definitions RustGIS bundles lies inside it,
+//!   and a test checks each one. Venus, the body nearest the Earth in size, has a radius of
 //!   6 051.8 km (IAU 2015). This is how a definition is told apart: WKT, a GeoTIFF's keys, a PROJ
-//!   string or PROJJSON;
+//!   string or PROJJSON.
 //! - or, for a system given only by a code, its authority is the IAU's (`IAU_2015`, `IAU`) and the
-//!   code's body isn't the Earth. An IAU 2015 code is the body's NAIF id times 100 plus the kind of
-//!   system ([`IauKind`]): `49900` is Mars (499) as a sphere, longitude/latitude, and `39900` the
-//!   Earth (399).
+//!   code's body isn't the Earth. An IAU 2015 code is the body's NAIF id times 100, plus the kind
+//!   of system ([`IauKind`]). So `49900` is Mars (499) as a sphere in longitude/latitude, and
+//!   `39900` is the Earth (399).
 
 use super::crs::Crs;
 
@@ -34,9 +33,9 @@ pub fn off_earth(semi_major: f64) -> bool {
     semi_major.is_finite() && semi_major > 0.0 && !EARTH_SEMI_MAJOR.contains(&semi_major)
 }
 
-/// The semi-major and semi-minor axes, in metres, that a PROJ definition gives by `+a` or `+R`
-/// (and `+b` or `+rf`; a sphere without them). `None` for one named by `+ellps` or `+datum`: PROJ's
-/// named ellipsoids are all the Earth's.
+/// The semi-major and semi-minor axes, in metres, that a PROJ definition gives by `+a` or `+R`,
+/// and `+b` or `+rf`. Without `+b` or `+rf` it is a sphere. `None` for an ellipsoid named by
+/// `+ellps` or `+datum`, since PROJ's named ellipsoids are all the Earth's.
 pub fn proj4_axes(proj4: &str) -> Option<(f64, f64)> {
     let value = |key: &str| {
         proj4.split_whitespace().take(64).find_map(|t| t.strip_prefix(key)).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
@@ -53,11 +52,11 @@ pub fn proj4_axes(proj4: &str) -> Option<(f64, f64)> {
 /// What the last two digits of an IAU 2015 code say the system is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IauKind {
-    /// Planetocentric longitude/latitude, on the body's sphere (`00`) or ellipsoid (`02`): east
+    /// Planetocentric longitude/latitude, on the body's sphere (`00`) or ellipsoid (`02`). East is
     /// positive.
-    Ocentric,
-    /// Planetographic longitude/latitude (`01`): west positive on most bodies.
-    Ographic,
+    Planetocentric,
+    /// Planetographic longitude/latitude (`01`). West is positive on most bodies.
+    Planetographic,
     /// A projection (`10` and up: equirectangular, sinusoidal, polar stereographic …), in metres.
     Projected,
 }
@@ -77,57 +76,83 @@ pub fn iau_code(authority: &str, code: i64) -> Option<(i64, IauKind)> {
     }
     let body = code / 100;
     let kind = match code % 100 {
-        0 | 2 => IauKind::Ocentric,
-        1 => IauKind::Ographic,
+        0 | 2 => IauKind::Planetocentric,
+        1 => IauKind::Planetographic,
         _ => IauKind::Projected,
     };
     (body != EARTH_NAIF).then_some((body, kind))
 }
 
-/// The notice for data read in a planetary `system` (as named for the reader): its
-/// longitude/latitude are kept, on an Earth map.
+/// The last two digits of a body's first projection in PROJ's `IAU_2015` table.
+const FIRST_PROJECTION: i64 = 10;
+
+/// Whether an IAU code is planetographic longitude/latitude, or a projection of it.
+/// In PROJ's `IAU_2015` table, a body's projections come in groups of three, starting at `…10`,
+/// `…15`, `…20` and so on. The first of a group is on the sphere, the second on the planetographic
+/// system and the third on the ellipsoid. So `49911` and `49916` project Mars's planetographic
+/// longitude/latitude, and PROJ gives them westings.
+pub fn iau_ographic(authority: &str, code: i64) -> bool {
+    match iau_code(authority, code) {
+        Some((_, IauKind::Planetographic)) => true,
+        Some((_, IauKind::Projected)) => code % 100 >= FIRST_PROJECTION && code % 5 == 1,
+        Some((_, IauKind::Planetocentric)) | None => false,
+    }
+}
+
+/// Whether a coordinate system's name says it is planetographic, by a word of its own
+/// (`Mars (2015) / Ographic`, `GCS_Mars_2015_Ographic`, `planetographic`), not one that merely
+/// ends so (`cartographic`).
+pub fn ographic_name(name: &str) -> bool {
+    name.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("ographic") || w.eq_ignore_ascii_case("planetographic"))
+}
+
+/// The notice for data read in another body's coordinate `system`, named as the reader shows it.
+/// Its longitude/latitude are kept as they are, so the map takes them for the Earth's.
 pub fn read_note(system: &str) -> String {
-    format!(
-        "{system} belongs to another body than the Earth: its longitude/latitude are read as they are, but the map, its scale bar and measurements take them for the Earth's"
-    )
+    format!("{system} belongs to another body than the Earth; it is drawn and measured as if on the Earth")
 }
 
-/// [`read_note`] for a system known only by its code: the layer keeps no system (RustGIS has no
-/// definition of the body to give it), so this says up front what an export does, which the
-/// export itself can't tell.
+/// [`read_note`] for a system known only by its code. The layer keeps no system, because RustGIS
+/// has no definition of the body to give it. An export of the layer can't tell, so this notice
+/// says now that exports take the data for the Earth's too.
 pub fn code_note(system: &str) -> String {
-    unkept_note(system, "only its code says so, which the layer doesn't keep")
+    unkept_note(system, "its code")
 }
 
-/// [`code_note`] for a system known by its ellipsoid, in a definition the reader doesn't convert
+/// [`code_note`] for a system known by its ellipsoid, in a definition the reader doesn't keep
 /// (GeoParquet's PROJJSON without an EPSG code).
 pub fn ellipsoid_note(system: &str) -> String {
-    unkept_note(system, "its ellipsoid says so, but the layer doesn't keep its system")
+    unkept_note(system, "its ellipsoid")
 }
 
-fn unkept_note(system: &str, why: &str) -> String {
+/// The notice for a layer that keeps no system, `told_by` naming what said the body.
+fn unkept_note(system: &str, told_by: &str) -> String {
     format!(
-        "{}; {why}: an export takes its coordinates for WGS 84 longitude/latitude, and one in a projection projects them as the Earth's",
-        read_note(system)
+        "{system} belongs to another body than the Earth, as only {told_by} says; it is drawn, measured and exported as if on the Earth"
     )
 }
 
-/// The notice for a layer read in `crs` when it is another body's ([`read_note`]), for the readers
-/// that don't name its datum themselves (rasters).
+/// The notice for a layer read in `crs` when it is another body's ([`read_note`]). It is for the
+/// readers that don't name the datum themselves (rasters).
 pub fn note_of(crs: Crs) -> Option<String> {
     crs.is_planetary().then(|| read_note(&crs.label()))
 }
 
-/// The error for data in a planetary `system` that reading as longitude/latitude would put in the
-/// wrong place, `why` saying how.
+/// The error for data in another body's `system` that would land in the wrong place if read as
+/// longitude/latitude. `why` says what is wrong with it.
 pub fn refused(system: &str, why: &str) -> String {
-    format!(
-        "{system} belongs to another body than the Earth, and {why}: other bodies' coordinate systems aren't read yet, and read as longitude/latitude its coordinates would be in the wrong place"
-    )
+    format!("{system} belongs to another body than the Earth, and {why}; read as longitude/latitude, it would land in the wrong place")
 }
 
-/// Why a projected planetary system given only by a code or a definition a reader doesn't convert
-/// is refused.
+/// The error for a WKT `text` that couldn't be read (`why`) when its datum is another body's.
+/// Read as longitude/latitude instead, as an unreadable Earth system is, its coordinates would
+/// land in the wrong place. `None` for the Earth's.
+pub fn refused_wkt(text: &str, why: &str) -> Option<String> {
+    super::wkt::planetary_datum(text).map(|datum| refused(&format!("the datum {datum}"), why))
+}
+
+/// Why another body's projected system is refused when the reader can't unproject it. That is
+/// when only its code is given, or a definition the reader doesn't convert.
 pub const PROJECTED: &str = "its coordinates are projected, in metres";
 
 /// Why a geodetic system in geocentric X/Y/Z (Cartesian) coordinates is refused.
@@ -151,15 +176,19 @@ fn not_degrees(unit: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Why a planetographic system given only by a code is refused.
+/// Why a planetographic system is refused, unless its axes say its longitudes count east.
 pub const OGRAPHIC: &str = "its planetographic longitudes may count west";
+
+/// Why a projection of planetographic longitude/latitude is refused when its axes don't say x
+/// counts east. PROJ gives such a projection westings.
+pub const OGRAPHIC_PROJECTED: &str = "it is a planetographic projection, so its x coordinates may count west";
 
 /// What a reader that converts only EPSG codes makes of a coordinate system declared some other
 /// way, when it is another body's.
 #[derive(Debug)]
 pub enum Declared {
-    /// Longitude/latitude, read as they are with this notice; with the system itself when a
-    /// definition gave it, to keep as the layer's.
+    /// Longitude/latitude, read as they are with this notice. `crs` is the system itself when a
+    /// definition gave it, for the layer to keep.
     LonLat { note: String, crs: Option<Crs> },
     /// Coordinates that would be in the wrong place as longitude/latitude: the error.
     Refused(String),
@@ -167,8 +196,8 @@ pub enum Declared {
 
 /// A coordinate system declared by `authority` and `code` (a GeoPackage's organization, a
 /// FlatGeobuf header's, a GeoJSON `crs` name's) or by a `wkt` definition, for a reader that
-/// converts only EPSG codes: `None` for the Earth's, or when neither says which body it is on.
-/// The definition goes first: it is what says the body and the axes.
+/// converts only EPSG codes. `None` for the Earth's, or when neither says which body it is on.
+/// The definition goes first, because it is what says the body and the axes.
 pub fn declared(authority: Option<&str>, code: Option<i64>, wkt: Option<&str>) -> Option<Declared> {
     let wkt = wkt.map(str::trim).filter(|w| w.contains('['));
     if let Some(w) = wkt {
@@ -184,8 +213,8 @@ pub fn declared(authority: Option<&str>, code: Option<i64>, wkt: Option<&str>) -
             // The Earth's, whatever the code says.
             Ok(_) => return None,
             Err(e) => {
-                if let Some(datum) = super::wkt::planetary_datum(w) {
-                    return Some(Declared::Refused(refused(&format!("the datum {datum}"), &e)));
+                if let Some(refused) = refused_wkt(w, &e) {
+                    return Some(Declared::Refused(refused));
                 }
             }
         }
@@ -195,18 +224,20 @@ pub fn declared(authority: Option<&str>, code: Option<i64>, wkt: Option<&str>) -
     let (_, kind) = iau_code(authority, code)?;
     let system = format!("{}:{code}", authority.trim());
     Some(match kind {
-        IauKind::Ocentric => Declared::LonLat { note: code_note(&system), crs: None },
-        IauKind::Ographic => Declared::Refused(refused(&system, OGRAPHIC)),
+        IauKind::Planetocentric => Declared::LonLat { note: code_note(&system), crs: None },
+        IauKind::Planetographic => Declared::Refused(refused(&system, OGRAPHIC)),
         IauKind::Projected => Declared::Refused(refused(&system, PROJECTED)),
     })
 }
 
 /// A GeoParquet column's `crs` (PROJJSON) when it is another body's: by its `id` (an IAU code),
 /// else by its ellipsoid's semi-major axis or radius, in metres. GeoParquet's readers convert only
-/// EPSG codes, so only planetocentric longitude/latitude in degrees is read (as it is): a projected
-/// system, geocentric X/Y/Z (a geodetic system's Cartesian coordinates), longitudes counted west or
-/// latitudes south, or longitude/latitude in another unit than degrees (radians, grads), is
-/// refused, whatever its code says.
+/// EPSG codes, so only planetocentric longitude/latitude in degrees is read, as it is. These are
+/// refused, whatever the code says:
+/// - a projected system;
+/// - geocentric X/Y/Z (a geodetic system's Cartesian coordinates);
+/// - longitudes counted west, or latitudes counted south;
+/// - longitude/latitude in another unit than degrees (radians, grads).
 pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
     let id = crs.get("id");
     let authority = id.and_then(|i| i.get("authority")).and_then(serde_json::Value::as_str);
@@ -246,14 +277,14 @@ pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
         // The definition goes before the code: a projected or mirrored system under a
         // planetocentric code is what it says.
         return Some(match iau {
-            IauKind::Ocentric if matches!(kind, Some("ProjectedCRS" | "DerivedProjectedCRS")) => {
+            IauKind::Planetocentric if matches!(kind, Some("ProjectedCRS" | "DerivedProjectedCRS")) => {
                 Declared::Refused(refused(&system, PROJECTED))
             }
-            IauKind::Ocentric => match misread {
+            IauKind::Planetocentric => match misread {
                 Some(why) => Declared::Refused(refused(&system, &why)),
                 None => Declared::LonLat { note: code_note(&system), crs: None },
             },
-            IauKind::Ographic => Declared::Refused(refused(&system, OGRAPHIC)),
+            IauKind::Planetographic => Declared::Refused(refused(&system, OGRAPHIC)),
             IauKind::Projected => Declared::Refused(refused(&system, PROJECTED)),
         });
     }
@@ -280,10 +311,10 @@ pub fn projjson(crs: &serde_json::Value) -> Option<Declared> {
     })
 }
 
-/// Why an export of a layer in planetary system `from` to `to` would write other data than the
-/// layer's, or `None` when it writes the same numbers (perhaps under another system's name, which
-/// [`crate::export_notes`] says). Projected into a system on another ellipsoid (the Earth's, or
-/// another body's), the coordinates would be that body's metres, not the layer's.
+/// Why exporting a layer in another body's system `from` to `to` would write other data than the
+/// layer's. Projected onto another ellipsoid (the Earth's, or another body's), the coordinates
+/// would be metres on that ellipsoid, not the layer's. `None` when the export writes the same
+/// numbers, perhaps under another system's name, which [`crate::export_notes`] says.
 pub fn export_error(from: Crs, to: Crs) -> Option<String> {
     if !from.is_planetary() || to.is_geographic() || from == to {
         return None;
@@ -295,7 +326,7 @@ pub fn export_error(from: Crs, to: Crs) -> Option<String> {
     };
     (!same).then(|| {
         format!(
-            "{} belongs to another body than the Earth, and {} is a projection on another ellipsoid, so its coordinates would be wrong: export it in its own coordinate system, or as longitude/latitude",
+            "{} belongs to another body than the Earth, and {} is on another ellipsoid, so the coordinates would be wrong; export it in its own system or as longitude/latitude",
             from.label(),
             to.label()
         )
@@ -350,9 +381,9 @@ mod tests {
 
     #[test]
     fn iau_codes_by_body_and_kind() {
-        assert_eq!(iau_code("IAU_2015", 49900), Some((499, IauKind::Ocentric)));
-        assert_eq!(iau_code("iau_2015", 49902), Some((499, IauKind::Ocentric)));
-        assert_eq!(iau_code("IAU", 49901), Some((499, IauKind::Ographic)));
+        assert_eq!(iau_code("IAU_2015", 49900), Some((499, IauKind::Planetocentric)));
+        assert_eq!(iau_code("iau_2015", 49902), Some((499, IauKind::Planetocentric)));
+        assert_eq!(iau_code("IAU", 49901), Some((499, IauKind::Planetographic)));
         assert_eq!(iau_code("IAU_2015", 49910), Some((499, IauKind::Projected)));
         assert_eq!(iau_code("IAU_2015", 30135), Some((301, IauKind::Projected)));
         // The Earth's own IAU codes, other authorities and junk aren't another body's.
@@ -362,9 +393,29 @@ mod tests {
         assert_eq!(iau_code("IAU_2015", -49900), None);
         assert_eq!(iau_code("", 49900), None);
         // Only the IAU's own names: not another authority that starts the same.
-        assert_eq!(iau_code(" IAU_2015 ", 49900), Some((499, IauKind::Ocentric)));
+        assert_eq!(iau_code(" IAU_2015 ", 49900), Some((499, IauKind::Planetocentric)));
         for other in ["IAUS", "IAUX", "IAU_", "IAU_15", "IAU_2O15", "IAU_20150"] {
             assert_eq!(iau_code(other, 49910), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn planetographic_codes_and_names() {
+        // Planetographic longitude/latitude and the projections of it, by PROJ's numbering.
+        for code in [49901, 49911, 49916, 49921, 49931, 49991, 30111] {
+            assert!(iau_ographic("IAU_2015", code), "{code}");
+        }
+        // Planetocentric ones, their projections, the Earth's and other authorities' aren't.
+        for code in [49900, 49902, 49910, 49912, 49915, 49917, 49930, 49992, 39901, 39911] {
+            assert!(!iau_ographic("IAU_2015", code), "{code}");
+        }
+        assert!(!iau_ographic("EPSG", 49901));
+        for name in ["Mars (2015) / Ographic", "GCS_Mars_2015_Ographic", "Mars_2015_Ographic_Equirectangular_clon0", "Mars planetographic"]
+        {
+            assert!(ographic_name(name), "{name}");
+        }
+        for name in ["Mars (2015) - Sphere / Ocentric", "Mars cartographic grid", "photographic mosaic", "Ographics", ""] {
+            assert!(!ographic_name(name), "{name}");
         }
     }
 
@@ -387,7 +438,7 @@ mod tests {
         let mars = r#"GEOGCS["Mars (2015) - Sphere / Ocentric",DATUM["Mars (2015) - Sphere",SPHEROID["Mars (2015) - Sphere",3396190,0]],PRIMEM["Reference Meridian",0],UNIT["degree",0.0174532925199433]]"#;
         match declared(Some("NONE"), Some(100_001), Some(mars)) {
             Some(Declared::LonLat { note, crs: Some(crs) }) => {
-                assert!(note.contains("Mars (2015) - Sphere") && note.contains("scale bar"), "{note}");
+                assert!(note.contains("Mars (2015) - Sphere") && note.contains("drawn and measured"), "{note}");
                 assert!(crs.is_planetary() && crs.is_geographic());
             }
             other => panic!("{other:?}"),
@@ -476,9 +527,9 @@ mod tests {
             Some(Declared::LonLat { note, crs: None }) => note,
             other => panic!("{other:?}"),
         };
-        assert!(note(&east).contains("only its code says so"), "{}", note(&east));
+        assert!(note(&east).contains("as only its code says"), "{}", note(&east));
         let by_ellipsoid = note(&sphere("GeographicCRS", "east", "3396190"));
-        assert!(by_ellipsoid.contains("its ellipsoid says so") && !by_ellipsoid.contains("code"), "{by_ellipsoid}");
+        assert!(by_ellipsoid.contains("as only its ellipsoid says") && !by_ellipsoid.contains("code"), "{by_ellipsoid}");
         // EPSG systems, junk and nothing say no body.
         assert!(projjson(&json(r#"{"type":"GeographicCRS","id":{"authority":"EPSG","code":4326}}"#)).is_none());
         assert!(projjson(&json(r#"{"datum":{"ellipsoid":{"radius":"x"}}}"#)).is_none());

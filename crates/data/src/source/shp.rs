@@ -542,8 +542,8 @@ fn shp_reproject(prj: Option<&str>, notes: &mut Vec<String>) -> Result<Reproject
             c
         }
         Some((p, Err(e))) => {
-            if let Some(datum) = crate::raster::wkt::planetary_datum(p) {
-                return Err(DataError::Format(format!("the .prj file: {}", planetary::refused(&format!("the datum {datum}"), &e))));
+            if let Some(refused) = planetary::refused_wkt(p, &e) {
+                return Err(DataError::Format(format!("the .prj file: {refused}")));
             }
             notes.push(format!("the .prj file: {e}; coordinates are read as longitude/latitude"));
             crate::raster::Crs::LonLat

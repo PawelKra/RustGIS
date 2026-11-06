@@ -659,12 +659,14 @@ pub(crate) struct Reproject {
 }
 
 impl Reproject {
-    /// For a reader that converts only EPSG codes, a coordinate system declared without one that is
-    /// another body's, by `authority` and `code` or its `wkt` definition
-    /// ([`crate::raster::planetary::declared`]): its longitude/latitude are read as they are, with
-    /// a note (in the system itself when the definition gives it), and other coordinates are an
-    /// error, as they would be in the wrong place. `None` when it isn't another body's. `what`
-    /// starts the note or error (`its coordinate system (srs_id 49900)`).
+    /// For a reader that converts only EPSG codes: a coordinate system declared without one, by
+    /// `authority` and `code` or by a `wkt` definition, when it is another body's
+    /// ([`crate::raster::planetary::declared`]). `None` when it isn't.
+    /// - Its longitude/latitude are read as they are, with a note. The layer keeps the system when
+    ///   the definition gives it.
+    /// - Other coordinates are an error, because they would land in the wrong place.
+    ///
+    /// `what` starts the note or the error (`its coordinate system (srs_id 49900)`).
     pub(crate) fn planetary(
         what: &str,
         authority: Option<&str>,
@@ -827,11 +829,11 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
         return Ok(Reproject::from_crs(crs, notes));
     }
     let what = format!("its coordinate system (srs_id {srs_id})");
-    // Another body's system that can't be converted is refused when its coordinates aren't
-    // longitude/latitude, by its definition or, without one, its organization and code (an IAU
-    // one): read as longitude/latitude, they would be in the wrong place. One read from its
-    // definition is converted as any other, with its own notice ([`crate::raster::wkt::read_wkt`]).
-    let planetary = |definition: Option<&str>, notes: &mut Vec<String>| {
+    // Another body's system that can't be converted is told by its definition, or without one by
+    // its organization and code (an IAU one). Its longitude/latitude are read with a notice. Other
+    // coordinates are refused, because they would land in the wrong place. A planetary definition
+    // that `read_wkt` reads is converted like any other, with its own notice.
+    let other_body = |definition: Option<&str>, notes: &mut Vec<String>| {
         row.as_ref().and_then(|r| Reproject::planetary(&what, r.organization.as_deref(), r.code, definition, notes))
     };
     // Else the WKT the row defines it with: a custom system, or a code this build doesn't know.
@@ -842,8 +844,8 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
                 crs
             }
             Err(e) => {
-                if let Some(planetary) = planetary(Some(definition), notes) {
-                    return planetary;
+                if let Some(reproject) = other_body(Some(definition), notes) {
+                    return reproject;
                 }
                 notes.push(format!("{what} can't be read ({e}); read as longitude/latitude"));
                 Crs::LonLat
@@ -851,8 +853,8 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
         };
         return Ok(Reproject::from_crs(crs, notes));
     }
-    if let Some(planetary) = planetary(None, notes) {
-        return planetary;
+    if let Some(reproject) = other_body(None, notes) {
+        return reproject;
     }
     if epsg.is_some() {
         // A code this build doesn't know, and no definition to fall back on: said by its code.
