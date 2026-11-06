@@ -1303,14 +1303,20 @@ impl RustGisApp {
             .unwrap_or_else(|| "Meters".into());
         self.ui.measurement_imperial =
             self.services.load_pref.as_ref().and_then(|load| load("measurement_units")).as_deref() == Some("imperial");
-        // The pointer's coordinate format; an unknown or missing one reads as decimal degrees.
-        self.map.coord_format = self
-            .services
-            .load_pref
-            .as_ref()
-            .and_then(|load| load(coordreadout::PREF))
-            .and_then(|code| CoordReadout::from_code(&code))
-            .unwrap_or_default();
+        // The pointer's coordinate format; a missing one reads as decimal degrees. One this
+        // version doesn't know (a newer RustGIS may have saved it) is said and read as decimal
+        // degrees too. It stays saved until the user picks a format (`ui.coordinateFormat`).
+        if let Some(code) = self.services.load_pref.as_ref().and_then(|load| load(coordreadout::PREF)) {
+            match CoordReadout::from_code(&code) {
+                Some(format) => self.map.coord_format = format,
+                None => {
+                    // Notices are shown as written, and the language is set only in `start`.
+                    i18n::set_current(self.chosen_lang());
+                    self.session
+                        .notify(tl!("The saved coordinate format isn't known to this version, so decimal degrees are shown."), false);
+                }
+            }
+        }
         // The GPU map backend: RUSTGIS_GPU forces it on, else the saved preference.
         self.map.gpu_enabled = std::env::var_os("RUSTGIS_GPU").is_some()
             || self.services.load_pref.as_ref().and_then(|load| load("ui.map.gpu")).as_deref() == Some("1");

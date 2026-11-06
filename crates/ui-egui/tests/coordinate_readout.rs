@@ -41,14 +41,48 @@ fn the_format_cycles_persists_and_is_restored() {
         assert!(app.run("ui.coordinateFormat", bad.clone()).is_err(), "{bad}");
         assert_eq!(app.map.coord_format, CoordReadout::Mgrs, "{bad}");
     }
-    // A saved choice comes back; an unknown one reads as decimal degrees.
-    for (pref, want) in [("utm", CoordReadout::Utm), ("mgrs", CoordReadout::Mgrs), ("bogus", CoordReadout::Decimal)] {
+    // A saved choice comes back, with nothing to say.
+    for (pref, want) in [("utm", CoordReadout::Utm), ("mgrs", CoordReadout::Mgrs)] {
         let restored = RustGisApp::with_sample().with_services(Services {
             load_pref: Some(Box::new(move |k| (k == "coordinate_format").then(|| pref.to_string()))),
             ..Services::default()
         });
         assert_eq!(restored.map.coord_format, want, "{pref}");
+        assert!(!said_unknown(&restored), "{pref}");
     }
+}
+
+fn said_unknown(app: &RustGisApp) -> bool {
+    app.session.notices.iter().any(|n| n.text.contains("saved coordinate format isn't known"))
+}
+
+#[test]
+fn an_unknown_saved_format_is_said_and_kept_until_the_user_picks_one() {
+    let saved = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let writes = saved.clone();
+    let app = RustGisApp::with_sample().with_services(Services {
+        load_pref: Some(Box::new(|k| (k == "coordinate_format").then(|| "lambert".to_string()))),
+        save_pref: Some(Box::new(move |k, v| writes.lock().unwrap_or_else(|e| e.into_inner()).push((k.to_string(), v.to_string())))),
+        ..Services::default()
+    });
+    let format_writes =
+        || saved.lock().unwrap().iter().filter(|(k, _)| k == "coordinate_format").map(|(_, v)| v.clone()).collect::<Vec<_>>();
+    // Read as decimal degrees, and said once.
+    assert_eq!(app.map.coord_format, CoordReadout::Decimal);
+    assert_eq!(app.session.notices.iter().filter(|n| n.text.contains("saved coordinate format isn't known")).count(), 1);
+    // Frames drawn and another setting saved leave the stored format alone.
+    let mut h = harness(app);
+    hover_map(&mut h);
+    h.state_mut().run("ui.measurementUnits", json!({"units": "imperial"})).unwrap();
+    hover_map(&mut h);
+    assert!(saved.lock().unwrap().iter().any(|(k, _)| k == "measurement_units"));
+    assert!(format_writes().is_empty(), "{:?}", format_writes());
+    // A click on the readout is the user's choice: it is saved.
+    let decimal = rustgis_engine::geom::format_lonlat(h.state().map.pointer_lonlat.expect("the pointer is over the map"));
+    h.get_by_label(&decimal).click();
+    hover_map(&mut h);
+    assert_eq!(h.state().map.coord_format, CoordReadout::Dms);
+    assert_eq!(format_writes(), ["dms"]);
 }
 
 /// Points the mouse at the middle of the window, over the map, for a few frames.

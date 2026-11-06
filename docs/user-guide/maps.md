@@ -157,7 +157,8 @@ Stereographic grid, which RustGIS doesn't have: there the readout shows *No UTM 
 *No MGRS here*) rather than a wrong reference, and so it does on the map of another body than
 the Earth, where degrees still read. Scripts set the format with
 `ui.coordinateFormat={"format":"utm"}` (`decimal`, `dms`, `utm` or `mgrs`); without `format`
-it steps to the next one.
+it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
+reads as decimal degrees with a notice, and stays saved until you pick a format.
 
 The [search box](#navigating) takes the same grid references, in any case:
 
