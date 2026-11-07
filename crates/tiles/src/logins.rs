@@ -90,14 +90,58 @@ struct Redaction {
     encoded: bool,
 }
 
-fn entries() -> MutexGuard<'static, BTreeMap<String, Entry>> {
+fn registry() -> &'static Mutex<BTreeMap<String, Entry>> {
     static ENTRIES: OnceLock<Mutex<BTreeMap<String, Entry>>> = OnceLock::new();
-    ENTRIES.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
+    ENTRIES.get_or_init(Mutex::default)
+}
+
+fn entries() -> MutexGuard<'static, BTreeMap<String, Entry>> {
+    registry().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An exact runtime snapshot of one session's login generations, including their absence.
+/// It contains no credential and is never a display or persistence representation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountIdentity {
+    session: u64,
+    entries: Vec<(String, String, Method)>,
+}
+
+/// Captures only the initiating session's runtime bindings. Other sessions cannot invalidate it.
+/// Approval capture must fail closed when the runtime registry cannot be read consistently.
+pub fn account_identity(session: u64) -> Result<AccountIdentity, &'static str> {
+    let entries = registry().lock().map_err(|_| "The service login identity is unavailable.")?;
+    let entries = entries
+        .iter()
+        .filter(|(_, entry)| entry.owner.split_once('/').is_some_and(|(s, _)| s.parse::<u64>() == Ok(session)))
+        .map(|(binding, entry)| (binding.clone(), entry.origin.clone(), entry.method.clone()))
+        .collect();
+    Ok(AccountIdentity { session, entries })
+}
+
+impl AccountIdentity {
+    /// Poison or any change to this session's active binding generations refuses later work.
+    pub fn is_current(&self) -> bool {
+        account_identity(self.session).is_ok_and(|current| current == *self)
+    }
 }
 
 /// Installs a fresh session/connection login generation. Only addresses bound to the returned
 /// token can use it. Callers revoke their previous generation explicitly.
 pub fn activate(origin: &str, owner: &str, method: Method, value: &str, insecure: bool) -> Result<String, &'static str> {
+    activate_with_random(origin, owner, method, value, insecure, fill_random)
+}
+
+/// Validates the login before requesting entropy, then installs a fresh binding and its active
+/// output redactions together; failed validation or entropy leaves the registry unchanged.
+fn activate_with_random(
+    origin: &str,
+    owner: &str,
+    method: Method,
+    value: &str,
+    insecure: bool,
+    mut random: impl FnMut(&mut [u8; 16]) -> Result<(), &'static str>,
+) -> Result<String, &'static str> {
     rustgis_data::login_address::set_validator(check);
     if self::origin(origin).as_deref() != Some(origin) {
         return Err("A login requires a canonical HTTP or HTTPS origin.");
@@ -118,12 +162,21 @@ pub fn activate(origin: &str, owner: &str, method: Method, value: &str, insecure
         && !payload.is_empty()
     {
         add_redactions(&mut redactions, payload);
+        // A server may echo the raw Basic password rather than its wire encoding. The complete
+        // header was bounded above, so decoding cannot allocate beyond that input's size.
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(payload)
+            && let Ok(decoded) = std::str::from_utf8(&decoded)
+            && let Some((_, password)) = decoded.split_once(':')
+            && !password.is_empty()
+        {
+            add_redactions(&mut redactions, password);
+        }
     }
     let mut entries = entries();
     // A token is the only thing that scopes a bound address to its login, so it is random. A
     // collision (never expected at 128 bits) is retried rather than replacing a live login.
     for _ in 0..4 {
-        let binding = random_token()?;
+        let binding = random_token(&mut random)?;
         if !entries.contains_key(&binding) {
             entries.insert(
                 binding.clone(),
@@ -136,42 +189,16 @@ pub fn activate(origin: &str, owner: &str, method: Method, value: &str, insecure
 }
 
 /// 128 unpredictable bits as 32 lower-case hex digits.
-fn random_token() -> Result<String, &'static str> {
+fn random_token(random: &mut impl FnMut(&mut [u8; 16]) -> Result<(), &'static str>) -> Result<String, &'static str> {
     let mut bytes = [0u8; 16];
-    fill_random(&mut bytes)?;
+    random(&mut bytes)?;
     Ok(format!("{:032x}", u128::from_be_bytes(bytes)))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+// The browser backend calls globalThis.crypto.getRandomValues (windows and workers), catching
+// missing APIs and exceptions. No binding is installed if the secure source fails.
 fn fill_random(bytes: &mut [u8; 16]) -> Result<(), &'static str> {
     getrandom::fill(bytes).map_err(|_| "No random numbers are available for a login binding.")
-}
-
-/// The browser build has no operating-system generator here (`getrandom` is a native-only
-/// dependency of this crate). It mixes the per-process keys of `std`'s `RandomState`, a counter,
-/// the clock and a stack address. On `wasm32-unknown-unknown` those keys may be fixed, so this is
-/// unique but not unpredictable: the browser build has one session, with no other session to
-/// guess a token against.
-#[cfg(target_arch = "wasm32")]
-fn fill_random(bytes: &mut [u8; 16]) -> Result<(), &'static str> {
-    use std::{
-        hash::{BuildHasher, Hasher},
-        sync::atomic::{AtomicU64, Ordering},
-    };
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let marker = 0u8;
-    let state = std::collections::hash_map::RandomState::new();
-    for (salt, half) in bytes.chunks_mut(8).enumerate() {
-        let mut hasher = state.build_hasher();
-        hasher.write_u64(count);
-        hasher.write_u128(nanos);
-        hasher.write_usize(std::ptr::addr_of!(marker) as usize);
-        hasher.write_usize(salt);
-        half.copy_from_slice(&hasher.finish().to_be_bytes());
-    }
-    Ok(())
 }
 
 fn add_redactions(redactions: &mut Vec<Redaction>, value: &str) {
@@ -279,10 +306,28 @@ fn append_percent_encoded(result: &mut String, value: &str) {
 /// Redacts active raw credentials, percent-encoded credentials (with either hex case), and
 /// the bare Base64 payload of Basic credentials. Matching the original input in one pass
 /// prevents overlapping values or a credential resembling `[redacted]` from leaking secrets.
+/// Matching covers every active login in this process; short passwords can replace ordinary
+/// text in another session's output. Revoked credentials are not retained for redaction.
 pub fn scrub(text: &str) -> String {
     let entries = entries();
+    if entries.is_empty() && !text.contains(rustgis_data::login_address::PREFIX) {
+        return text.to_string();
+    }
     let mut patterns: Vec<_> = entries.values().flat_map(|entry| &entry.redactions).collect();
     patterns.sort_unstable_by_key(|pattern| std::cmp::Reverse(pattern.value.expose().len()));
+    scrub_patterns(text, &patterns)
+}
+
+/// Cleans generated error text before active values can obscure its address syntax.
+/// Runtime request bindings and successful data values must not use this output projection.
+pub fn scrub_error(text: &str) -> String {
+    let unbound = scrub_patterns(text, &[]);
+    let (public, _) = rustgis_data::address::scrub_addresses(&unbound);
+    scrub(&public)
+}
+
+/// Removes runtime capability headers and the supplied active patterns in one pass.
+fn scrub_patterns(text: &str, patterns: &[&Redaction]) -> String {
     // Strip capabilities even after revocation, when there are no active credential patterns.
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
@@ -432,6 +477,7 @@ mod tests {
 
     #[test]
     fn http_requires_permission_and_bindings_reject_scheme_host_and_port_changes() {
+        let _turn = crate::cache::turn();
         assert!(activate("http://insecure-login.test", "http", Method::Header("X-Key".into()), "short", false).is_err());
         let binding = activate("https://scoped-login.test", "scope", Method::Header("X-Key".into()), "scope-secret", false).unwrap();
         let bound = bind(&binding, "https://scoped-login.test/tile").unwrap();
@@ -447,6 +493,7 @@ mod tests {
 
     #[test]
     fn bindings_isolate_connections_and_revoke_generations() {
+        let _turn = crate::cache::turn();
         let target = "https://binding-login.example";
         let a = activate(target, "session-a/connection", Method::Header("X-Key".into()), "a", false).unwrap();
         let b = activate(target, "session-b/connection", Method::Header("X-Key".into()), "b", false).unwrap();
@@ -465,21 +512,63 @@ mod tests {
     }
 
     #[test]
-    fn bindings_are_long_distinct_and_not_a_sequence() {
-        let target = "https://token-login.example";
-        let tokens: Vec<String> = (0..8).map(|_| activate(target, "token", Method::Header("X-Key".into()), "k", false).unwrap()).collect();
-        let distinct: std::collections::BTreeSet<_> = tokens.iter().collect();
-        assert_eq!(distinct.len(), tokens.len());
-        for t in &tokens {
-            assert_eq!(t.len(), 32);
-            assert!(t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-            assert!(bind(t, &format!("{target}/tile")).is_ok());
+    fn failed_random_source_installs_nothing_and_preserves_a_live_login() {
+        let _turn = crate::cache::turn();
+        let target = "https://random-failure-login.example";
+        let old = activate(target, "random-replacement", Method::Header("X-Key".into()), "old-credential", false).unwrap();
+        let address = bind(&old, &format!("{target}/tile")).unwrap();
+        for owner in ["random-first-login", "random-replacement"] {
+            let mut attempts = 0;
+            let result = activate_with_random(target, owner, Method::Header("X-Key".into()), "failed-credential", false, |bytes| {
+                attempts += 1;
+                // Even a source that writes before failing must never activate those bytes.
+                bytes.fill(0x21);
+                Err("No random numbers are available for a login binding.")
+            });
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+            let expected = usize::from(owner == "random-replacement");
+            assert_eq!(entries().values().filter(|entry| entry.owner == owner).count(), expected);
+            assert_eq!(apply(&address).unwrap().unwrap().header.unwrap().1, "old-credential");
         }
-        let value = |t: &String| u128::from_str_radix(t, 16).unwrap();
-        assert!(tokens.windows(2).all(|w| value(&w[1]).wrapping_sub(value(&w[0])) != 1));
-        for t in &tokens {
-            assert!(deactivate(t));
-        }
+        assert!(deactivate(&old));
+    }
+
+    #[test]
+    fn collisions_retry_without_overwriting_and_exhaust_after_four_attempts() {
+        let _turn = crate::cache::turn();
+        let target = "https://collision-login.example";
+        let method = || Method::Header("X-Key".into());
+        let old = activate_with_random(target, "collision-old", method(), "old-key", false, |bytes| {
+            bytes.fill(0x3c);
+            Ok(())
+        })
+        .unwrap();
+        let old_address = bind(&old, &format!("{target}/tile")).unwrap();
+        let mut attempts = 0;
+        let next = activate_with_random(target, "collision-new", method(), "new-key", false, |bytes| {
+            attempts += 1;
+            bytes.fill(if attempts == 1 { 0x3c } else { 0x7a });
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        let next_address = bind(&next, &format!("{target}/tile")).unwrap();
+        assert_eq!(apply(&old_address).unwrap().unwrap().header.unwrap().1, "old-key");
+        assert_eq!(apply(&next_address).unwrap().unwrap().header.unwrap().1, "new-key");
+
+        attempts = 0;
+        let result = activate_with_random(target, "collision-exhausted", method(), "failed-key", false, |bytes| {
+            attempts += 1;
+            bytes.fill(0x3c);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), "The service login binding could not be created.");
+        assert_eq!(attempts, 4);
+        assert!(!entries().values().any(|entry| entry.owner == "collision-exhausted"));
+        assert_eq!(apply(&old_address).unwrap().unwrap().header.unwrap().1, "old-key");
+        assert!(deactivate(&old));
+        assert!(deactivate(&next));
     }
 
     #[test]
@@ -494,12 +583,55 @@ mod tests {
         }
     }
 
+    /// Identity includes an empty session and ignores a different session with a shared prefix.
+    #[test]
+    fn runtime_identity_binds_session_generations_and_absence() {
+        let _turn = crate::cache::turn();
+        let session = 9_150_001;
+        let empty = account_identity(session).unwrap();
+        assert!(empty.is_current());
+        let unrelated =
+            activate("https://identity-login.example", "91500010/other", Method::Header("X-Key".into()), "synthetic-identity-other", false)
+                .unwrap();
+        assert!(empty.is_current());
+        let binding = activate(
+            "https://identity-login.example",
+            "9150001/connection",
+            Method::Header("X-Key".into()),
+            "synthetic-identity-first",
+            false,
+        )
+        .unwrap();
+        assert!(!empty.is_current());
+        let active = account_identity(session).unwrap();
+        assert!(active.is_current() && active == account_identity(session).unwrap());
+        assert!(deactivate(&unrelated));
+        assert!(active.is_current());
+        assert!(deactivate(&binding));
+        assert!(!active.is_current());
+        let replacement = activate(
+            "https://identity-login.example",
+            "9150001/connection",
+            Method::Header("X-Key".into()),
+            "synthetic-identity-first",
+            false,
+        )
+        .unwrap();
+        assert!(active != account_identity(session).unwrap(), "same credential is a new generation");
+        assert!(deactivate(&replacement));
+    }
+
     #[test]
     fn scrubs_header_and_basic_payload() {
-        let value = basic("scrub-user", "scrub-password");
+        let _turn = crate::cache::turn();
+        let password = "scrub-password: /é";
+        let value = basic("scrub-user", password);
         let binding = activate("https://scrub-login.example", "scrub", Method::Header("Authorization".into()), &value, false).unwrap();
         let payload = value.strip_prefix("Basic ").unwrap();
         assert_eq!(scrub(&format!("{value} {payload} {}", percent_encode(&value))), "[redacted] [redacted] [redacted]");
+        assert_eq!(scrub(&format!("server echoed {password} {}", percent_encode(password))), "server echoed [redacted] [redacted]");
+        assert_eq!(scrub("scrub-user"), "scrub-user");
+        assert_eq!(scrub("a clean server message"), "a clean server message");
         let url = bind(&binding, "https://scrub-login.example/tile").unwrap();
         assert!(!scrub(&format!("failed: {url}")).contains(rustgis_data::login_address::PREFIX));
         assert_eq!(format!("{:?}", apply(&url).unwrap().unwrap()), "Applied(<redacted>)");

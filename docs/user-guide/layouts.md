@@ -56,9 +56,13 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     alike, such as a context layer filling the frame, isn't worth a warning); two that overlap (a
     frame too small) are said too.
     The top visible raster gets a colorbar beneath the vector legend if its renderer has a colour
-    scale; RGB and untinted hillshade do not. If the legend or colorbar cannot fit, the result
-    warns about clipping or resizing. A streamed layer still loading gets a fixed-size legend
-    to adjust by hand.
+    scale; RGB and untinted hillshade do not. The legend takes the fewest columns, up to three,
+    that fit the largest rectangle the map leaves free; when none fits, a long one is laid in more
+    when that shows more of it, or as much while covering at least a quarter less of what the map
+    draws (the answer's `legendColumns`); in a side column it stays in one. Polygon layers with no
+    fill and no labels, such as neighbouring borders, don't count as what the map draws here, unless
+    nothing else is shown. If the legend or colorbar cannot fit, the result warns about clipping or
+    resizing. A streamed layer still loading gets a fixed-size legend to adjust by hand.
   - **Decimal comma**: `"decimal": ","` prints the graticule, scale bar and colorbar numbers and
     `{scale}` with a decimal comma and points between thousands (`0,05`, `1:6.300.000`).
     `layout.page={"decimal": ","}` sets it on any layout; `"."` restores decimal points.
@@ -151,8 +155,10 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   properties pick its **Style** (classic arrow, compass rose, triangle or star) and its **Fill**
   and **Outline** colours (`"style":"compass","fill":"#B91C1C"`). A scale bar's pick its
   **Style** (alternating bar, stepped line or single line), its **Units** (metres or kilometres
-  to suit the scale, or kilometres, metres, miles or feet) and its **Divisions** (1 to 10), each
-  labelled where there is room (`"style":"line","units":"miles","divisions":2`). A legend's
+  to suit the scale, or kilometres, metres, miles or feet), its **Divisions** (1 to 10), each
+  labelled where there is room, its **Color** (the lines, the dark divisions and the labels) and
+  its **Fill** (the alternating bar's light divisions)
+  (`"style":"line","units":"miles","divisions":2,"color":"#1F4E79"`). A legend's
   parts:
   - **What a legend lists**: what its frame draws: only layers with a feature at the frame's
     scale (through their definition query, display filters and scale range) and, for Unique
@@ -164,6 +170,14 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     (`"allClasses": true`) to list every class of every visible layer instead, and **Hide other
     values** (`"hideOther": true`) to leave `<all other values>` out of the legend in either
     mode (the features it stands for are still drawn).
+  - **Columns** (`"columns"`, 1 to 3): its rows side by side under its title, as even as they go,
+    each column as wide as its widest row, with its own column of symbols, and a layer's name
+    staying with the row under it. The box keeps its size, so widen it for the columns: in a box
+    too narrow they close up and long labels run into the next or past the box, and a box too
+    short fills each column in turn and leaves out the last rows.
+    Giving `"columns"`, or changing the box or what a legend in columns lists, says when its box
+    loses rows or closes the columns up. A legend in one column is told so only when given
+    `"columns"`.
   - **Point symbols**: a point layer's symbol is drawn as the map draws it: its marker or the
     stacked marks of its class or layer, its size and outline, the transparency of the layer and
     its groups, and its reference scale at the frame's scale, unturned. A row has one symbol, so
@@ -203,6 +217,11 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   rounded corners (`"radius"`, in mm), and a line's colour, width, arrowheads and angle. From a
   command:
   `layout.addElement={"kind":"line","dir":"falling","color":"#C0392B","width":2}`.
+  A colour goes only to the elements that draw it, and is refused for the others. `color` is a
+  text's, a line's, an arrow's or a scale bar's, and sets a shape's outline unless `outline` is
+  also given; when adding, it is also an extent indicator's or a grid's. `fill` is a north
+  arrow's, a shape's or a scale bar's, and `outline` a north arrow's or a shape's. A legend,
+  picture, table and the like take none.
 - **Arrows**: **Arrow** adds an arrow pointing right. Drag the round handle above a selected arrow
   or line to turn it about its centre: it snaps to level, upright and diagonal within 3°, and
   **Shift** turns it in 15° steps. **Angle** in its properties sets it exactly (0° points right,
@@ -292,6 +311,10 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `layout.export` accepts `dpi` and `"allPages": false` for just the current PDF
   page. **Print** opens the PDF in the system viewer on desktop; **Save Layout File** and
   **Import Layout** move layouts between projects (`.rgislayout`).
+- **Capture To Clipboard** copies an image of the current page at 192 dpi, with any text still being
+  typed. A page that would pass 16 million pixels, or 12,000 pixels on a side, is copied at a lower
+  dpi, and the notice says so; a page that would need less than 36 dpi is too large to copy, so
+  export it instead.
 
 ## Reports
 

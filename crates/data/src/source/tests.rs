@@ -306,6 +306,112 @@ fn whole_reads_by_chunk_stay_within_the_memory_budget() {
     }
 }
 
+/// A GeoParquet column in another body's system (PROJJSON, as PROJ writes IAU_2015) is read as
+/// its longitude/latitude with a notice, refused when its coordinates are projected or count west,
+/// and an EPSG one says nothing of bodies.
+#[test]
+fn geoparquet_planetary_systems_are_said_or_refused() {
+    let d = dir().join("parquet-planetary");
+    std::fs::create_dir_all(&d).unwrap();
+    let body = |m: &String| m.contains("belongs to another body than the Earth");
+    let mars = |kind: &str, code: u32, lon: &str| {
+        format!(
+            r#"["Point"],"crs":{{"type":"{kind}","name":"Mars (2015)","datum":{{"type":"GeodeticReferenceFrame","name":"Mars (2015) - Sphere","ellipsoid":{{"name":"Mars (2015) - Sphere","radius":3396190}}}},"coordinate_system":{{"subtype":"ellipsoidal","axis":[{{"name":"Geodetic latitude","direction":"north","unit":"degree"}},{{"name":"Geodetic longitude","direction":"{lon}","unit":"degree"}}]}},"id":{{"authority":"IAU","version":2015,"code":{code}}}}}"#
+        )
+    };
+    let p = d.join("mars.parquet");
+    write_parquet_typed(&p, false, &mars("GeographicCRS", 49900, "east"));
+    let src = open_path(&p, None).unwrap();
+    assert_eq!(src.info().notes.iter().filter(|m| body(m)).count(), 1, "{:?}", src.info().notes);
+    assert!(!src.info().notes.iter().any(|m| m.contains("no EPSG code")), "{:?}", src.info().notes);
+    let (ds, _) = materialize(src.as_ref()).unwrap();
+    assert_eq!(
+        ds.features.iter().filter_map(|f| f.geometry.as_ref()?.label_point()).collect::<Vec<_>>(),
+        points().iter().map(|p| p.0).collect::<Vec<_>>()
+    );
+    // The definition goes before the code: a projected or mirrored one under a planetocentric
+    // code is refused too.
+    for (kind, code, lon, why) in [
+        ("ProjectedCRS", 49910, "east", "metres"),
+        ("GeographicCRS", 49901, "west", "west"),
+        ("ProjectedCRS", 49900, "east", "metres"),
+        ("GeographicCRS", 49900, "west", "west"),
+    ] {
+        write_parquet_typed(&p, false, &mars(kind, code, lon));
+        let e = open_path(&p, None).err().unwrap().to_string();
+        assert!(e.contains("belongs to another body than the Earth") && e.contains(why), "{kind} {code} {lon}: {e}");
+    }
+    let no_id = |s: String| s.replace(r#","id":{"authority":"IAU","version":2015,"code":49900}"#, "");
+    // Latitudes counted south, by code or by ellipsoid.
+    for crs in [mars("GeographicCRS", 49900, "east"), no_id(mars("GeographicCRS", 49900, "east"))] {
+        write_parquet_typed(&p, false, &crs.replace(r#""direction":"north""#, r#""direction":"south""#));
+        let e = open_path(&p, None).err().unwrap().to_string();
+        assert!(e.contains("belongs to another body than the Earth") && e.contains("south"), "{e}");
+    }
+    // By its ellipsoid alone (no IAU code): said by the ellipsoid, not by a code it hasn't; and an
+    // Earth one.
+    write_parquet_typed(&p, false, &no_id(mars("GeographicCRS", 49900, "east")));
+    let notes = open_path(&p, None).unwrap().info().notes.clone();
+    let said: Vec<&String> = notes.iter().filter(|m| body(m)).collect();
+    assert_eq!(said.len(), 1, "{notes:?}");
+    assert!(said[0].contains("as only its ellipsoid says") && !said[0].contains("code"), "{said:?}");
+    write_parquet_typed(&p, false, r#"["Point"],"crs":{"type":"GeographicCRS","name":"WGS 84","id":{"authority":"EPSG","code":4326}}"#);
+    assert!(open_path(&p, None).unwrap().info().notes.is_empty());
+
+    // Its coordinate system's own axes, by code or by ellipsoid: geocentric X/Y/Z, and
+    // longitude/latitude in another unit than degrees, would be read as degrees, so are refused.
+    let axes = |kind: &str, id: &str, cs: &str| {
+        format!(
+            r#"["Point"],"crs":{{"type":"{kind}","name":"Mars (2015)","datum":{{"type":"GeodeticReferenceFrame","name":"Mars (2015) - Sphere","ellipsoid":{{"name":"Mars (2015) - Sphere","radius":3396190}}}},"coordinate_system":{cs}{id}}}"#
+        )
+    };
+    const IAU: &str = r#","id":{"authority":"IAU","version":2015,"code":49900}"#;
+    let lonlat = |lat: &str, lon: &str| {
+        format!(
+            r#"{{"subtype":"ellipsoidal","axis":[{{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":{lat}}},{{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":{lon}}}]}}"#
+        )
+    };
+    let xyz = r#"{"subtype":"Cartesian","axis":[{"name":"Geocentric X","abbreviation":"X","direction":"geocentricX","unit":"metre"},{"name":"Geocentric Y","abbreviation":"Y","direction":"geocentricY","unit":"metre"},{"name":"Geocentric Z","abbreviation":"Z","direction":"geocentricZ","unit":"metre"}]}"#;
+    let grad = r#"{"type":"AngularUnit","name":"grad","conversion_factor":0.015707963267949}"#;
+    let degree = r#"{"type":"AngularUnit","name":"degree","conversion_factor":0.0174532925199433}"#;
+    for id in ["", IAU] {
+        for (kind, cs, why) in [
+            ("GeodeticCRS", xyz.to_string(), "geocentric X/Y/Z"),
+            ("GeographicCRS", lonlat(r#""radian""#, r#""radian""#), "in radian, not degrees"),
+            ("GeographicCRS", lonlat(r#""degree""#, grad), "in grad, not degrees"),
+        ] {
+            write_parquet_typed(&p, false, &axes(kind, id, &cs));
+            let e = open_path(&p, None).err().unwrap().to_string();
+            assert!(e.contains("belongs to another body than the Earth") && e.contains(why), "{kind} {id}: {e}");
+            let bytes = std::fs::read(&p).unwrap();
+            assert!(open_bytes("mars.parquet", bytes, None).err().unwrap().to_string().contains(why), "{kind} {id}");
+        }
+        // Degrees, by name or by factor; a geodetic system on ellipsoidal or spherical axes; and an
+        // ellipsoidal height in metres: read, with the notice.
+        let height = lonlat(r#""degree""#, r#""degree""#)
+            .replace("]}", r#",{"name":"Ellipsoidal height","abbreviation":"h","direction":"up","unit":"metre"}]}"#);
+        for (kind, cs) in [
+            ("GeodeticCRS", lonlat(r#""degree""#, r#""degree""#)),
+            ("GeodeticCRS", lonlat(r#""degree""#, r#""degree""#).replace("ellipsoidal", "spherical")),
+            ("GeographicCRS", lonlat(degree, r#"{"name":"degree"}"#)),
+            ("GeographicCRS", lonlat(r#""Degree""#, r#""deg""#)),
+            ("GeographicCRS", height),
+        ] {
+            write_parquet_typed(&p, false, &axes(kind, id, &cs));
+            let src = open_path(&p, None).unwrap_or_else(|e| panic!("{kind} {cs} {id}: {e}"));
+            assert_eq!(src.info().notes.iter().filter(|m| body(m)).count(), 1, "{kind} {cs} {id}: {:?}", src.info().notes);
+            let (ds, _) = materialize(src.as_ref()).unwrap();
+            assert_eq!(ds.features.len(), points().len());
+        }
+    }
+    // An Earth system, in radians or as X/Y/Z, says nothing of bodies (it is read as before).
+    for cs in [lonlat(r#""radian""#, r#""radian""#), xyz.to_string()] {
+        write_parquet_typed(&p, false, &axes("GeographicCRS", "", &cs).replace("3396190", "6378137"));
+        let notes = open_path(&p, None).unwrap().info().notes.clone();
+        assert!(!notes.iter().any(body), "{notes:?}");
+    }
+}
+
 #[test]
 fn geoparquet_with_and_without_a_covering() {
     let d = dir();
@@ -369,6 +475,38 @@ fn geoparquet_refuses_invalid_column_ranges() {
             assert!(matches!(open_url_blocking(&url), Err(DataError::Format(_))));
         }
     }
+}
+
+/// A dictionary page whose header says it holds two billion values is refused before the `parquet`
+/// crate makes room for them (64 GB for a binary column; fuzzing, #1498). The page patched is the
+/// file's last column chunk, so no other chunk moves.
+#[test]
+fn geoparquet_refuses_dictionary_counts_its_page_cannot_hold() {
+    use ::parquet::file::reader::{FileReader, SerializedFileReader};
+    let path = dir().join("dictionary-count.parquet");
+    write_parquet(&path, false);
+    let original = std::fs::read(&path).unwrap();
+    assert!(crate::io::read_layers("x.parquet", &original).is_ok());
+    let md = SerializedFileReader::new(bytes::Bytes::copy_from_slice(&original)).unwrap().metadata().clone();
+    let mut groups = md.row_groups().to_vec();
+    let last = groups.len() - 1;
+    let mut cols = groups[last].columns().to_vec();
+    let geometry = cols.len() - 1;
+    let start = cols[geometry].dictionary_page_offset().unwrap() as usize;
+    // In the page header, the dictionary page header (field 7, a struct) and its first field, the
+    // count (an i32 varint).
+    let at = start + original[start..].windows(2).position(|w| w == [0x4c, 0x15]).unwrap() + 2;
+    let end = at + original[at..].iter().position(|b| b & 0x80 == 0).unwrap() + 1;
+    let count = [0x80, 0xd0, 0xac, 0xf3, 0x0e]; // zigzag(2_000_000_000)
+    let grown = (count.len() - (end - at)) as i64;
+    let mut bytes = [&original[..at], &count, &original[end..start + cols[geometry].compressed_size() as usize]].concat();
+    let size = cols[geometry].compressed_size() + grown;
+    cols[geometry] = cols[geometry].clone().into_builder().set_total_compressed_size(size).build().unwrap();
+    groups[last] = groups[last].clone().into_builder().set_column_metadata(cols).build().unwrap();
+    let md = md.into_builder().set_row_groups(groups).build();
+    ::parquet::file::metadata::ParquetMetaDataWriter::new(&mut bytes, &md).finish().unwrap();
+    let error = crate::io::read_layers("x.parquet", &bytes).err().unwrap().to_string();
+    assert!(error.contains("dictionary page says it holds 2000000000 values"), "{error}");
 }
 
 #[test]
@@ -532,6 +670,181 @@ fn an_unknown_coordinate_system_is_reported() {
     assert!(src.info().notes.iter().any(|n| n.contains("EPSG:9999999")), "{:?}", src.info().notes);
     let (_, report) = materialize(src.as_ref()).unwrap();
     assert!(report.messages.iter().any(|m| m.contains("read as longitude/latitude")), "{:?}", report.messages);
+}
+
+/// MAGNA-SIRGAS / Origen-Nacional (EPSG:9377) as a GeoPackage writer may define it: no authority.
+const ORIGEN_NACIONAL: &str = r#"PROJCS["MAGNA-SIRGAS / Origen-Nacional",GEOGCS["MAGNA-SIRGAS",DATUM["Marco_Geocentrico_Nacional_de_Referencia",SPHEROID["GRS 1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["false_easting",5000000.0],PARAMETER["false_northing",2000000.0],PARAMETER["central_meridian",-73.0],PARAMETER["scale_factor",0.9992],PARAMETER["latitude_of_origin",4.0],UNIT["Metre",1.0]]"#;
+
+/// A GeoPackage with one point in srs_id 300001, defined by `organization`, `code` and
+/// `definition`, at Origen-Nacional metres (4 874 000, 2 580 000).
+fn write_custom_srs_gpkg(path: &Path, organization: &str, code: i64, definition: &str) {
+    let _ = std::fs::remove_file(path);
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.execute_batch(
+        "CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT, srs_id INTEGER PRIMARY KEY, organization TEXT, organization_coordsys_id INTEGER, definition TEXT, description TEXT);
+         CREATE TABLE gpkg_contents (table_name TEXT PRIMARY KEY, data_type TEXT, identifier TEXT, description TEXT, last_change TEXT, min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE, srs_id INTEGER);
+         CREATE TABLE gpkg_geometry_columns (table_name TEXT, column_name TEXT, geometry_type_name TEXT, srs_id INTEGER, z TINYINT, m TINYINT);
+         INSERT INTO gpkg_contents (table_name, data_type, srs_id) VALUES ('via', 'features', 300001);
+         INSERT INTO gpkg_geometry_columns VALUES ('via', 'geom', 'POINT', 300001, 0, 0);
+         CREATE TABLE via (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom BLOB);",
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO gpkg_spatial_ref_sys VALUES ('Custom', 300001, ?1, ?2, ?3, '')",
+        rusqlite::params![organization, code, definition],
+    )
+    .unwrap();
+    let p = Coord::new(4_874_000.0, 2_580_000.0);
+    let mut blob = b"GP\x00\x01".to_vec();
+    blob.extend_from_slice(&300_001i32.to_le_bytes());
+    blob.extend(wkb::encode(&Geometry::Point(p)));
+    c.execute("INSERT INTO via (geom) VALUES (?1)", [blob]).unwrap();
+}
+
+/// The point of [`write_custom_srs_gpkg`] and the notes, from the desktop and the browser readers.
+fn custom_srs_reads(path: &Path) -> Vec<(Option<Geometry>, Vec<String>)> {
+    let desktop = open_path(path, None).unwrap();
+    let browser = gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(path).unwrap())), None).unwrap();
+    [desktop.as_ref(), &browser as &dyn FeatureSource]
+        .into_iter()
+        .map(|src| {
+            let batch = src.read(&Request::all()).unwrap();
+            (batch.features.first().and_then(|f| f.geometry.clone()), src.info().notes.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn a_gpkg_system_without_an_epsg_code_is_read_from_its_definition() {
+    // #1476: a custom row (organization CUSTOM, code 0) with the WKT of Origen-Nacional.
+    let p = dir().join("origen_nacional.gpkg");
+    write_custom_srs_gpkg(&p, "CUSTOM", 0, ORIGEN_NACIONAL);
+    for (geometry, notes) in custom_srs_reads(&p) {
+        let Some(Geometry::Point(c)) = geometry else { panic!("{geometry:?}") };
+        // Northern Colombia, where EPSG:9377 puts those metres.
+        let expected =
+            crate::raster::Crs::from_epsg(9377).unwrap().transformer().unwrap().to_lonlat(Coord::new(4_874_000.0, 2_580_000.0)).unwrap();
+        assert!((c.x - expected.x).abs() < 1e-6 && (c.y - expected.y).abs() < 1e-6, "{c:?} vs {expected:?}");
+        assert!((-74.3..-74.0).contains(&c.x) && (9.1..9.4).contains(&c.y), "{c:?}");
+        // Nothing to say: MAGNA-SIRGAS needs no datum shift.
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    // The layer keeps that system as its own (Layer Properties, Define Projection, exports), in a
+    // whole read too, on both readers.
+    let desktop = open_path(&p, None).unwrap();
+    let browser = gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(&p).unwrap())), None).unwrap();
+    for src in [desktop.as_ref(), &browser as &dyn FeatureSource] {
+        let crs = src.info().coordinate_system();
+        assert!(crs.is_some_and(|c| c.custom_def().is_some_and(|d| d.proj4.contains("+proj=tmerc"))), "{:?}", src.info().crs);
+        assert_eq!(materialize(src).unwrap().0.crs, crs);
+    }
+    drop((desktop, browser));
+    // A row without a definition is still said to be read as longitude/latitude.
+    write_custom_srs_gpkg(&p, "NONE", 300001, "undefined");
+    for (_, notes) in custom_srs_reads(&p) {
+        assert!(notes.iter().any(|n| n.contains("srs_id 300001") && n.contains("has no EPSG code")), "{notes:?}");
+    }
+    // No row for the id at all: said too.
+    rusqlite::Connection::open(&p).unwrap().execute("DELETE FROM gpkg_spatial_ref_sys WHERE srs_id = 300001", []).unwrap();
+    for (_, notes) in custom_srs_reads(&p) {
+        assert!(notes.iter().any(|n| n.contains("srs_id 300001") && n.contains("has no EPSG code")), "{notes:?}");
+    }
+    // A writer's "undefined …" text defines nothing: the same note, not a parse failure.
+    write_custom_srs_gpkg(&p, "NONE", 300001, "undefined geographic coordinate system");
+    for (_, notes) in custom_srs_reads(&p) {
+        assert!(notes.iter().any(|n| n.contains("has no EPSG code")) && !notes.iter().any(|n| n.contains("can't be read")), "{notes:?}");
+    }
+    // A definition that can't be read says so, and why.
+    write_custom_srs_gpkg(&p, "CUSTOM", 0, "PROJCS[");
+    for (_, notes) in custom_srs_reads(&p) {
+        assert!(notes.iter().any(|n| n.contains("srs_id 300001") && n.contains("can't be read")), "{notes:?}");
+    }
+    // The spec's undefined ids: -1 (cartesian) is assumed longitude/latitude, said; 0
+    // (geographic) is longitude/latitude, nothing to say.
+    for (id, said) in [(-1, true), (0, false)] {
+        write_custom_srs_gpkg(&p, "NONE", 300001, "undefined");
+        rusqlite::Connection::open(&p)
+            .unwrap()
+            .execute_batch(&format!(
+                "UPDATE gpkg_spatial_ref_sys SET srs_id = {id}, organization_coordsys_id = {id};
+                 UPDATE gpkg_contents SET srs_id = {id};
+                 UPDATE gpkg_geometry_columns SET srs_id = {id};"
+            ))
+            .unwrap();
+        for (_, notes) in custom_srs_reads(&p) {
+            assert_eq!(
+                notes.iter().any(|n| n.contains(&format!("srs_id {id})")) && n.contains("has no EPSG code")),
+                said,
+                "{id}: {notes:?}"
+            );
+        }
+    }
+    // A row naming neither organization nor code but defining the system is read by its
+    // definition, not as the system its id happens to be.
+    write_custom_srs_gpkg(&p, "NONE", 0, ORIGEN_NACIONAL);
+    rusqlite::Connection::open(&p)
+        .unwrap()
+        .execute_batch(
+            "UPDATE gpkg_spatial_ref_sys SET srs_id = 3857, organization = NULL, organization_coordsys_id = NULL;
+             UPDATE gpkg_contents SET srs_id = 3857;
+             UPDATE gpkg_geometry_columns SET srs_id = 3857;",
+        )
+        .unwrap();
+    for (geometry, notes) in custom_srs_reads(&p) {
+        assert!(matches!(geometry, Some(Geometry::Point(c)) if (-74.3..-74.0).contains(&c.x)), "{geometry:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    // MAGNA-SIRGAS on an ellipsoid other than its own isn't taken for it: the datum note stays.
+    write_custom_srs_gpkg(
+        &p,
+        "CUSTOM",
+        0,
+        &ORIGEN_NACIONAL.replace(r#"SPHEROID["GRS 1980",6378137.0,298.257222101]"#, r#"SPHEROID["International 1924",6378388.0,297.0]"#),
+    );
+    for (_, notes) in custom_srs_reads(&p) {
+        assert!(notes.iter().any(|n| n.contains("srs_id 300001") && n.contains("few hundred metres")), "{notes:?}");
+    }
+    // EPSG code 0 is no code: said, not read as longitude/latitude in silence.
+    write_custom_srs_gpkg(&p, "EPSG", 0, "undefined");
+    for (_, notes) in custom_srs_reads(&p) {
+        assert!(notes.iter().any(|n| n.contains("srs_id 300001") && n.contains("has no EPSG code")), "{notes:?}");
+    }
+    // A row naming neither organization nor code leaves Web Mercator to its id, as a missing row.
+    write_custom_srs_gpkg(&p, "NONE", 0, "undefined");
+    rusqlite::Connection::open(&p)
+        .unwrap()
+        .execute_batch(
+            "UPDATE gpkg_spatial_ref_sys SET srs_id = 3857, organization = NULL, organization_coordsys_id = NULL;
+             UPDATE gpkg_contents SET srs_id = 3857;
+             UPDATE gpkg_geometry_columns SET srs_id = 3857;",
+        )
+        .unwrap();
+    for (geometry, notes) in custom_srs_reads(&p) {
+        // Those metres in Web Mercator: about 43.8° E, 22.6° N.
+        assert!(matches!(geometry, Some(Geometry::Point(c)) if (43.0..45.0).contains(&c.x) && (22.0..23.0).contains(&c.y)), "{geometry:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    // An EPSG code stored as a REAL (9377.0, in a column a writer declared DOUBLE) is that code on
+    // both readers, with no definition.
+    write_custom_srs_gpkg(&p, "EPSG", 0, "undefined");
+    rusqlite::Connection::open(&p)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE gpkg_spatial_ref_sys;
+             CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT, srs_id INTEGER PRIMARY KEY, organization TEXT, organization_coordsys_id DOUBLE, definition TEXT, description TEXT);
+             INSERT INTO gpkg_spatial_ref_sys VALUES ('Origen-Nacional', 300001, 'EPSG', 9377.0, 'undefined', '');",
+        )
+        .unwrap();
+    for (geometry, notes) in custom_srs_reads(&p) {
+        assert!(matches!(geometry, Some(Geometry::Point(c)) if (-74.3..-74.0).contains(&c.x)), "{geometry:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    // An EPSG code this build doesn't know falls back to the definition.
+    write_custom_srs_gpkg(&p, "EPSG", 9_999_999, ORIGEN_NACIONAL);
+    for (geometry, notes) in custom_srs_reads(&p) {
+        assert!(matches!(geometry, Some(Geometry::Point(c)) if (-74.3..-74.0).contains(&c.x)), "{geometry:?}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
 }
 
 #[test]

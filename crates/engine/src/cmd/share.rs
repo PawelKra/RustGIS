@@ -10,18 +10,31 @@ use serde_json::{Value, json};
 
 use super::exports::{Work, Wrote};
 use super::{f, need_layer, ps};
-use crate::{CmdResult, CommandSpec as C, Session};
+use crate::{CommandSpec as C, Session};
+
+/// The map export binds exactly the map and tile routes the worker will copy.
+fn map_inputs(s: &super::InputContext<'_>, _: &Value) -> Result<super::Inputs, String> {
+    Ok(super::tiles::render_inputs(s.map()))
+}
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("share.exportMap", "Export Map", "Publish › Output", export_map)
-            .view()
+        C::new("share.exportMap", "Export Map", "Publish › Output", |s, p| {
+            // A style added with its own view: the export waits for it to load, as it does for
+            // tiles. The app runs it here, not on a thread, while one loads.
+            super::tiles::follow_style_view(s, web_time::Duration::from_secs(30));
+            super::exports::write_here(s, p, "share.exportMap")
+        }).inputs(map_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        .view()
             .params(r#"{"path": "*.png", "width"?: px, "height"?: px, "dpi"?: 96..600}"#),
-        C::new("share.exportLayer", "Export Features", "Publish › Output", |s, p| super::exports::write_here(s, p, "share.exportLayer"))
+        C::new("share.exportLayer", "Export Features", "Publish › Output", |s, p| super::exports::write_here(s, p, "share.exportLayer")).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .when(need_layer)
             .params(r#"{"layer"?, "path": "*.geojson|*.csv|*.fgb|*.gpkg|*.parquet|*.shp|*.zip|*.kml|*.kmz|*.gpx", "crs"?: "EPSG:… (or WKT) for a GeoPackage, Shapefile or FlatGeobuf (default: the system the layer was read in, else EPSG:4326)", "mode"?: "newFile (default: refuses an existing file) | addTable | replaceTable, for a GeoPackage", "tableName"?: "the GeoPackage table (default: the layer's name)"}"#),
         C::new("share.exportTable", "Export Table", "Publish › Output", |s, p| {
+            let owner = s.continuation()?;
+            owner.check()?;
+            let _progress = rustgis_analysis::control::install_progress(None);
             let path = ps(p, "path").ok_or("path is required")?;
             let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
             let gpkg = gpkg_table(p, &ext)?;
@@ -35,6 +48,7 @@ pub fn commands() -> Vec<C> {
             }
             let (left_out, table) =
                 rustgis_data::io::write_path_to(&t.dataset, Path::new(path), Crs::LonLat, &gpkg).map_err(|e| e.to_string())?;
+            s.check_continuation(&owner).map_err(|why| super::exports::completion_refused(Some(path), why))?;
             if left_out > 0 {
                 s.notify(format!("{path}: {left_out} features without drawable geometry were left out"), false);
             }
@@ -44,7 +58,7 @@ pub fn commands() -> Vec<C> {
             let mut out = json!({"path": path});
             report_table(s, path, &gpkg, table, &mut out);
             Ok(out)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(
             r#"{"table": name|id (a standalone table), "path": "*.geojson|*.csv|*.fgb|*.gpkg|*.parquet|*.shp|*.zip|*.kml|*.kmz|*.gpx", "mode"?: "newFile (default: refuses an existing file) | addTable | replaceTable, for a GeoPackage", "tableName"?: "the GeoPackage table (default: the table's name)"}"#,
         )
@@ -136,21 +150,32 @@ fn report_table(s: &mut Session, path: &str, gpkg: &GpkgTable, table: Option<Gpk
 
 /// Renders the active map at the current view (or a requested size) to PNG bytes.
 pub fn map_png(s: &mut Session, width: Option<f64>, height: Option<f64>, dpi: Option<f64>) -> Result<Vec<u8>, String> {
-    let (vw, vh) = s.view_size;
+    let view_size = s.view_size;
+    png_of(s.map_mut(), view_size, width, height, dpi)
+}
+
+/// Renders `map` at its camera in a view of `(vw, vh)` points (or a requested size) to PNG bytes.
+fn png_of(
+    map: &mut rustgis_map::Map,
+    (vw, vh): (f64, f64),
+    width: Option<f64>,
+    height: Option<f64>,
+    dpi: Option<f64>,
+) -> Result<Vec<u8>, String> {
     // NaN would pass through `clamp`; non-finite values fall back to the defaults.
     let fin = |v: Option<f64>| v.filter(|x| x.is_finite());
     let (width, height, dpi) = (fin(width), fin(height), fin(dpi));
     let w = width.unwrap_or(vw).clamp(16.0, 8000.0);
     let h = height.unwrap_or(vh).clamp(16.0, 8000.0);
     let ppp = (dpi.unwrap_or(96.0) / 96.0).clamp(0.5, 6.0);
-    let mut camera = s.map().camera;
+    let mut camera = map.camera;
     // Keep the same ground extent when the size differs from the view.
     if width.is_some() || height.is_some() {
         camera.res *= (vw / w).max(vh / h);
         camera.clamp();
     }
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    rustgis_render::render_png(s.map_mut(), &view)
+    rustgis_render::render_png(map, &view)
 }
 
 /// The map view on one PDF page (for printing): the page is the view's shape at 96 points per
@@ -175,14 +200,21 @@ pub fn map_pdf(s: &mut Session, dpi: f64) -> Result<Vec<u8>, String> {
     Ok(rustgis_render::pdf::write(&[page], &s.map().name))
 }
 
-fn export_map(s: &mut Session, p: &Value) -> CmdResult {
+/// `share.exportMap`: draws the active map as it is now to a PNG. It draws a copy of the map, so
+/// the map can move meanwhile; a cancelled export stops waiting for tiles and writes nothing.
+pub(crate) fn map_work(s: &Session, p: &Value) -> Result<Work, String> {
     let path = ps(p, "path").ok_or("path is required")?.to_string();
-    // A style added with its own view: the export waits for it to load, as it does for tiles.
-    super::tiles::follow_style_view(s, web_time::Duration::from_secs(30));
-    let png = map_png(s, f(p, "width"), f(p, "height"), f(p, "dpi"))?;
-    rustgis_data::io::write_atomic(std::path::Path::new(&path), &png).map_err(|e| format!("{path}: {e}"))?;
-    s.notify(format!("Exported {path}"), false);
-    Ok(json!({"path": path, "bytes": png.len()}))
+    let (width, height, dpi) = (f(p, "width"), f(p, "height"), f(p, "dpi"));
+    let (mut map, view_size) = (s.map().detached(), s.view_size);
+    Ok(Box::new(move || {
+        let written = (|| {
+            let png = png_of(&mut map, view_size, width, height, dpi)?;
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+            rustgis_data::io::write_atomic(Path::new(&path), &png).map_err(|e| format!("{path}: {e}"))?;
+            Ok(json!({"path": path, "bytes": png.len()}))
+        })();
+        super::exports::drawn(std::slice::from_ref(&map), Vec::new(), written, path)
+    }))
 }
 
 /// `share.exportLayer`: writes a layer to a file by its extension. A streamed layer exports its
@@ -219,6 +251,10 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     // GeoJSON, KML and GPX are longitude/latitude; the others keep the layer's own system unless
     // told another.
     let crs = asked.unwrap_or_else(|| rustgis_data::io::default_export_crs(ds, &ext));
+    // Another body's layer projected onto another ellipsoid would be wrong data, not a wrong name.
+    if let Some(e) = rustgis_data::export_error(ds, crs) {
+        return Err(format!("{path}: {e}"));
+    }
     let (written, left_out, skipped, table) = match &chunks {
         Some((src, layer)) => {
             let (e, table) =
@@ -257,10 +293,22 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     let answer = json!({"path": path, "features": written, "leftOut": left_out, "crs": crs.label()});
     // The table written, said and put in the answer once the export lands, where the session
     // (layers reading a replaced table) is at hand.
+    let written_path = Some(path.to_string());
     let path = path.to_string();
-    let then: Option<super::exports::Then> = table
-        .map(|t| Box::new(move |s: &mut Session, out: &mut Value| report_table(s, &path, &gpkg, Some(t), out)) as super::exports::Then);
-    Ok(Wrote { answer, notes: said, then })
+    let then: Option<super::exports::Then> = table.map(|t| {
+        Box::new(move |s: &mut Session, out: &mut Value| {
+            report_table(s, &path, &gpkg, Some(t), out);
+            Ok(())
+        }) as super::exports::Then
+    });
+    Ok(Wrote {
+        answer,
+        notes: said,
+        written_path,
+        then,
+        #[cfg(not(target_arch = "wasm32"))]
+        owner: None,
+    })
 }
 
 /// Whether `a` and `b` are the same existing file.
