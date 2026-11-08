@@ -544,6 +544,9 @@ fn now(ui: &Ui) -> f64 {
 /// Shows the active map workspace, discarding stale node gestures after map-tab changes and
 /// before rendering their overlays or consuming pointer releases.
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
+    // Read before the cache was cleared (a sign-out), a picture goes with it: checked on every
+    // frame, whatever is shown (a view with no map frame, a catalog or a layout included).
+    app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
     let t = Tokens::get(ui.ctx());
     crate::modelbuilder::follow_view(app);
     view_tabs(app, ui, &t);
@@ -1269,9 +1272,6 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             draw_label(&painter, &callout_from(l, at, feature), at);
         }
     }
-    // Read before the cache was cleared (a sign-out), a picture goes with it: checked on every
-    // frame, the pop-up open or not, hidden overlays included.
-    app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
     if app.map.hide_overlays {
         return;
     }
@@ -3841,7 +3841,14 @@ pub(crate) fn decode_picture(bytes: &[u8]) -> Result<image::RgbaImage, String> {
     limits.max_image_height = Some(MAX_PICTURE_SIDE);
     limits.max_alloc = Some(MAX_PICTURE_ALLOC);
     reader.limits(limits);
-    Ok(reader.decode().map_err(|_| "the picture is too large to show, or isn't one".to_string())?.to_rgba8())
+    let bad = || "the picture is too large to show, or isn't one".to_string();
+    // The decoder keeps pixels as stored: the picture is turned as its Orientation tag says (a
+    // phone's photo is often stored sideways).
+    let mut decoder = reader.into_decoder().map_err(|_| bad())?;
+    let orientation = image::ImageDecoder::orientation(&mut decoder).map_err(|_| bad())?;
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|_| bad())?;
+    img.apply_orientation(orientation);
+    Ok(img.to_rgba8())
 }
 
 /// The on-screen navigator: a north compass, zoom in and out, and four pan arrows.

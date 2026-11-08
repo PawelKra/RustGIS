@@ -497,7 +497,9 @@ pub fn clear() {
     crate::warp::forget();
     rustgis_data::source::remote::forget();
     CLEARS.fetch_add(1, Ordering::Relaxed);
-    GENERATION.fetch_add(1, Ordering::Relaxed);
+    // The map draws again (and the pop-up's pictures are forgotten): the waker wakes an idle app,
+    // as when a fetch ends, so a clear from a worker thread isn't left until the next input.
+    notify();
 }
 
 /// The resource a cache key reads: its address without a download budget, a byte range or a
