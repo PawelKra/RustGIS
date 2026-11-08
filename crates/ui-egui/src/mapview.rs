@@ -3514,6 +3514,8 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
         info["layer"].as_str().unwrap_or("").to_string()
     };
     let mut attrs = info["attributes"].as_object().cloned().unwrap_or_default();
+    // Read before the cache was cleared (a sign-out), a picture goes with it.
+    app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
     // A picture value (a photo's thumbnail) shows as the picture, not as its text.
     let picture_key = attrs.iter().find(|(_, v)| v.as_str().is_some_and(is_picture)).map(|(k, _)| k.clone());
     let picture = picture_key.and_then(|k| attrs.remove(&k)).and_then(|v| v.as_str().map(|s| picture_texture(app, ui.ctx(), s)));
@@ -3529,11 +3531,7 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     let picture = match (picture, &web_picture) {
         (Some(Ok(tex)), _) => Some(crate::popupmedia::Shown::Ready(tex)),
         (Some(Err(e)), _) => Some(crate::popupmedia::Shown::Failed(crate::popupmedia::Failure::Fetch(e))),
-        (None, Some(url)) => {
-            // Read before the cache was cleared (a sign-out), a picture goes with it.
-            app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
-            Some(app.map.pictures.show(ui.ctx(), url, crate::popupmedia::fetch))
-        }
+        (None, Some(url)) => Some(app.map.pictures.show(ui.ctx(), url, crate::popupmedia::fetch)),
         (None, None) => None,
     };
     let mut load_picture = false;
@@ -3630,7 +3628,10 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
                                     // than a thumbnail shown that way; one from the web leaves room for
                                     // a few rows under it.
                                     let size = tex.size_vec2();
-                                    let tallest = if picture_is_data { 240.0 } else { 180.0 };
+                                    // Within the limit too, past the header and the rows' minimum.
+                                    let room = (limit.y - header.response.rect.height() - 40.0).max(40.0);
+                                    let base: f32 = if picture_is_data { 240.0 } else { 180.0 };
+                                    let tallest = base.min(room);
                                     let scale = (ui.available_width() / size.x.max(1.0)).min(tallest / size.y.max(1.0)).min(1.5);
                                     ui.add(
                                         egui::Image::new((tex.id(), size * scale))

@@ -159,6 +159,8 @@ pub(crate) enum Failure {
     NotHttps,
     /// Addresses on this computer or the local network aren't fetched for a value.
     Local,
+    /// Link-local and unspecified addresses, and cloud metadata hosts, are never fetched.
+    Forbidden,
 }
 
 impl Failure {
@@ -166,7 +168,8 @@ impl Failure {
     pub(crate) fn line(&self) -> String {
         match self {
             Failure::Fetch(e) => {
-                let reason: String = e.chars().take(200).collect();
+                let cut = e.chars().count() > 200;
+                let reason: String = e.chars().take(200).chain(cut.then_some('…')).collect();
                 crate::i18n::fmt("Picture unavailable: {reason}", &[("reason", &reason)])
             }
             Failure::NotPicture => crate::i18n::fmt("Picture unavailable: not a picture", &[]),
@@ -179,6 +182,7 @@ impl Failure {
             ),
             Failure::NotHttps => crate::i18n::fmt("Picture unavailable: only https:// pictures are fetched", &[]),
             Failure::Local => crate::i18n::fmt("Picture unavailable: pictures aren't fetched from this computer or the local network", &[]),
+            Failure::Forbidden => crate::i18n::fmt("Picture unavailable: that address is never fetched", &[]),
         }
     }
 }
@@ -187,10 +191,12 @@ impl Failure {
 fn refusal(url: &str) -> Option<Failure> {
     if strip_prefix_ignore_case(url, "https://").is_none() {
         Some(Failure::NotHttps)
-    } else if address::reach(url) != address::Reach::Public {
-        Some(Failure::Local)
     } else {
-        None
+        match address::reach(url) {
+            address::Reach::Public => None,
+            address::Reach::Local => Some(Failure::Local),
+            address::Reach::Forbidden => Some(Failure::Forbidden),
+        }
     }
 }
 
@@ -517,7 +523,8 @@ mod tests {
         assert_eq!(refusal("http://x.org/p"), Some(Failure::NotHttps));
         assert_eq!(refusal("https://192.168.1.2/p.jpg"), Some(Failure::Local));
         assert_eq!(refusal("https://localhost/p.jpg"), Some(Failure::Local));
-        assert_eq!(refusal("https://169.254.169.254/p.jpg"), Some(Failure::Local));
+        assert_eq!(refusal("https://169.254.169.254/p.jpg"), Some(Failure::Forbidden));
+        assert_eq!(refusal("https://metadata.google.internal/p.jpg"), Some(Failure::Forbidden));
         assert_eq!(refusal("HTTPS://x.org/p.jpg"), None);
     }
 

@@ -360,6 +360,7 @@ fn local_and_plain_http_pictures_are_never_fetched() {
         ("http://images.example.org/a.jpg", "only https:// pictures are fetched"),
         ("https://192.168.1.10/a.jpg", "pictures aren't fetched from this computer or the local network"),
         ("https://localhost/a.jpg", "pictures aren't fetched from this computer or the local network"),
+        ("https://169.254.169.254/a.jpg", "that address is never fetched"),
     ] {
         let mut h = popup(json!({"name": "Here", "image": address}));
         h.run_steps(3);
