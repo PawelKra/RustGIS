@@ -26,6 +26,7 @@ mod connectiontree;
 mod connectionui;
 #[cfg(not(target_arch = "wasm32"))]
 mod connectui;
+mod coordreadout;
 mod cswui;
 mod cubesui;
 mod diagnosticlog;
@@ -120,6 +121,7 @@ use serde_json::{Value, json};
 pub use autosave::FolderStore;
 pub use autosave::{Recovery, RecoveryStore};
 pub use chrome::{DoubleClick, TitlebarMetrics};
+pub use coordreadout::CoordReadout;
 pub use rustgis_assistant;
 pub use rustgis_engine;
 pub use widgets::big_split_menu;
@@ -1386,6 +1388,20 @@ impl RustGisApp {
             .unwrap_or_else(|| "Meters".into());
         self.ui.measurement_imperial =
             self.services.load_pref.as_ref().and_then(|load| load("measurement_units")).as_deref() == Some("imperial");
+        // The pointer's coordinate format; a missing one reads as decimal degrees. One this
+        // version doesn't know (a newer RustGIS may have saved it) is said and read as decimal
+        // degrees too. It stays saved until the user picks a format (`ui.coordinateFormat`).
+        if let Some(code) = self.services.load_pref.as_ref().and_then(|load| load(coordreadout::PREF)) {
+            match CoordReadout::from_code(&code) {
+                Some(format) => self.map.coord_format = format,
+                None => {
+                    // Notices are shown as written, and the language is set only in `start`.
+                    i18n::set_current(self.chosen_lang());
+                    self.session
+                        .notify(tl!("The saved coordinate format isn't known to this version, so decimal degrees are shown."), false);
+                }
+            }
+        }
         // The GPU map backend: RUSTGIS_GPU forces it on, else the saved preference.
         self.map.gpu_enabled = std::env::var_os("RUSTGIS_GPU").is_some()
             || self.services.load_pref.as_ref().and_then(|load| load("ui.map.gpu")).as_deref() == Some("1");
@@ -1486,6 +1502,7 @@ impl RustGisApp {
             i18n::Script::Cjk(i18n::CjkFont::Korean) => Some(ScriptFont::Cjk(CjkRegion::Korean)),
             i18n::Script::Arabic => Some(ScriptFont::Arabic),
             i18n::Script::Bengali => Some(ScriptFont::Bengali),
+            i18n::Script::Lao => Some(ScriptFont::Lao),
             i18n::Script::Alphabetic => None,
         }
     }
@@ -2919,6 +2936,18 @@ impl RustGisApp {
                     save("measurement_units", if imperial { "imperial" } else { "metric" });
                 }
             }
+            "ui.coordinateFormat" => {
+                let format = match p.get("format") {
+                    None | Some(Value::Null) => self.map.coord_format.next(),
+                    Some(Value::String(v)) => CoordReadout::from_code(v)
+                        .ok_or_else(|| tl!("The coordinate format must be decimal, dms, utm or mgrs").to_string())?,
+                    _ => return Err(tl!("The coordinate format must be decimal, dms, utm or mgrs").into()),
+                };
+                self.map.coord_format = format;
+                if let Some(save) = &self.services.save_pref {
+                    save(coordreadout::PREF, format.code());
+                }
+            }
             "ui.moveSharedVertices" => {
                 let on = match p.get("on") {
                     None => !self.map.move_shared_vertices,
@@ -3515,10 +3544,9 @@ impl RustGisApp {
             }
             "ui.captureMap" => {
                 let session = &mut self.session;
-                let png = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rustgis_engine::cmd::share::map_png(session, None, None, Some(192.0))
-                }))
-                .unwrap_or_else(|_| Err("the capture failed unexpectedly".into()))?;
+                let png =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::share::map_png_fitted(session, 192.0)))
+                        .unwrap_or_else(|_| Err("the capture failed unexpectedly".into()))?;
                 let pm = rustgis_engine::render::decode_png(&png).ok_or("could not draw the map")?;
                 let size = [pm.width() as usize, pm.height() as usize];
                 self.ui.copy_image = Some(egui::ColorImage::from_rgba_premultiplied(size, pm.data()));
@@ -3843,10 +3871,9 @@ impl RustGisApp {
             "ui.exportMap" if self.services.download.is_some() => {
                 // The same last-resort panic guard `Session::run` gives commands.
                 let session = &mut self.session;
-                let png = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rustgis_engine::cmd::share::map_png(session, None, None, Some(192.0))
-                }))
-                .unwrap_or_else(|_| Err("Export Map failed unexpectedly".into()));
+                let png =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::share::map_png_fitted(session, 192.0)))
+                        .unwrap_or_else(|_| Err("Export Map failed unexpectedly".into()));
                 let png = match png {
                     Ok(p) => p,
                     Err(e) => {
@@ -3931,17 +3958,20 @@ impl RustGisApp {
             }
             "ui.exportMap" => {
                 let name = format!("{}.png", self.session.map().name);
-                if let Some(path) = dialogs::pick_save(&name, &["png"], tl!("PNG image")) {
+                // A .tif is the view placed on the ground (a GeoTIFF), without the scale bar.
+                if let Some(path) = dialogs::pick_save(&name, &["png", "tif", "tiff"], tl!("PNG image or GeoTIFF")) {
+                    // 192 DPI, or the most a view too large for it holds (the export says so).
+                    let args = json!({"path": path, "dpi": 192, "fit": true});
                     // Drawn on a thread of its own, with progress and Cancel in the status bar;
                     // here while a style added with its own view loads, as the command waits for
                     // it to move the map there first.
                     #[cfg(not(target_arch = "wasm32"))]
                     if self.session.style_view.is_none() {
-                        return exportjob::start(self, "share.exportMap", json!({"path": path, "dpi": 192}));
+                        return exportjob::start(self, "share.exportMap", args);
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     exportjob::idle(self)?;
-                    return self.run("share.exportMap", json!({"path": path, "dpi": 192}));
+                    return self.run("share.exportMap", args);
                 }
             }
             "ui.exportLayer" => {
@@ -5024,7 +5054,7 @@ impl RustGisApp {
             let region = [CjkRegion::SimplifiedChinese, CjkRegion::Japanese, CjkRegion::Korean]
                 .map(ScriptFont::Cjk)
                 .into_iter()
-                .chain([ScriptFont::Arabic, ScriptFont::Bengali])
+                .chain([ScriptFont::Arabic, ScriptFont::Bengali, ScriptFont::Lao])
                 .find(|r| script_font_url(*r) == Some(url.as_str()));
             if bytes.is_empty() || !valid_font(&bytes, 0) {
                 // A failed download: say so; picking the language again retries.
