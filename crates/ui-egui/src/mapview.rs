@@ -1269,6 +1269,9 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             draw_label(&painter, &callout_from(l, at, feature), at);
         }
     }
+    // Read before the cache was cleared (a sign-out), a picture goes with it: checked on every
+    // frame, the pop-up open or not, hidden overlays included.
+    app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
     if app.map.hide_overlays {
         return;
     }
@@ -3514,8 +3517,6 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
         info["layer"].as_str().unwrap_or("").to_string()
     };
     let mut attrs = info["attributes"].as_object().cloned().unwrap_or_default();
-    // Read before the cache was cleared (a sign-out), a picture goes with it.
-    app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
     // A picture value (a photo's thumbnail) shows as the picture, not as its text.
     let picture_key = attrs.iter().find(|(_, v)| v.as_str().is_some_and(is_picture)).map(|(k, _)| k.clone());
     let picture = picture_key.and_then(|k| attrs.remove(&k)).and_then(|v| v.as_str().map(|s| picture_texture(app, ui.ctx(), s)));
