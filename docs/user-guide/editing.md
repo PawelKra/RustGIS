@@ -231,11 +231,11 @@ of up to 4 MB and 2048 × 2048 pixels are shown; the last 16 addresses' pictures
 session, so opening the pop-up again shows the picture without asking again; they are forgotten with
 the web layers' cached tiles (signing out of ArcGIS, a login that ends, **Reload Web Layers**). When
 one can't be shown, the pop-up says why ("Picture unavailable: …": the server's answer, a network
-error, not a picture, a picture format that isn't supported, too large) and doesn't ask again; its
-address stays a link. A plain `http://` picture, or one on this computer or the local network, is
-never fetched. In the web app the picture's server must allow it to be read from another site
-(CORS); many photo sites do, some don't. It must also give the picture at that address: the web
-app refuses a redirect, as it does for every download.
+error, a server that stops sending it, not a picture, a picture format that isn't supported, too
+large) and doesn't ask again; its address stays a link. A plain `http://` picture, or one on this
+computer or the local network, is never fetched. In the web app the picture's server must allow it
+to be read from another site (CORS); many photo sites do, some don't. It must also give the picture
+at that address: the web app refuses a redirect, as it does for every download.
 
 The topmost and visible modes also identify the features of vector tile layers under the click:
 PMTiles and MBTiles archives and vector tiles added as data (not catalog basemaps or MapLibre

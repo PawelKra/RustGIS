@@ -1077,6 +1077,14 @@ pub fn split_download_limit(url: &str) -> (&str, Option<usize>) {
     }
 }
 
+/// Whether the browser gives up a fetch of `url` that stalls, as an installed fetcher is handed it
+/// with `ceiling`. Tiles and documents are given up. So is a download kept to internet addresses
+/// ([`download_public_limited`]): its address comes from data, like a picture for the pop-up.
+/// A download the user named is not given up.
+pub fn gives_up_when_stalled(url: &str, ceiling: crate::address::Reach) -> bool {
+    split_download_limit(url).1.is_none() || ceiling == crate::address::Reach::Public
+}
+
 fn download_address(url: &str, max: usize) -> String {
     if max >= MAX_DOWNLOAD { format!("{DOWNLOAD}{url}") } else { format!("{LIMITED_DOWNLOAD}{max}:{url}") }
 }
@@ -3440,6 +3448,35 @@ mod tests {
         download_limited("https://pictures.example/a.png", 1024, Box::new(move |r| drop(tx.send(r))));
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().unwrap(), vec![1]);
         assert_eq!(*ceilings.lock().unwrap(), [Reach::Public, Reach::Local]);
+    }
+
+    /// A picture for the pop-up is given up in the browser when it stalls, as a tile is; a
+    /// download the user named, with or without a smaller budget, is not.
+    #[test]
+    fn only_downloads_the_user_named_wait_out_a_stall() {
+        let _turn = turn();
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let sent = handed.clone();
+        set_fetcher_with_origin(move |url, ceiling, done, _| {
+            sent.lock().unwrap().push(gives_up_when_stalled(&url, ceiling));
+            done(Err("not fetched".into()));
+        });
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let answered = || -> Done {
+            let tx = tx.clone();
+            Box::new(move |_| {
+                let _ = tx.send(());
+            })
+        };
+        let url = "https://pictures.example/a.png";
+        download_public_limited(url, 1024, answered());
+        download_limited(url, 1024, answered());
+        download(url, answered());
+        for _ in 0..3 {
+            rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        }
+        assert_eq!(*handed.lock().unwrap(), [true, false, false]);
+        assert!(gives_up_when_stalled("https://tiles.example/1/2/3.png", crate::address::Reach::Local));
     }
 
     #[test]
