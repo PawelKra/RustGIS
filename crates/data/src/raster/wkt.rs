@@ -263,13 +263,14 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
     if let Some((code, crs)) = by_code
         && files_shift.is_none_or(|shift| matches_bundled_shift(code, &shift))
     {
-        return Ok((crs, None));
+        return Ok((crs, projection_note(&root, crs).map(str::to_owned)));
     }
     // A system that can't be read from its parameters is still read by its EPSG code, with the
     // code's shift in place of the file's, which is said.
     match (read_system(&root), by_code) {
         (Err(e), Some((code, crs))) => {
-            Ok((crs, Some(format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {e}"))))
+            let note = format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {e}");
+            Ok((crs, with_projection_note(Some(note), &root, crs)))
         }
         (read, _) => read,
     }
@@ -298,6 +299,7 @@ fn read_system(root: &Node) -> Result<(Crs, Option<String>), String> {
                 }
                 _ => None,
             };
+            let note = with_projection_note(note, root, crs);
             Ok((crs, note))
         }
         other => Err(format!("{other} coordinate systems aren't supported")),
@@ -307,6 +309,55 @@ fn read_system(root: &Node) -> Result<(Crs, Option<String>), String> {
 /// A WKT1 system's geographic system: the system itself when it is one, else its `GEOGCS`.
 fn geogcs(n: &Node) -> Option<&Node> {
     if n.name.eq_ignore_ascii_case("GEOGCS") { Some(n) } else { n.child("GEOGCS") }
+}
+
+/// `note`, with [`projection_note`]'s after it when there is one.
+fn with_projection_note(note: Option<String>, root: &Node, crs: Crs) -> Option<String> {
+    match (note, projection_note(root, crs)) {
+        (Some(note), Some(compatibility)) => Some(format!("{note}; {compatibility}")),
+        (note, compatibility) => note.or(compatibility.map(str::to_owned)),
+    }
+}
+
+/// The file's declared EPSG method differs from the formula used for compatibility with PROJ.
+/// A known CRS authority can bypass reading its definition, but must still report that choice.
+pub fn projection_compatibility_note(text: &str, crs: Crs) -> Option<&'static str> {
+    eqc_semi_major(crs)?;
+    projection_note(&wkt1(parse(text).ok()?, 0).ok()?, crs)
+}
+
+/// The semi-major axis used by the resolved equidistant cylindrical projection.
+fn eqc_semi_major(crs: Crs) -> Option<f64> {
+    let custom = crs.custom_def();
+    let proj4 = match crs {
+        Crs::Epsg(code) => epsg_proj4(code),
+        Crs::Custom(_) => custom.as_ref().map(|d| d.proj4.as_str()),
+        _ => None,
+    };
+    let proj4 = proj4.filter(|p| p.split_whitespace().any(|p| p == "+proj=eqc"))?;
+    proj4rs::Proj::from_proj_string(proj4).ok().map(|proj| proj.ellipse_parameters().0)
+}
+
+/// Method 1028 is ellipsoidal, unlike the legacy PROJ 9.7.1 `eqc` formula; a sphere has no discrepancy.
+fn projection_note(root: &Node, crs: Crs) -> Option<&'static str> {
+    let method = root.child("PROJECTION")?.child("AUTHORITY")?;
+    if !method.title().eq_ignore_ascii_case("EPSG") || authority_code(method) != Some(1028) {
+        return None;
+    }
+    let spheroid = root.child("GEOGCS")?.child("DATUM")?.child("SPHEROID")?;
+    let resolved_axis = eqc_semi_major(crs)?;
+    if spheroid.num(0).is_some_and(|axis| (axis - resolved_axis).abs() > resolved_axis.abs() * 1e-12) {
+        return Some(if spheroid.num(1).is_some_and(|rf| rf.is_finite() && rf > 0.0 && rf.recip() > 1e-12) {
+            "the equidistant cylindrical WKT semi-major axis differs from the resolved CRS; RustGIS uses the resolved CRS semi-major axis, so coordinates may differ from the declared spheroid; the WKT method is interpreted as EPSG method 1028 (ellipsoidal), but RustGIS uses the legacy PROJ/GDAL spherical formula (PROJ 9.7.1 compatibility), which differs from the ellipsoidal formula"
+        } else {
+            "the equidistant cylindrical WKT semi-major axis differs from the resolved CRS; RustGIS uses the resolved CRS semi-major axis, so coordinates may differ from the declared spheroid"
+        });
+    }
+    let rf = spheroid.num(1)?;
+    (rf.is_finite()
+        && rf > 0.0
+        && rf.recip() > 1e-12)
+    .then_some("the WKT method is interpreted as EPSG method 1028 (ellipsoidal); RustGIS uses the legacy PROJ/GDAL spherical equidistant cylindrical formula (PROJ 9.7.1 compatibility), which differs from the ellipsoidal formula")
 }
 
 /// Whether a WKT1 geographic system's ellipsoid is another body's. It is checked before the system
@@ -571,11 +622,14 @@ fn projected2(p: &Node) -> Result<Node, String> {
     let to_m = factor(unit).unwrap_or(1.0);
     if let Some(conv) = p.child("CONVERSION") {
         let method = conv.child_of(&["METHOD", "PROJECTION"]);
-        let name = match method.and_then(|m| lookup(m, METHODS, |r| (r.0, r.1))) {
+        let mapped = method.and_then(|m| lookup(m, METHODS, |r| (r.0, r.1)));
+        let name = match mapped {
             Some(&(_, _, wkt1)) => wkt1,
             None => method.map_or("", Node::title),
         };
-        items.push(Item::Node(Node::new("PROJECTION", name, [])));
+        // Retain the named EPSG method for compatibility diagnostics after normalization.
+        let method_id = mapped.map(|&(code, _, _)| Item::Node(Node::new("AUTHORITY", "EPSG", [Item::Num(f64::from(code))])));
+        items.push(Item::Node(Node::new("PROJECTION", name, method_id)));
         for param in conv.nodes().filter(|n| n.name.eq_ignore_ascii_case("PARAMETER")) {
             let Some(v) = param.num(0) else { continue };
             let (name, measure) = match lookup(param, PARAMETERS, |r| (r.0, r.1)) {
@@ -1459,8 +1513,8 @@ pub fn to_wkt(crs: Crs) -> Option<String> {
     let ellps = text("ellps").or(datum.map(|d| d.2));
     let known = ellps.and_then(|e| ELLIPSOIDS.iter().find(|r| r.0.eq_ignore_ascii_case(e)));
     let ellps_name = known.map_or("unnamed", |r| r.1);
-    // proj4rs computes `eqc` on a sphere of the semi-major axis and gives that sphere, but RustGIS
-    // computes it on the datum's ellipsoid (`crs::ellipsoidal_eqc`), the one written here.
+    // proj4rs computes `eqc` on a sphere of the semi-major axis and gives that sphere. Keep the
+    // datum's original ellipsoid in the definition, as PROJ/GDAL do.
     let (a, b) = match text("proj") {
         Some("eqc") => super::crs::eqc_geographic(&def).ok()?.ellipse_parameters(),
         _ => proj.ellipse_parameters(),
@@ -1943,7 +1997,8 @@ pub(crate) mod tests {
         // (Systems in the corpus that can't be read, such as Hotine Oblique Mercator variant B, are
         // passed over.)
         for (crs, note) in wkts.iter().filter_map(|w| read_wkt(w).ok()) {
-            assert_eq!(crs.lacks_datum_shift(), note.is_some(), "{}: {note:?}", crs.label());
+            let unshifted = note.as_ref().is_some_and(|n| n.contains("has no conversion to WGS 84"));
+            assert_eq!(crs.lacks_datum_shift(), unshifted, "{}: {note:?}", crs.label());
         }
         assert!(crs_from_wkt(nad27).unwrap().lacks_datum_shift());
         // The one exception: a Mercator on that sphere has Web Mercator's definition (typed as PROJ,
@@ -2340,6 +2395,46 @@ pub(crate) mod tests {
     /// How far apart two longitudes/latitudes are, in metres (near enough for a few metres).
     pub(crate) fn metres_apart(a: Coord, b: Coord) -> f64 {
         ((a.x - b.x) * b.y.to_radians().cos()).hypot(a.y - b.y) * METRES_PER_DEGREE
+    }
+
+    #[test]
+    fn explicit_method_1028_keeps_the_datum_warning() {
+        let rows = corpus();
+        let wkt = rows.iter().find(|r| r.0 == "EPSG:4087").unwrap().2;
+        let local = wkt.replace("World Geodetic System 1984 ensemble", "Local datum");
+        let (crs, note) = read_wkt(&local).unwrap();
+        assert!(crs.lacks_datum_shift());
+        let note = note.unwrap();
+        assert!(note.contains("has no conversion to WGS 84") && note.contains("EPSG method 1028"), "{note}");
+        assert_eq!(note.matches("EPSG method 1028").count(), 1);
+    }
+
+    #[test]
+    fn method_1028_on_an_effective_sphere_has_no_compatibility_warning() {
+        let rows = corpus();
+        let wkt = rows.iter().find(|r| r.0 == "EPSG:4087").unwrap().2;
+        let near_sphere = wkt.replace("298.257223563", "10000000000000");
+        assert_ne!(wkt, near_sphere);
+        assert!(read_wkt(&near_sphere).unwrap().1.is_none());
+        assert!(read_wkt(wkt).unwrap().1.unwrap().contains("differs from the ellipsoidal formula"));
+    }
+
+    #[test]
+    fn near_spherical_eqc_with_a_resolved_radius_mismatch_is_reported() {
+        let rows = corpus();
+        let wkt = rows.iter().find(|r| r.0 == "EPSG:4087").unwrap().2;
+        let mismatched = wkt.replace("298.257223563", "10000000000000").replace("6378137", "6371000");
+        let (_, notice) = read_wkt(&mismatched).unwrap();
+        assert!(notice.is_some_and(|notice| notice.contains("semi-major axis")));
+    }
+
+    #[test]
+    fn projection_review_axis_mismatch_keeps_the_formula_warning() {
+        let rows = corpus();
+        let wkt = rows.iter().find(|r| r.0 == "EPSG:4087").unwrap().2.replace("6378137", "6371000");
+        let (_, notice) = read_wkt(&wkt).unwrap();
+        let notice = notice.unwrap();
+        assert!(notice.contains("semi-major axis") && notice.contains("EPSG method 1028"), "{notice}");
     }
 
     #[test]
