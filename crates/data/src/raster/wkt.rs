@@ -770,8 +770,15 @@ fn bound(b: Node, depth: usize) -> Result<Node, String> {
 fn onward_shift(target: &Node) -> Result<[f64; 7], String> {
     let datum = geogcs(target).and_then(|g| g.child("DATUM"));
     let code = target.child("AUTHORITY").filter(|a| a.title().eq_ignore_ascii_case("EPSG")).and_then(authority_code);
-    // A shift the target gives wins, as it does for any system.
+    // A shift the target gives wins, as it does for any system. A zero one where the target's
+    // code has a shift may be a writer's placeholder, and this can't say so, so it is refused.
     if let Some(shift) = towgs84(datum) {
+        if shift.iter().all(|v| *v == 0.0)
+            && let Some(c) = code
+            && !matches_bundled_shift(c, &shift)
+        {
+            return Err(format!("the bound system's target gives a shift of zero to WGS 84 where EPSG:{c} has one"));
+        }
         return Ok(std::array::from_fn(|i| shift.get(i).copied().unwrap_or(0.0)));
     }
     // WGS 84 itself, by its EPSG code or a datum read as WGS 84, needs no shift.
@@ -2696,6 +2703,16 @@ pub(crate) mod tests {
         let ll = at(&bound_crs(BESSEL_WKT2, ed50_shifted, &BESSEL_SHIFT));
         let expected = at(&bound_crs(BESSEL_WKT2, WGS84_WKT2, &added));
         assert!(metres_apart(ll, expected) < 0.001 && metres_apart(ll, ed50) > 5.0, "{ll:?}");
+        // A zero one where the target's code has a shift (ED50's) may be a placeholder: refused,
+        // as the bound system can't say which it used. Zero on a code without a shift is kept.
+        let ed50_zero = ed50_shifted.replace("TOWGS84[-80,-90,-110,0,0,0,0]", "TOWGS84[0,0,0,0,0,0,0]");
+        assert_ne!(ed50_zero, ed50_shifted);
+        assert_eq!(
+            crs_from_wkt(&bound_crs(BESSEL_WKT2, &ed50_zero, &BESSEL_SHIFT)),
+            Err("the bound system's target gives a shift of zero to WGS 84 where EPSG:4230 has one".into())
+        );
+        let wgs84_zero = ed50_zero.replace(r#"AUTHORITY["EPSG","4230"]"#, r#"AUTHORITY["EPSG","4326"]"#);
+        assert!(metres_apart(at(&bound_crs(BESSEL_WKT2, &wgs84_zero, &BESSEL_SHIFT)), to_wgs84) < 0.001);
         // A geocentric WGS 84 target, as EPSG defines Helmert transformations, is WGS 84.
         let geocentric = r#"GEODCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],CS[Cartesian,3],AXIS["(X)",geocentricX],AXIS["(Y)",geocentricY],AXIS["(Z)",geocentricZ],LENGTHUNIT["metre",1],ID["EPSG",4978]]"#;
         let ll = at(&bound_crs(BESSEL_WKT2, geocentric, &BESSEL_SHIFT));
