@@ -262,7 +262,7 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
         .and_then(authority_code)
         .and_then(|code| Some((code, Crs::from_epsg(code)?)));
     if let Some((code, crs)) = by_code
-        && files_shift.is_none_or(|shift| matches_bundled_shift(code, &shift))
+        && files_shift.as_ref().is_none_or(|shift| matches_bundled_shift(code, shift))
     {
         return Ok((crs, projection_note(&root, crs).map(str::to_owned)));
     }
@@ -282,6 +282,12 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
                 )
             };
             Ok((crs, with_projection_note(Some(note), &root, crs)))
+        }
+        // A shift of zero, where the code has one, may be a writer's placeholder: said, as the
+        // positions then differ from the code's by that shift.
+        (Ok((crs, note)), Some((code, _))) if files_shift.is_some_and(|s| s.iter().all(|v| *v == 0.0)) => {
+            let zero = format!("the file gives a shift of zero to WGS 84, which is used in place of EPSG:{code}'s transformation");
+            Ok((crs, Some(note.map_or(zero.clone(), |n| format!("{n}; {zero}")))))
         }
         (read, _) => read,
     }
@@ -2774,6 +2780,15 @@ pub(crate) mod tests {
         assert!(note.as_deref().is_some_and(|n| n.contains("EPSG:32631 is read without it")), "{note:?}");
         let wkt1 = to_wkt(Crs::Epsg(27700)).unwrap();
         assert!(wkt1.contains("TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]"), "{wkt1}");
+        // A shift of zero where the code has one is the file's too, and said.
+        let zero = wkt1.replace("TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]", "TOWGS84[0,0,0,0,0,0,0]");
+        assert_ne!(zero, wkt1);
+        let (crs, note) = read_wkt(&zero).unwrap();
+        assert!(matches!(crs, Crs::Custom(_)), "{crs:?}");
+        assert_eq!(
+            note.as_deref(),
+            Some("the file gives a shift of zero to WGS 84, which is used in place of EPSG:27700's transformation")
+        );
         assert_eq!(crs_from_wkt(&wkt1), Ok(Crs::Epsg(27700)));
         let other = wkt1.replace("TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]", "TOWGS84[375,-111,431,0,0,0,0]");
         let def = crs_from_wkt(&other).unwrap().custom_def().unwrap();
