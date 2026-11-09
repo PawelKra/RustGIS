@@ -516,7 +516,10 @@ fn geographic2(g: &Node, top: bool) -> Result<Node, String> {
     }
     // Longitudes counted west (planetographic ones, on most bodies) would be read as east, which
     // mirrors the data. Such a system is refused here unless it is read by its EPSG code. Its
-    // axes are also kept below, so a check on the WKT1 it becomes ([`geographic`]) sees them too.
+    // axes are also kept below, so a check on the WKT1 it becomes ([`geographic`]) sees them too
+    // when it is the top system. A projected system's base axes don't move its coordinates (PROJ
+    // places them the same), so on the Earth they aren't checked; another body's are
+    // ([`mirrored_projection`]).
     if top && reversed_axes(g) && epsg_id(g).and_then(Crs::from_epsg).is_none() {
         return Err(REVERSED_AXES.into());
     }

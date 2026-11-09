@@ -108,8 +108,9 @@ or other WKT:
 - A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
   datum's own transformation to WGS 84: the one the file gives it, else none for a datum treated
   as WGS 84 (such as RDN2008, IGM95 or NAD 83), else the built-in one. It is refused when there is
-  none of these, or when combining the two transformations' rotations could be off by a
-  centimetre.
+  none of these, when the target gives a zero transformation where its datum has another (a
+  writer's placeholder, as for ED50 or NAD 27), or when combining the two transformations'
+  rotations could be off by a centimetre.
 - A UTM name (`WGS_1984_UTM_Zone_31N`) gives its EPSG code only when the parameters are that
   zone's.
 - Projected axes pointing west or south, as in South Africa's Lo grids, are read as such, or
