@@ -269,8 +269,10 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
     // code's shift in place of the file's, which is said.
     match (read_system(&root), by_code) {
         (Err(e), Some((code, crs))) => {
-            let codes_shift = matches!(crs, Crs::LonLat | Crs::WebMercator)
-                || u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift).is_some();
+            // A code whose shift is none (WGS 84's, or a WGS 84-like datum's) doesn't replace the
+            // file's either.
+            let codes_shift = !matches!(crs, Crs::LonLat | Crs::WebMercator)
+                && u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift).is_some_and(|s| s.iter().any(|v| *v != 0.0));
             let note = if codes_shift {
                 format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {e}")
             } else {
@@ -2754,6 +2756,15 @@ pub(crate) mod tests {
                 "the file's own shift to WGS 84 is set aside, because the Krovak (North Orientated) projection isn't supported, and EPSG:4267 is read without it, so positions may be off by as much as that shift"
             )
         );
+        // So it does with a code whose shift is none (WGS 84's).
+        let wgs84_code = krovak.replace(r#"ID["EPSG",5514]]"#, r#"ID["EPSG",4326]]"#);
+        let (crs, note) = read_wkt(&bound_crs(&wgs84_code, WGS84_WKT2, &[570.8, 85.7, 462.8])).unwrap();
+        assert_eq!(crs, Crs::LonLat);
+        assert!(note.as_deref().is_some_and(|n| n.contains("EPSG:4326 is read without it")), "{note:?}");
+        let utm_code = krovak.replace(r#"ID["EPSG",5514]]"#, r#"ID["EPSG",32631]]"#);
+        let (crs, note) = read_wkt(&bound_crs(&utm_code, WGS84_WKT2, &[570.8, 85.7, 462.8])).unwrap();
+        assert_eq!(crs, Crs::Epsg(32631));
+        assert!(note.as_deref().is_some_and(|n| n.contains("EPSG:32631 is read without it")), "{note:?}");
         let wkt1 = to_wkt(Crs::Epsg(27700)).unwrap();
         assert!(wkt1.contains("TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]"), "{wkt1}");
         assert_eq!(crs_from_wkt(&wkt1), Ok(Crs::Epsg(27700)));
