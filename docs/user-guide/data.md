@@ -117,7 +117,8 @@ fields, calculates field [expressions](expressions.md) and opens **Calculate Geo
 The geometry calculator fills a new double field or an existing numeric field with area,
 perimeter, length or point X/Y, for all or selected features. Point coordinates can be WGS 84
 degrees or a supported projected EPSG system's units. Areas, perimeters and lengths measure on
-the WGS 84 ellipsoid, with the exceptions for full-turn and polar rings listed under
+the WGS 84 ellipsoid; how full-turn rings (globe-wide bands) and rings split at the antimeridian
+are measured, and the exception for polar rings, are under
 [Geoprocessing](analysis.md#geoprocessing-tools).
 See [Editing](editing.md) for field
 calculations and data-design rules. Streamed layers must first be loaded with **Load All
@@ -626,6 +627,21 @@ database is kept without its password. The commands `sources.list`, `sources.sav
 `sources.favourite` and `sources.remove` read and change the lists, for the command line and the
 [AI Assistant](assistant.md). On the command line they last for the run.
 
+### Network downloads
+
+On desktop and the command line, web tiles, service documents and file downloads through
+**From URL…** connect directly, including `layer.addUrl`. These requests do not use
+`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`: a proxy could resolve a destination beyond the
+app's IP checks. There is no proxy override for these requests. If your network requires a
+proxy, download a file with a trusted external tool and open the local copy in RustGIS.
+Live tile and service access requires direct connectivity. The web app uses the browser's
+network settings. Browser GET and HEAD requests refuse redirects, including HTTP-to-HTTPS upgrades
+and CDN hops, because the app cannot inspect their destinations. This includes **From URL…**
+file downloads, fonts, service documents, tiles and sprites, and PMTiles/COG archive range
+reads. Supply the final address; for a redirecting file download, download it with a trusted
+external tool and open the local copy. The browser also controls DNS and local-network access;
+see [tile request limits](maps.md#basemaps).
+
 ### HTTPS certificates
 
 On desktop and the command line, RustGIS's HTTPS clients use platform certificate verification:
@@ -642,7 +658,8 @@ inspection proxy's) must be trusted by the operating system for the account runn
   variables select the trust sources instead of the default system locations (an empty
   `SSL_CERT_DIR` counts as unset).
   If no default system roots are found and neither variable is set, this client falls back to
-  its bundled Mozilla roots, so public HTTPS still works in minimal containers. It does not
+  its bundled Mozilla roots, so public HTTPS still works in minimal containers, and says so
+  once a session (in the status bar and the troubleshooting history). It does not
   add Mozilla roots to an existing CA store (even one it can't read) or an explicitly configured one.
 
 `SSL_CERT_FILE` and `SSL_CERT_DIR` do **not** override Windows or macOS trust for this client.
@@ -863,6 +880,9 @@ Relative links, including parent paths, resolve against the document's address w
 template placeholders or query values, including proxy parameters containing `https://` URLs.
 KVP requests replace capabilities operation parameters, keeping unrelated parameters such as
 MapServer's `map=`.
+A same-origin link whose path or query holds a space, backslash or control character keeps the
+login: tabs, line breaks and trailing spaces are dropped, a backslash in the path becomes `/` and
+other spaces, control characters and backslashes are percent-encoded (a space as `%20`).
 If a service supplies a same-origin link too long to carry its login, the request is refused
 instead of being fetched anonymously. Addresses that cannot be rebound to a login are left
 unchanged and reported.

@@ -314,8 +314,12 @@ A long list stops at its first 2,000 layers, and a note says how many the servic
 API service stops at its first 2,000 collections instead, and each can make up to three layers
 (features, map tiles and vector tiles), so its list can be longer. Which ones come first is up to the service, and some change their order between
 answers. `service.add` still takes any of them by name, up to 100,000 in one document, fewer
-(but at least 2,000) when the document's request address (an OGC API's, its own), which each
-layer's repeats, is very long. An ArcGIS service or directory is an exception: it is read up to
+when the document's request addresses (an OGC API's, its own; a WMS's GetMap, GetFeatureInfo
+and legend addresses together), which each layer's repeat, are very long: at least 2,000 up to
+about 32 KB, and fewer than are listed past that, at least one, with a note. A list also stops
+early, with a note, once its layers' document addresses (each layer's `source_url`) reach
+64 MiB: 2,000 layers each repeating an address over 32 KB, or the more layers of an OGC API's
+list each repeating a somewhat shorter one. An ArcGIS service or directory is an exception: it is read up to
 2,000 layers, folders and services, and lists all it reads.
 A dynamic MapServer offers each of those layers twice, as features and as a
 map, so its list can be twice as long. A note says how many are left out past either limit.
@@ -599,9 +603,9 @@ RustGIS keeps x and y only. When a source has Z or M values (heights or measures
 they were dropped, and exporting or converting the layer (or exporting a standalone table that
 holds geometry), or sharing it as a web map, web layer or OGC API Features, says what's written
 lacks them.
-Shapefile, GeoPackage, GeoParquet, FlatGeobuf, PostGIS, File Geodatabase, GeoJSON, KML (altitudes
-other than 0), GML and CSV WKT columns are checked; sources read through GDAL or DuckDB, and SQL
-Server tables, aren't yet. GPX elevations and LiDAR heights are kept as fields, and a File
+Shapefile, GeoPackage, GeoParquet, FlatGeobuf, PostGIS, SQL Server, File Geodatabase, GeoJSON, KML
+(altitudes other than 0), GML and CSV WKT columns are checked; sources read through GDAL or DuckDB
+aren't yet. GPX elevations and LiDAR heights are kept as fields, and a File
 Geodatabase multipatch's heights as `z_min` and `z_max`. Where a source doesn't declare its
 dimensions, only a sample is checked: the first 16 rows of a GeoParquet file without geometry types
 (in its first row group), and the first 16 rows with a geometry of a GeoPackage table with optional

@@ -1101,6 +1101,9 @@ pub struct RustGisApp {
     /// to give its wake callback yet: `logic` installs the wake as soon as a context exists.
     #[cfg(not(target_arch = "wasm32"))]
     relay_wake_pending: bool,
+    /// Whether session plugins' programs ask for a repaint when they send a line.
+    #[cfg(not(target_arch = "wasm32"))]
+    plugin_wake_set: bool,
     /// Extra font faces installed with the interface fonts: (name, face, script). The current
     /// language's face comes right after the interface font (before it for Arabic script), so its
     /// glyph shapes win; the others are last-resort fallbacks. Faces are shared, so reinstalling
@@ -1305,6 +1308,8 @@ impl RustGisApp {
             frame_ctx: None,
             #[cfg(not(target_arch = "wasm32"))]
             relay_wake_pending: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            plugin_wake_set: false,
             extra_fonts: Vec::new(),
             installed_region: None,
             fonts_dirty: false,
@@ -3932,6 +3937,9 @@ impl RustGisApp {
                     dbf_notes.extend(io::shapefile_names_note(&ds.fields, &name));
                     dbf_notes.extend(io::shapefile_values_notes(ds, &name));
                 }
+                if matches!(ext.as_str(), "parquet" | "geoparquet") {
+                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(ds, &name));
+                }
                 if left_out > 0 {
                     self.session.notify(format!("{name}: {left_out} features without drawable geometry were left out"), false);
                 }
@@ -4416,10 +4424,10 @@ impl RustGisApp {
                 if let Some(zoom) = p.get("zoom") {
                     q["zoom"] = zoom.clone();
                 }
-            } else if let Some(zoom) =
-                p.get("zoom").and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| matches!(s, "true" | "yes" | "1" | "on"))))
-            {
-                q["zoom"] = json!(zoom);
+            } else if let Some(zoom) = p.get("zoom").filter(|v| !v.is_null()) {
+                // Read as the engine reads a true/false parameter; a value it can't read goes on
+                // as given, for the command adding the download to read as false and say so (#1600).
+                q["zoom"] = rustgis_engine::cmd::bool_value(zoom).map_or_else(|| zoom.clone(), |z| json!(z));
             }
             if let Some(number) = p.get("request").filter(|v| v.is_u64()) {
                 q["request"] = number.clone();
@@ -4715,7 +4723,7 @@ impl RustGisApp {
         let shown = rustgis_engine::sources::redact(&url);
         p["id"] = json!(id);
         p["url"] = json!(url);
-        let zoom = p.get("zoom").and_then(Value::as_bool) == Some(true);
+        let zoom = p.get("zoom").and_then(rustgis_engine::cmd::bool_value) == Some(true);
         if zoom && self.ui.link_zoomed {
             p["zoom"] = json!(false);
         }
@@ -4994,6 +5002,21 @@ impl RustGisApp {
                 }
             }
             relayshot::drive(self, ctx);
+            // Session plugins' programs: what they asked, and what changed on the map for them.
+            if !self.plugin_wake_set {
+                let ctx = ctx.clone();
+                rustgis_engine::plugins::session::set_wake(std::sync::Arc::new(move || ctx.request_repaint()));
+                self.plugin_wake_set = true;
+            }
+            let state = self.session.state();
+            if self.session.poll_plugin_sessions() > 0 && self.session.state() != state {
+                self.map.cancel_label_drag();
+            }
+            // A program that exits without a last line (something it left running holds its output
+            // open) wakes nothing: while one runs, the app looks at least once a second.
+            if !rustgis_engine::plugins::session::running().is_empty() {
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
             // A script an agent wrote to the file bridge.
             if let Some(bridge) = self.file_bridge.clone() {
                 if !bridge.has_wake() {
