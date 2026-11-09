@@ -16,7 +16,7 @@ use crate::{CmdResult, CommandSpec as C, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addData", "Add Data", "Home › Add", add_data).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
-            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a CityJSON model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
+            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a CityJSON model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
         C::new("layer.addPhotos", "Add Photos", "Home › Add", add_photos).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"paths"?: [JPEG photo files], "folder"?: "a folder of photos (every JPEG in it)", "name"?: "the layer (default Photos; photos join it when it exists)"}"#,
         ),
@@ -2033,7 +2033,37 @@ fn add_source_with(
     // and the AI Assistant know the file holds more than was added.
     let mut skipped: Vec<String> = Vec::new();
     let mut total = None;
-    let tables: Vec<Option<String>> = match (ps(p, "layer").map(str::trim).filter(|t| !t.is_empty()), &origin) {
+    let selected = ps(p, "layer").map(str::trim).filter(|t| !t.is_empty());
+    // Report unsupported contents for a whole-file add, not a deliberate table selection.
+    let contents = match (&origin, selected.is_none()) {
+        #[cfg(not(target_arch = "wasm32"))]
+        (Origin::Path(path), true) if path.to_ascii_lowercase().ends_with(".gpkg") => {
+            source::gpkg::unsupported_table_counts(Path::new(path)).map_err(err)?
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        (Origin::Bytes(name, bytes), true) if name.to_ascii_lowercase().ends_with(".gpkg") => {
+            source::gpkg::unsupported_table_counts_bytes(bytes.as_slice()).map_err(err)?
+        }
+        #[cfg(target_arch = "wasm32")]
+        (Origin::Bytes(name, bytes), true) if name.to_ascii_lowercase().ends_with(".gpkg") => {
+            source::gpkg_mem::unsupported_table_counts(source::Shared(bytes.clone())).map_err(err)?
+        }
+        _ => Vec::new(),
+    };
+    let omitted: Vec<String> = contents
+        .into_iter()
+        .map(|(kind, count)| {
+            if kind == "attributes" {
+                format!("{count} attribute-only tables not added: GeoPackage attribute tables are not supported")
+            } else if kind == "features" {
+                format!("{count} feature table(s) not added: no geometry column is registered")
+            } else {
+                format!("{count} {kind} table(s) not added: only GeoPackage feature tables are supported")
+            }
+        })
+        .collect();
+    let attribute_note = (!omitted.is_empty()).then(|| omitted.join("; "));
+    let tables: Vec<Option<String>> = match (selected, &origin) {
         (Some(t), _) => vec![Some(t.to_string())],
         (None, Origin::Path(path)) if path.to_ascii_lowercase().ends_with(".gpkg") => {
             let mut all = source::layers(Path::new(path)).map_err(err)?;
@@ -2058,7 +2088,10 @@ fn add_source_with(
         _ => vec![None],
     };
     if tables.is_empty() {
-        return Err(format!("{label}: no feature tables"));
+        return Err(match &attribute_note {
+            Some(note) => format!("{label}: no feature tables; {note}"),
+            None => format!("{label}: no feature tables"),
+        });
     }
     let empty_before = super::map_is_empty(s);
     let mut ids = Vec::new();
@@ -2074,7 +2107,10 @@ fn add_source_with(
                     Err(rustgis_data::DataError::Format("the table isn't open".into()))
                 }
             }
-            .map_err(err)?,
+            .map_err(|e| match &attribute_note {
+                Some(note) => format!("{}; {note}", err(e)),
+                None => err(e),
+            })?,
         };
         let info = src.info().clone();
         // A point cloud is always read in place, so a project keeps its file's path, not millions
@@ -2145,6 +2181,9 @@ fn add_source_with(
         if !e.is_empty() {
             s.zoom_to(&e);
         }
+    }
+    if let Some(note) = attribute_note {
+        s.notify(format!("{label}: {note}"), false);
     }
     let first = ids.first().copied();
     let mut out = json!({"layer": first, "layers": ids, "features": features, "streamed": streamed});
@@ -2938,6 +2977,7 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     }
     super::connections::restore_active(s);
     s.wait_in_place_reads();
+    super::project::say_conversion_fallbacks(s);
     // Only the database the added layer reads can change here.
     let keys: Vec<_> = s.map().layer(id).and_then(|l| l.source.as_ref()).map(super::connections::layer_keys).unwrap_or_default();
     super::connections::resolve_keys(s, &keys);
