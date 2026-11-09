@@ -755,11 +755,11 @@ fn bound(b: Node, depth: usize) -> Result<Node, String> {
         towgs84 = compose(&towgs84, onward)?;
     }
     let geog = if crs.name.eq_ignore_ascii_case("GEOGCS") { Some(&mut crs) } else { crs.child_mut("GEOGCS") };
-    if let Some(datum) = geog.and_then(|g| g.child_mut("DATUM")) {
-        // The bound transformation replaces a `TOWGS84` the source (in WKT1) gives itself.
-        datum.items.retain(|i| !matches!(i, Item::Node(n) if n.name.eq_ignore_ascii_case("TOWGS84")));
-        datum.items.push(Item::Node(Node { name: "TOWGS84".into(), items: towgs84.into_iter().map(Item::Num).collect() }));
-    }
+    // A source without a datum has nowhere to keep the shift: refused, not read without it.
+    let datum = geog.and_then(|g| g.child_mut("DATUM")).ok_or("the bound coordinate system's source has no datum to give the shift to")?;
+    // The bound transformation replaces a `TOWGS84` the source (in WKT1) gives itself.
+    datum.items.retain(|i| !matches!(i, Item::Node(n) if n.name.eq_ignore_ascii_case("TOWGS84")));
+    datum.items.push(Item::Node(Node { name: "TOWGS84".into(), items: towgs84.into_iter().map(Item::Num).collect() }));
     Ok(crs)
 }
 
@@ -2722,6 +2722,14 @@ pub(crate) mod tests {
         assert_eq!(e, "the bound coordinate system's rotations are too large to combine");
         let no_target = bound_crs(BESSEL_WKT2, WGS84_WKT2, &BESSEL_SHIFT).replace(&format!("TARGETCRS[{WGS84_WKT2}],"), "");
         assert_eq!(crs_from_wkt(&no_target), Err("the bound coordinate system has no target".into()));
+        // A source without a datum has nowhere to keep the shift: refused, not read without it.
+        let no_datum =
+            BESSEL_WKT2.replace(r#"DATUM["Local datum",ELLIPSOID["Bessel 1841",6377397.155,299.1528128,LENGTHUNIT["metre",1]]],"#, "");
+        assert_ne!(no_datum, BESSEL_WKT2);
+        assert_eq!(
+            crs_from_wkt(&bound_crs(&no_datum, WGS84_WKT2, &BESSEL_SHIFT)),
+            Err("the bound coordinate system's source has no datum to give the shift to".into())
+        );
     }
 
     /// The shift a file gives wins over the one bundled for its system's EPSG code. The code is

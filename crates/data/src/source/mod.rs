@@ -862,8 +862,10 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
             && let Some(wkt1) = wkt1
         {
             // Unless the WKT2 is another body's system that is refused: it is the one that counts.
-            // (One the WKT2 can't tell the coordinates of, as when it can't be parsed, gives way.)
-            if let Some(Err(refused)) = other_body(Some(definition), &mut Vec::new()) {
+            // (One the WKT2 can't tell the coordinates of, as when it can't be parsed, gives way,
+            // so the row's code isn't asked here: an IAU projected code would refuse a WKT1 that
+            // reads.)
+            if let Some(Err(refused)) = Reproject::planetary(&what, None, None, Some(definition), &mut Vec::new()) {
                 return Err(refused);
             }
             notes.push(format!("{what}: its WKT2 definition can't be read ({e}), so its WKT1 definition is used"));

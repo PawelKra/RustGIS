@@ -310,6 +310,18 @@ fn planetographic_systems_without_east_axes_are_refused() {
     assert_eq!(points(&ds), LONLAT.map(|(x, y)| Coord::new(x, y)).to_vec());
     assert!(report.messages.iter().any(|m| m.contains("its WKT1 definition is used")), "{:?}", report.messages);
     assert!(mem(&path).unwrap().info().notes.iter().any(|m| m.contains("its WKT1 definition is used")));
+    // So it does under a projected IAU code, which alone would be refused: the WKT1 reads.
+    let path = geopackage(dir.path(), "eqc_wkt2_broken", metres, ("IAU_2015", 49910, MARS_EQC));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("ALTER TABLE gpkg_spatial_ref_sys ADD COLUMN definition_12_063 TEXT", []).unwrap();
+    conn.execute("UPDATE gpkg_spatial_ref_sys SET definition_12_063 = ?1 WHERE srs_id = 990001", [r#"PROJCRS["Mars""#]).unwrap();
+    drop(conn);
+    let (ds, report) = io::read_path(&path).unwrap();
+    for (got, (lon, lat)) in points(&ds).into_iter().zip(LONLAT) {
+        assert!((got.x - lon).abs() < 1e-9 && (got.y - lat).abs() < 1e-9, "{got:?}");
+    }
+    assert!(report.messages.iter().any(|m| m.contains("its WKT1 definition is used")), "{:?}", report.messages);
+    assert!(mem(&path).unwrap().info().notes.iter().any(|m| m.contains("its WKT1 definition is used")));
     let east = with_axes(MARS_OGRAPHIC_ESRI, east_north);
     let path = geopackage(dir.path(), "ographic_east", LONLAT, ("IAU_2015", 49901, &east));
     let (ds, report) = io::read_path(&path).unwrap();
