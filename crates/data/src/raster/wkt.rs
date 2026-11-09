@@ -770,13 +770,17 @@ fn bound(b: Node, depth: usize) -> Result<Node, String> {
 fn onward_shift(target: &Node) -> Result<[f64; 7], String> {
     let datum = geogcs(target).and_then(|g| g.child("DATUM"));
     let code = target.child("AUTHORITY").filter(|a| a.title().eq_ignore_ascii_case("EPSG")).and_then(authority_code);
-    // The bundled shift for the target's EPSG code, else for its national datum.
-    let bundled = || code.and_then(|c| u16::try_from(c).ok()).and_then(epsg_proj4).or_else(|| national_datum(datum));
     // A shift the target gives wins, as it does for any system. A zero one where the target's
     // code or datum has a shift may be a writer's placeholder, and this can't say so, so it is
     // refused.
     if let Some(shift) = towgs84(datum) {
-        if shift.iter().all(|v| *v == 0.0) && bundled().and_then(bundled_shift).is_some_and(|b| b.iter().any(|v| *v != 0.0)) {
+        // As for a system's own shift ([`read_wkt`]): a zero that isn't its code's shift (NAD 27's
+        // is a grid), or where its national datum has one.
+        let placeholder = match code {
+            Some(c) => !matches_bundled_shift(c, &shift),
+            None => national_datum(datum).and_then(bundled_shift).is_some_and(|b| b.iter().any(|v| *v != 0.0)),
+        };
+        if shift.iter().all(|v| *v == 0.0) && placeholder {
             let name = match target.title().trim() {
                 "" => "the bound system's target",
                 t => t,
@@ -789,7 +793,8 @@ fn onward_shift(target: &Node) -> Result<[f64; 7], String> {
     if code.and_then(Crs::from_epsg) == Some(Crs::LonLat) || wgs84_like(datum).is_some() {
         return Ok([0.0; 7]);
     }
-    match bundled().and_then(bundled_shift) {
+    let bundled = code.and_then(|c| u16::try_from(c).ok()).and_then(epsg_proj4).or_else(|| national_datum(datum));
+    match bundled.and_then(bundled_shift) {
         Some(shift) => Ok(shift),
         None => {
             let name = match target.title().trim() {
@@ -2720,6 +2725,12 @@ pub(crate) mod tests {
         assert_eq!(
             crs_from_wkt(&bound_crs(BESSEL_WKT2, &ed50_zero_by_name, &BESSEL_SHIFT)),
             Err("ED50 gives a shift of zero to WGS 84 where its datum has one".into())
+        );
+        // And on a code without a Helmert shift (NAD 27's is a grid).
+        let nad27_zero = r#"GEOGCS["NAD27",DATUM["North_American_Datum_1927",SPHEROID["Clarke 1866",6378206.4,294.978698213898],TOWGS84[0,0,0,0,0,0,0]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4267"]]"#;
+        assert_eq!(
+            crs_from_wkt(&bound_crs(BESSEL_WKT2, nad27_zero, &BESSEL_SHIFT)),
+            Err("NAD27 gives a shift of zero to WGS 84 where its datum has one".into())
         );
         let wgs84_zero = r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563],TOWGS84[0,0,0,0,0,0,0]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4326"]]"#;
         assert!(metres_apart(at(&bound_crs(BESSEL_WKT2, wgs84_zero, &BESSEL_SHIFT)), to_wgs84) < 0.001);
