@@ -102,8 +102,9 @@ or other WKT:
   only by that code keeps the code's transformation, with a notice. Web Mercator is on WGS 84, so
   a transformation its file gives is set aside, with a notice.
 - A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
-  datum's own transformation to WGS 84: the one the file gives it, else the built-in one. It is
-  refused when there is neither.
+  datum's own transformation to WGS 84: the one the file gives it, else none for a datum treated
+  as WGS 84 (such as RDN2008, IGM95 or NAD 83), else the built-in one. It is refused when there is
+  none of these.
 - A UTM name (`WGS_1984_UTM_Zone_31N`) gives its EPSG code only when the parameters are that
   zone's.
 - Projected axes pointing west or south, as in South Africa's Lo grids, are read as such, or

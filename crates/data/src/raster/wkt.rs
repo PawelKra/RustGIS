@@ -269,7 +269,15 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
     // code's shift in place of the file's, which is said.
     match (read_system(&root), by_code) {
         (Err(e), Some((code, crs))) => {
-            let note = format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {e}");
+            let codes_shift = matches!(crs, Crs::LonLat | Crs::WebMercator)
+                || u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift).is_some();
+            let note = if codes_shift {
+                format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {e}")
+            } else {
+                format!(
+                    "the file's own shift to WGS 84 is set aside, because {e}, and EPSG:{code} is read without it, so positions may be off by as much as that shift"
+                )
+            };
             Ok((crs, with_projection_note(Some(note), &root, crs)))
         }
         (read, _) => read,
@@ -1064,7 +1072,8 @@ fn axis_flip(p: &Node) -> Result<Option<&'static str>, String> {
 fn polar(p: &Node) -> bool {
     let method = norm(p.child("PROJECTION").map_or("", Node::title));
     let lat0 = parameter(&parameters(p), &LATITUDE_OF_ORIGIN);
-    method.contains("POLAR") || lat0.is_some_and(|lat| (lat.abs() - 90.0).abs() < 1e-9)
+    // `POLAR_STEREOGRAPHIC`, or Esri's `STEREOGRAPHIC_NORTH_POLE` / `STEREOGRAPHIC_SOUTH_POLE`.
+    method.contains("POLAR") || method.ends_with("_POLE") || lat0.is_some_and(|lat| (lat.abs() - 90.0).abs() < 1e-9)
 }
 
 /// A projection's PROJ definition built from its WKT parameters.
@@ -2495,6 +2504,15 @@ pub(crate) mod tests {
         let corpus_3413 = rows.iter().find(|r| r.0 == "EPSG:3413").unwrap().1;
         let ll = at(gdal_3413, Coord::new(corpus_3413[0], corpus_3413[1]));
         assert!(metres_apart(ll, Coord::new(corpus_3413[2], corpus_3413[3])) < 1.0, "{ll:?}");
+        // So are they under Esri's name for the method, with its latitude of true scale.
+        let esri_3413 = gdal_3413.replace(
+            r#"PROJECTION["Polar_Stereographic"],PARAMETER["latitude_of_origin",70]"#,
+            r#"PROJECTION["Stereographic_North_Pole"],PARAMETER["standard_parallel_1",70]"#,
+        );
+        assert_ne!(esri_3413, gdal_3413);
+        assert!(!proj4(&esri_3413).unwrap().contains("+axis"));
+        let ll = at(&esri_3413, Coord::new(corpus_3413[0], corpus_3413[1]));
+        assert!(metres_apart(ll, Coord::new(corpus_3413[2], corpus_3413[3])) < 1.0, "{ll:?}");
     }
 
     /// A projection that can't take axes pointing west or south is refused rather than mirrored.
@@ -2721,6 +2739,19 @@ pub(crate) mod tests {
             note.as_deref(),
             Some(
                 "the file's own shift to WGS 84 is set aside for EPSG:5514's, because the Krovak (North Orientated) projection isn't supported"
+            )
+        );
+        // With a code that has no shift of its own (NAD 27's is a grid), the notice says the file's
+        // shift isn't applied at all.
+        assert_eq!(epsg_proj4(4267).and_then(bundled_shift), None);
+        let nad27_code = krovak.replace(r#"ID["EPSG",5514]]"#, r#"ID["EPSG",4267]]"#);
+        assert_ne!(nad27_code, krovak);
+        let (crs, note) = read_wkt(&bound_crs(&nad27_code, WGS84_WKT2, &[570.8, 85.7, 462.8])).unwrap();
+        assert_eq!(crs, Crs::Epsg(4267));
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "the file's own shift to WGS 84 is set aside, because the Krovak (North Orientated) projection isn't supported, and EPSG:4267 is read without it, so positions may be off by as much as that shift"
             )
         );
         let wkt1 = to_wkt(Crs::Epsg(27700)).unwrap();

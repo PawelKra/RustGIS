@@ -859,6 +859,10 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
             && from_wkt2
             && let Some(wkt1) = wkt1
         {
+            // Unless the WKT2 is another body's system: it is the one that counts.
+            if let Some(reproject) = other_body(Some(definition), notes) {
+                return reproject;
+            }
             notes.push(format!("{what}: its WKT2 definition can't be read ({e}), so its WKT1 definition is used"));
             definition = wkt1;
             read = crate::raster::wkt::read_wkt(wkt1);
