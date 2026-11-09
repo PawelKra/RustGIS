@@ -330,6 +330,12 @@ fn with_projection_note(note: Option<String>, root: &Node, crs: Crs) -> Option<S
     }
 }
 
+/// Whether `text` is a geographic or projected system in WKT this reader can parse (whether or not
+/// it then reads the system).
+pub fn parses(text: &str) -> bool {
+    parse(text).and_then(|n| wkt1(n, 0)).is_ok_and(|n| ["GEOGCS", "PROJCS"].iter().any(|r| n.name.eq_ignore_ascii_case(r)))
+}
+
 /// The file's declared EPSG method differs from the formula used for compatibility with PROJ.
 /// A known CRS authority can bypass reading its definition, but must still report that choice.
 pub fn projection_compatibility_note(text: &str, crs: Crs) -> Option<&'static str> {

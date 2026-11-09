@@ -28,6 +28,22 @@ fn explicit_method_1028_warns_for_known_geopackage_authorities() {
             assert!(at.x.abs() < 1e-9 && (at.y - 45.0).abs() < 1e-9, "{at:?}");
         }
     }
+    // The WKT1 names the method when the WKT2 can't be parsed: still said. A WKT2 that is read
+    // counts, also when the WKT1 says otherwise (here, on a sphere: nothing to say).
+    for (wkt2, warned) in
+        [("GEOGCRS[", true), (r#"ENGCRS["site",EDATUM["site"]]"#, true), (&wkt.replace(r#",ID["EPSG",1028]"#, ""), true), (&sphere, false)]
+    {
+        assert_ne!(wkt2, wkt);
+        let mut notes = Vec::new();
+        let row = GpkgSrs {
+            organization: Some("EPSG".into()),
+            code: Some(4087),
+            definition: Some(wkt.into()),
+            definition_12_063: Some(wkt2.into()),
+        };
+        gpkg_reproject(100001, Some(row), &mut notes).unwrap();
+        assert_eq!(notes.iter().filter(|n| n.contains("EPSG method 1028")).count(), usize::from(warned), "{wkt2}: {notes:?}");
+    }
 }
 
 #[test]
