@@ -863,7 +863,9 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
                 crs
             }
             Err(e) => {
-                if let Some(reproject) = other_body(Some(definition), notes) {
+                // The WKT2 is asked first: when the WKT1 read in its place can't be read either,
+                // the WKT2 still tells another body's system.
+                if let Some(reproject) = wkt2.into_iter().chain([definition]).find_map(|d| other_body(Some(d), notes)) {
                     return reproject;
                 }
                 notes.push(format!("{what} can't be read ({e}); read as longitude/latitude"));

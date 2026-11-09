@@ -91,13 +91,16 @@ and S-JTSK, the same built-in Helmert datum transformation as the EPSG definitio
 or other WKT:
 
 - A transformation in the file (a `TOWGS84`, or a WKT2 `BOUNDCRS`'s) takes precedence, also over
-  the built-in one of an EPSG code the file gives, as in PROJ and GDAL.
+  the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. A system RustGIS can read
+  only by that code keeps the code's transformation, with a notice.
 - A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
-  datum's built-in transformation, and is refused when there is none.
+  datum's own transformation to WGS 84: the one the file gives it, else the built-in one. It is
+  refused when there is neither.
 - A UTM name (`WGS_1984_UTM_Zone_31N`) gives its EPSG code only when the parameters are that
   zone's.
 - Projected axes pointing west or south, as in South Africa's Lo grids, are read as such, or
-  refused where they can't be (Web Mercator, Krovak, sinusoidal).
+  refused where they can't be (Web Mercator, Krovak, sinusoidal, or such axes declared northing
+  first, as in Austria's Ferro grids).
 
 RDN2008 and IGM95 are treated as WGS 84-like datums. These transformations do not replace
 regional grid corrections for survey accuracy. An unrecognized datum keeps its ellipsoid and

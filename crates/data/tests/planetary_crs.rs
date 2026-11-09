@@ -279,6 +279,16 @@ fn planetographic_systems_without_east_axes_are_refused() {
     assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
     let e = mem(&path).err().unwrap().to_string();
     assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
+    // And when the WKT2 is the refused one and the WKT1 can't be read either.
+    let path = geopackage(dir.path(), "ographic_wkt1_broken", LONLAT, ("NONE", 1, "GEOGCS["));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("ALTER TABLE gpkg_spatial_ref_sys ADD COLUMN definition_12_063 TEXT", []).unwrap();
+    conn.execute("UPDATE gpkg_spatial_ref_sys SET definition_12_063 = ?1 WHERE srs_id = 990001", [MARS_OGRAPHIC_ESRI]).unwrap();
+    drop(conn);
+    let e = io::read_path(&path).unwrap_err().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
+    let e = mem(&path).err().unwrap().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
     let east = with_axes(MARS_OGRAPHIC_ESRI, east_north);
     let path = geopackage(dir.path(), "ographic_east", LONLAT, ("IAU_2015", 49901, &east));
     let (ds, report) = io::read_path(&path).unwrap();

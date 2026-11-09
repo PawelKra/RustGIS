@@ -255,27 +255,41 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
     // bundled for its EPSG code, as in PROJ and GDAL. The code is used only when the two are the
     // same.
     let files_shift = towgs84(geogcs(&root).and_then(|g| g.child("DATUM")));
-    if let Some(a) = root.child("AUTHORITY")
-        && a.title().eq_ignore_ascii_case("EPSG")
-        && let Some(code) = authority_code(a)
-        && let Some(crs) = Crs::from_epsg(code)
+    let by_code = root
+        .child("AUTHORITY")
+        .filter(|a| a.title().eq_ignore_ascii_case("EPSG"))
+        .and_then(authority_code)
+        .and_then(|code| Some((code, Crs::from_epsg(code)?)));
+    if let Some((code, crs)) = by_code
         && files_shift.is_none_or(|shift| matches_bundled_shift(code, &shift))
     {
         return Ok((crs, None));
     }
+    // A system that can't be read from its parameters is still read by its EPSG code, with the
+    // code's shift in place of the file's, which is said.
+    match (read_system(&root), by_code) {
+        (Err(e), Some((code, crs))) => {
+            Ok((crs, Some(format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {e}"))))
+        }
+        (read, _) => read,
+    }
+}
+
+/// A WKT1 system read from its parameters, with its note ([`read_wkt`]).
+fn read_system(root: &Node) -> Result<(Crs, Option<String>), String> {
     match root.name.to_ascii_uppercase().as_str() {
         "GEOGCS" => {
-            if on_another_body(Some(&root)) && planetographic(&root) && !counts_east(&root) {
+            if on_another_body(Some(root)) && planetographic(root) && !counts_east(root) {
                 return Err(planetary::OGRAPHIC.into());
             }
-            let crs = geographic(&root)?;
-            Ok((crs, note(crs, Some(&root))))
+            let crs = geographic(root)?;
+            Ok((crs, note(crs, Some(root))))
         }
         "PROJCS" => {
             if on_another_body(root.child("GEOGCS")) {
-                mirrored_projection(&root)?;
+                mirrored_projection(root)?;
             }
-            let crs = projected(&root)?;
+            let crs = projected(root)?;
             let note = if matches!(crs, Crs::Custom(_)) { note(crs, root.child("GEOGCS")) } else { None };
             Ok((crs, note))
         }
@@ -658,6 +672,8 @@ fn bound(b: Node, depth: usize) -> Result<Node, String> {
     }
     let geog = if crs.name.eq_ignore_ascii_case("GEOGCS") { Some(&mut crs) } else { crs.child_mut("GEOGCS") };
     if let Some(datum) = geog.and_then(|g| g.child_mut("DATUM")) {
+        // The bound transformation replaces a `TOWGS84` the source (in WKT1) gives itself.
+        datum.items.retain(|i| !matches!(i, Item::Node(n) if n.name.eq_ignore_ascii_case("TOWGS84")));
         datum.items.push(Item::Node(Node { name: "TOWGS84".into(), items: towgs84.into_iter().map(Item::Num).collect() }));
     }
     Ok(crs)
@@ -722,14 +738,22 @@ fn compose(first: &[f64], second: [f64; 7]) -> Result<Vec<f64>, String> {
     Ok(vec![x, y, z, first[3] + second[3], first[4] + second[4], first[5] + second[5], scale])
 }
 
-/// Whether `shift` (three or seven parameters) is the shift bundled for EPSG `code`: zero for WGS 84
-/// and the datums taken for it. A datum with no bundled shift (NAD 27's is a grid) matches none.
+/// Whether `shift` (three or seven parameters) is the shift bundled for EPSG `code`: zero for WGS 84,
+/// the datums taken for it and Web Mercator. A datum with no bundled shift (NAD 27's is a grid)
+/// matches none.
 fn matches_bundled_shift(code: u32, shift: &[f64]) -> bool {
     // Writers round the last digit differently: GDAL writes Hong Kong 1980's rotations as
     // -2.243648″ and -1.158828″, the bundled shift has -2.243649″ and -1.158827″. Differences
     // under 1e-5 (metres, arc-seconds or parts per million) move a point less than a millimetre.
     const ROUNDING: f64 = 1e-5;
-    let Some(bundled) = u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift) else { return false };
+    // Web Mercator's datum is WGS 84, so its shift is none. (It projects as if on a sphere, which
+    // EPSG:3785 gives as its datum's ellipsoid.)
+    let bundled = if Crs::from_epsg(code) == Some(Crs::WebMercator) {
+        Some([0.0; 7])
+    } else {
+        u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift)
+    };
+    let Some(bundled) = bundled else { return false };
     bundled.iter().enumerate().all(|(i, b)| (shift.get(i).copied().unwrap_or(0.0) - b).abs() < ROUNDING)
 }
 
@@ -821,7 +845,8 @@ fn utm_central_meridian(zone: f64) -> f64 {
 
 /// Whether a projected system is the UTM zone of EPSG `code`, as [`utm`] gives it:
 /// - Transverse Mercator;
-/// - on a WGS 84-like datum the file adds no shift of its own to, from Greenwich;
+/// - on a WGS 84-like datum the file adds no shift of its own to, from Greenwich (NAD 83's
+///   realisations count as one);
 /// - in metres, with axes east and north;
 /// - at the zone's central meridian, from the equator;
 /// - with UTM's scale, false easting, and false northing (0 north of the equator).
@@ -835,8 +860,17 @@ fn is_utm_zone(p: &Node, method: &str, code: u32) -> bool {
     let get = |names: &[&str], default: f64| parameter(&params, names).unwrap_or(default);
     // Equal but for the rounding of written values: within a billionth of the value, or of 1 near 0.
     let near = |v: f64, to: f64| (v - to).abs() <= 1e-9 * to.abs().max(1.0);
+    // NAD 83's realisations (HARN, 2011, CSRS, …) differ from WGS 84 by a metre or so, as NAD 83
+    // does. They are told by their names, which start as NAD 83's: an ellipsoid alone doesn't say
+    // which datum it is.
+    let nad83_realisation = |d: &Node| {
+        let name = norm(d.title());
+        let name = name.trim_start_matches("D_");
+        ["NORTH_AMERICAN_1983", "NORTH_AMERICAN_DATUM_1983", "NAD_1983", "NAD83"].iter().any(|n| name.starts_with(n))
+            && ellipsoid_matches(d, "+proj=longlat +ellps=GRS80")
+    };
     method == "TRANSVERSE_MERCATOR"
-        && (datum.is_none() || wgs84_like(datum).is_some())
+        && datum.is_none_or(|d| wgs84_like(Some(d)).is_some() || nad83_realisation(d))
         && !shifted(datum)
         && geog.and_then(|g| g.child("PRIMEM")).and_then(|m| m.num(0)).is_none_or(|pm| near(pm, 0.0))
         && p.child("UNIT").and_then(|u| u.num(0)).is_none_or(|m| near(m, 1.0))
@@ -920,7 +954,8 @@ const CENTRAL_MERIDIAN: [&str; 4] = ["CENTRAL_MERIDIAN", "LONGITUDE_OF_CENTER", 
 /// Lo grids count westings and southings): `wnu`, `esu` or `wsu`, in the easting-then-northing
 /// order coordinates are read in. `None` for east and north, for no axes, and for a polar
 /// system's: they follow meridians, as its projection does. A height or depth axis (a
-/// three-dimensional WKT2 system's) doesn't count. Other axes pointing west or south are refused.
+/// three-dimensional WKT2 system's) doesn't count. Other axes pointing west or south are refused,
+/// and so are such axes declared northing first.
 ///
 /// It is for an Earth projection's axes. Systems whose reversed axes can't be read this way
 /// (geographic systems, Krovak, another body's projections) are refused by [`reversed_axes`].
@@ -942,9 +977,16 @@ fn axis_flip(p: &Node) -> Result<Option<&'static str>, String> {
         if directions.iter().any(|d| d == "WEST" || d == "SOUTH") { Err(REVERSED_AXES.to_string()) } else { Ok(None) }
     };
     let [a, b] = directions.as_slice() else { return unless_west_or_south() };
-    // Axes may be declared northing first. Coordinates are read easting first all the same, so
-    // the east-west axis is x.
-    let (x, y) = if a == "EAST" || a == "WEST" { (a, b) } else { (b, a) };
+    // Axes may be declared northing first (EPSG:2180's). Coordinates are read easting first all
+    // the same, so the east-west axis is x.
+    let northing_first = a == "NORTH" || a == "SOUTH";
+    let (x, y) = if northing_first { (b, a) } else { (a, b) };
+    // With axes pointing south or west, PROJ and GDAL keep the declared order, so a southing
+    // declared first is x (Austria's Ferro grids, EPSG:8044). Read easting first, positions would
+    // be hundreds of kilometres off, so such axes are refused.
+    if northing_first && (x == "EAST" || x == "WEST") && !(x == "EAST" && y == "NORTH") {
+        return Err(REVERSED_AXES.to_string());
+    }
     match (x.as_str(), y.as_str()) {
         ("EAST", "NORTH") => Ok(None),
         ("WEST", "NORTH") => Ok(Some("wnu")),
@@ -2321,9 +2363,6 @@ pub(crate) mod tests {
             r#"ORDER[2],LENGTHUNIT["metre",1]],AXIS["ellipsoidal height (h)",up,ORDER[3],LENGTHUNIT["metre",1]]]"#,
         );
         assert!(three_d.contains(",up,ORDER[3]") && proj4(&three_d).unwrap().contains("+axis=wsu"), "{three_d}");
-        // In either order, as coordinates are read easting first whatever order is declared.
-        let swapped = LO19.replace(r#"AXIS["Y",WEST],AXIS["X",SOUTH]"#, r#"AXIS["X",SOUTH],AXIS["Y",WEST]"#);
-        assert!(metres_apart(at(&swapped, xy), lonlat) < 0.001);
         // Westings only, southings only: the other coordinate counts as usual.
         let west = LO19.replace(r#"AXIS["X",SOUTH]"#, r#"AXIS["X",NORTH]"#);
         assert!(proj4(&west).unwrap().contains("+axis=wnu"));
@@ -2391,6 +2430,31 @@ pub(crate) mod tests {
         assert!(def.proj4.contains("+proj=eqc") && def.proj4.contains("+axis=wnu"), "{}", def.proj4);
     }
 
+    /// Axes declared northing first are read easting first when they point north and east, and
+    /// refused when they point south or west: PROJ reads the southing as x there.
+    #[test]
+    fn northing_first_axes_pointing_south_or_west_are_refused() {
+        // EPSG:8044 as GDAL writes it without its code. Read with `+axis=wsu`, its points would be
+        // hundreds of kilometres from where PROJ puts them.
+        let gusterberg = r#"PROJCS["Gusterberg Grid (Ferro)",GEOGCS["Gusterberg (Ferro)",DATUM["Gusterberg_Ferro",SPHEROID["Zach 1812",6376045,310]],PRIMEM["Ferro",-17.6666666666667],UNIT["degree",0.0174532925199433]],PROJECTION["Cassini_Soldner"],PARAMETER["latitude_of_origin",48.0384638888889],PARAMETER["central_meridian",31.8041805555556],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1],AXIS["Southing",SOUTH],AXIS["Westing",WEST]]"#;
+        assert_eq!(crs_from_wkt(gusterberg), Err("axes pointing west or south aren't supported".into()));
+        let swapped = LO19.replace(r#"AXIS["Y",WEST],AXIS["X",SOUTH]"#, r#"AXIS["X",SOUTH],AXIS["Y",WEST]"#);
+        assert_ne!(swapped, LO19);
+        assert_eq!(crs_from_wkt(&swapped), Err("axes pointing west or south aren't supported".into()));
+        // The Lo grids declare their westing first: read, as `projected_axes_west_and_south_are_read`
+        // checks.
+        let (xy, lonlat) = LO19_POINT;
+        let lo19 = crs_from_wkt(LO19).unwrap().transformer().unwrap().to_lonlat(xy).unwrap();
+        assert!(metres_apart(lo19, lonlat) < 0.001, "{lo19:?}");
+        // EPSG:2180 declares its northing first, north and east: read easting first, without
+        // `+axis`. PROJ puts 509 847.9005 m E, 511 024.2427 m N at 19.145°E 52.465°N.
+        let pl_1992 = r#"PROJCS["ETRS89 / PL-1992",GEOGCS["ETRS89",DATUM["European_Terrestrial_Reference_System_1989",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",19],PARAMETER["scale_factor",0.9993],PARAMETER["false_easting",500000],PARAMETER["false_northing",-5300000],UNIT["metre",1],AXIS["Northing",NORTH],AXIS["Easting",EAST]]"#;
+        let (crs, note) = read_wkt(pl_1992).unwrap();
+        assert!(note.is_none() && !crs.custom_def().unwrap().proj4.contains("+axis"), "{crs:?} {note:?}");
+        let ll = crs.transformer().unwrap().to_lonlat(Coord::new(509_847.900_535_462_54, 511_024.242_654_006)).unwrap();
+        assert!(metres_apart(ll, Coord::new(19.145, 52.465)) < 0.001, "{ll:?}");
+    }
+
     /// A UTM zone's name gives its EPSG code only when the parameters are that zone's; otherwise
     /// they're read as they are.
     #[test]
@@ -2444,6 +2508,22 @@ pub(crate) mod tests {
             )
             .replace(r#""Central_Meridian",3.0"#, r#""Central_Meridian",-81.0"#);
         assert_eq!(crs_from_wkt(&nad83), Ok(Crs::Epsg(26917)));
+        // So it is on NAD 83's realisations, told by their names, without a note.
+        for datum in ["D_North_American_1983_HARN", "D_NAD_1983_2011", "D_North_American_1983_CSRS"] {
+            let realisation = nad83.replace(r#""D_North_American_1983""#, &format!(r#""{datum}""#));
+            assert_ne!(realisation, nad83);
+            assert_eq!(read_wkt(&realisation), Ok((Crs::Epsg(26917), None)), "{datum}");
+        }
+        // Another datum on the same ellipsoid isn't taken for WGS 84: it is read from its
+        // parameters, with its note.
+        let local = ESRI_32631.replace(
+            r#"DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]]"#,
+            r#"DATUM["D_Local_Survey",SPHEROID["GRS_1980",6378137.0,298.257222101]]"#,
+        );
+        assert_ne!(local, ESRI_32631);
+        let (crs, note) = read_wkt(&local).unwrap();
+        assert!(matches!(crs, Crs::Custom(_)), "{crs:?}");
+        assert!(note.is_some_and(|n| n.starts_with("the datum D_Local_Survey has no conversion to WGS 84")));
         // WKT2, without its ID: by EPSG's parameter names.
         let rows = corpus();
         let wkt2 = rows.iter().find(|r| r.0 == "EPSG:32631").unwrap().2;
@@ -2523,6 +2603,24 @@ pub(crate) mod tests {
         assert_eq!(crs_from_wkt(&bound_crs(&bng, WGS84_WKT2, &osgb)), Ok(Crs::Epsg(27700)));
         let def = crs_from_wkt(&bound_crs(&bng, WGS84_WKT2, &[375.0, -111.0, 431.0])).unwrap().custom_def().unwrap();
         assert!(def.proj4.starts_with("+proj=tmerc +lat_0=49") && def.proj4.contains("+towgs84=375,-111,431 "), "{}", def.proj4);
+        // A WKT1 source with a `TOWGS84` of its own: the bound transformation replaces it.
+        let bng_wkt1 = to_wkt(Crs::Epsg(27700)).unwrap();
+        assert!(bng_wkt1.contains("TOWGS84[446.448,"), "{bng_wkt1}");
+        let def = crs_from_wkt(&bound_crs(&bng_wkt1, WGS84_WKT2, &[375.0, -111.0, 431.0])).unwrap().custom_def().unwrap();
+        assert!(def.proj4.contains("+towgs84=375,-111,431 ") && !def.proj4.contains("446.448"), "{}", def.proj4);
+        // A system that can't be read from its parameters (Krovak North Orientated, in WKT2) is
+        // read by its code, with the code's shift instead of the file's, said.
+        let krovak = format!(r#"{},ID["EPSG",5514]]"#, rows.iter().find(|r| r.0 == "EPSG:5514").unwrap().2.strip_suffix(']').unwrap());
+        assert_eq!(epsg_proj4(5514).and_then(earth_of).unwrap().1, [589.0, 76.0, 480.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(read_wkt(&bound_crs(&krovak, WGS84_WKT2, &[589.0, 76.0, 480.0])), Ok((Crs::Epsg(5514), None)));
+        let (crs, note) = read_wkt(&bound_crs(&krovak, WGS84_WKT2, &[570.8, 85.7, 462.8])).unwrap();
+        assert_eq!(crs, Crs::Epsg(5514));
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "the file's own shift to WGS 84 is set aside for EPSG:5514's, because the Krovak (North Orientated) projection isn't supported"
+            )
+        );
         let wkt1 = to_wkt(Crs::Epsg(27700)).unwrap();
         assert!(wkt1.contains("TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]"), "{wkt1}");
         assert_eq!(crs_from_wkt(&wkt1), Ok(Crs::Epsg(27700)));
@@ -2544,6 +2642,24 @@ pub(crate) mod tests {
         let towgs84 = |t: &str| utm.replace("298.257223563]]", &format!("298.257223563],{t}]"));
         assert_eq!(crs_from_wkt(&towgs84("TOWGS84[0,0,0]")), Ok(Crs::Epsg(32631)));
         assert!(matches!(crs_from_wkt(&towgs84("TOWGS84[1,2,3]")), Ok(Crs::Custom(_))));
+    }
+
+    /// Web Mercator's codes with a shift of zero, as GDAL writes them, are Web Mercator. Read from
+    /// their parameters, as Mercator on an ellipsoid, points would be 21 km off.
+    #[test]
+    fn web_mercator_with_a_zero_shift_is_web_mercator() {
+        // EPSG:3785, and GDAL 1's EPSG:900913.
+        let popular = r#"PROJCS["Popular Visualisation CRS / Mercator",GEOGCS["Popular Visualisation CRS (deprecated)",DATUM["Popular_Visualisation_Datum",SPHEROID["Popular Visualisation Sphere",6378137,0,AUTHORITY["EPSG","7059"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6055"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AXIS["Latitude",NORTH],AXIS["Longitude",EAST],AUTHORITY["EPSG","4055"]],PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH],EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs"],AUTHORITY["EPSG","3785"]]"#;
+        let google = r#"PROJCS["Google Maps Global Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.01745329251994328,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]],PROJECTION["Mercator_2SP"],PARAMETER["standard_parallel_1",0],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",0],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["Meter",1],EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext  +no_defs"],AUTHORITY["EPSG","900913"]]"#;
+        for wkt in [popular, google] {
+            assert_eq!(read_wkt(wkt), Ok((Crs::WebMercator, None)), "{wkt}");
+            // PROJ puts 6 679 169.4476 m E, 5 621 521.4862 m N at 60°E 45°N.
+            let ll = Crs::WebMercator.transformer().unwrap().to_lonlat(Coord::new(6_679_169.447_596_414, 5_621_521.486_192_066)).unwrap();
+            assert!(metres_apart(ll, Coord::new(60.0, 45.0)) < 0.001, "{ll:?}");
+        }
+        // Another shift is the file's own, read from its parameters.
+        let shifted = google.replace("TOWGS84[0,0,0,0,0,0,0]", "TOWGS84[1,2,3,0,0,0,0]");
+        assert!(matches!(crs_from_wkt(&shifted), Ok(Crs::Custom(_))));
     }
 
     /// PROJ's `+towgs84` as WKT2: a `BOUNDCRS` with the shift to WGS 84 as its transformation.
