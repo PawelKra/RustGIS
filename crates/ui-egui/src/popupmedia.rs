@@ -10,7 +10,8 @@
 //!
 //! Fetching a picture named by the data tells its server who opened the file and when, so only
 //! RustGIS's own asset server ([`AUTO_HOST`], exactly, over `https://`: [`loads_by_itself`]) is
-//! fetched as the pop-up opens; a redirect it answers with is followed, as for any download. A
+//! fetched as the pop-up opens. A redirect it answers with is handled as for any download:
+//! followed natively, refused in the browser, which can't show where it leads. A
 //! picture anywhere else shows a **Show Picture** button and nothing is fetched until it is
 //! clicked. A plain `http://` picture, or one on this computer or the local network, is never
 //! fetched; the pop-up says so.

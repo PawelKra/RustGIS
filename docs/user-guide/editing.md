@@ -234,7 +234,8 @@ one can't be shown, the pop-up says why ("Picture unavailable: …": the server'
 error, not a picture, a picture format that isn't supported, too large) and doesn't ask again; its
 address stays a link. A plain `http://` picture, or one on this computer or the local network, is
 never fetched. In the web app the picture's server must allow it to be read from another site
-(CORS); many photo sites do, some don't.
+(CORS); many photo sites do, some don't. It must also give the picture at that address: the web
+app refuses a redirect, as it does for every download.
 
 The topmost and visible modes also identify the features of vector tile layers under the click:
 PMTiles and MBTiles archives and vector tiles added as data (not catalog basemaps or MapLibre
