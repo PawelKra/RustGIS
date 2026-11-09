@@ -290,7 +290,14 @@ fn read_system(root: &Node) -> Result<(Crs, Option<String>), String> {
                 mirrored_projection(root)?;
             }
             let crs = projected(root)?;
-            let note = if matches!(crs, Crs::Custom(_)) { note(crs, root.child("GEOGCS")) } else { None };
+            let note = match crs {
+                Crs::Custom(_) => note(crs, root.child("GEOGCS")),
+                // Web Mercator is on WGS 84, so a shift the file gives its datum isn't applied.
+                Crs::WebMercator if towgs84(geogcs(root).and_then(|g| g.child("DATUM"))).is_some_and(|s| s.iter().any(|v| *v != 0.0)) => {
+                    Some("the file's own shift to WGS 84 is set aside, as Web Mercator is on WGS 84".into())
+                }
+                _ => None,
+            };
             Ok((crs, note))
         }
         other => Err(format!("{other} coordinate systems aren't supported")),
@@ -2660,6 +2667,16 @@ pub(crate) mod tests {
         // Another shift is the file's own, read from its parameters.
         let shifted = google.replace("TOWGS84[0,0,0,0,0,0,0]", "TOWGS84[1,2,3,0,0,0,0]");
         assert!(matches!(crs_from_wkt(&shifted), Ok(Crs::Custom(_))));
+        // A system named and projected as Web Mercator stays Web Mercator, and a shift its file
+        // gives is said to be set aside.
+        let esri = ESRI_3857.replace("6378137.0,298.257223563]]", "6378137.0,298.257223563],TOWGS84[1,2,3]]");
+        assert_ne!(esri, ESRI_3857);
+        let (crs, note) = read_wkt(&esri).unwrap();
+        assert_eq!(crs, Crs::WebMercator);
+        assert_eq!(note.as_deref(), Some("the file's own shift to WGS 84 is set aside, as Web Mercator is on WGS 84"));
+        assert_eq!(read_wkt(ESRI_3857), Ok((Crs::WebMercator, None)));
+        let zero = ESRI_3857.replace("6378137.0,298.257223563]]", "6378137.0,298.257223563],TOWGS84[0,0,0]]");
+        assert_eq!(read_wkt(&zero), Ok((Crs::WebMercator, None)));
     }
 
     /// PROJ's `+towgs84` as WKT2: a `BOUNDCRS` with the shift to WGS 84 as its transformation.

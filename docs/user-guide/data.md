@@ -92,7 +92,8 @@ or other WKT:
 
 - A transformation in the file (a `TOWGS84`, or a WKT2 `BOUNDCRS`'s) takes precedence, also over
   the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. A system RustGIS can read
-  only by that code keeps the code's transformation, with a notice.
+  only by that code keeps the code's transformation, with a notice. Web Mercator is on WGS 84, so
+  a transformation its file gives is set aside, with a notice.
 - A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
   datum's own transformation to WGS 84: the one the file gives it, else the built-in one. It is
   refused when there is neither.
