@@ -255,9 +255,10 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
     // bundled for its EPSG code, as in PROJ and GDAL. The code is used only when the two are the
     // same.
     let files_shift = towgs84(geogcs(&root).and_then(|g| g.child("DATUM")));
+    // EPSG's codes are the Earth's: one on another body's system is read from its parameters.
     let by_code = root
         .child("AUTHORITY")
-        .filter(|a| a.title().eq_ignore_ascii_case("EPSG"))
+        .filter(|a| a.title().eq_ignore_ascii_case("EPSG") && !on_another_body(geogcs(&root)))
         .and_then(authority_code)
         .and_then(|code| Some((code, Crs::from_epsg(code)?)));
     if let Some((code, crs)) = by_code
@@ -2786,6 +2787,21 @@ pub(crate) mod tests {
         let towgs84 = |t: &str| utm.replace("298.257223563]]", &format!("298.257223563],{t}]"));
         assert_eq!(crs_from_wkt(&towgs84("TOWGS84[0,0,0]")), Ok(Crs::Epsg(32631)));
         assert!(matches!(crs_from_wkt(&towgs84("TOWGS84[1,2,3]")), Ok(Crs::Custom(_))));
+    }
+
+    /// Another body's system with an EPSG code (the Earth's) is read from its parameters, not as
+    /// the code's Earth system: refused when it can't be read, with a shift of its own or without.
+    #[test]
+    fn another_bodys_system_is_not_read_by_an_epsg_code() {
+        let mars = r#"GEOGCS["Mars_2015_Ographic",DATUM["D_Mars_2015",SPHEROID["Mars_2015",3396190.0,169.894447223612]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433],AUTHORITY["EPSG","4326"]]"#;
+        assert_eq!(read_wkt(mars), Err(planetary::OGRAPHIC.to_string()));
+        let shifted = mars.replace("169.894447223612]]", "169.894447223612],TOWGS84[1,2,3]]");
+        assert_ne!(shifted, mars);
+        assert_eq!(read_wkt(&shifted), Err(planetary::OGRAPHIC.to_string()));
+        // A planetocentric one is read as the Mars system it is.
+        let ocentric = mars.replace("Mars_2015_Ographic", "Mars_2015_Ocentric").replace("169.894447223612", "0");
+        let (crs, _) = read_wkt(&ocentric).unwrap();
+        assert!(crs.is_planetary(), "{crs:?}");
     }
 
     /// Web Mercator's codes with a shift of zero, as GDAL writes them, are Web Mercator. Read from
