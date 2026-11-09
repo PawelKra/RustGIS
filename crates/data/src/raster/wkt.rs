@@ -1066,7 +1066,9 @@ fn axis_flip(p: &Node) -> Result<Option<&'static str>, String> {
         .nodes()
         .filter(|a| a.name.eq_ignore_ascii_case("AXIS") && a.child("MERIDIAN").is_none())
         .filter_map(|a| {
-            a.items.iter().find_map(|i| match i {
+            // The direction is the last bare word: an unquoted name (`AXIS[Westing,WEST]`) comes
+            // before it.
+            a.items.iter().rev().find_map(|i| match i {
                 Item::Word(w) => Some(w.to_ascii_uppercase()),
                 _ => None,
             })
@@ -2508,6 +2510,10 @@ pub(crate) mod tests {
         );
         assert!(three_d.contains(",up,ORDER[3]") && proj4(&three_d).unwrap().contains("+axis=wsu"), "{three_d}");
         // Westings only, southings only: the other coordinate counts as usual.
+        // Unquoted axis names, as some writers give them: the direction is still read.
+        let unquoted = LO19.replace(r#"AXIS["Y",WEST],AXIS["X",SOUTH]"#, "AXIS[Y,WEST],AXIS[X,SOUTH]");
+        assert_ne!(unquoted, LO19);
+        assert!(proj4(&unquoted).unwrap().contains("+axis=wsu"));
         let west = LO19.replace(r#"AXIS["X",SOUTH]"#, r#"AXIS["X",NORTH]"#);
         assert!(proj4(&west).unwrap().contains("+axis=wnu"));
         assert!(metres_apart(at(&west, Coord::new(xy.x, -xy.y)), lonlat) < 0.001);
