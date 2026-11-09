@@ -268,6 +268,17 @@ fn planetographic_systems_without_east_axes_are_refused() {
     assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
     let e = mem(&path).err().unwrap().to_string();
     assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
+    // So it is beside a WKT2 definition that can't be read, which gives way to it (without the
+    // IAU code, which would say it too).
+    let path = geopackage(dir.path(), "ographic_wkt2", LONLAT, ("NONE", 1, MARS_OGRAPHIC_ESRI));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("ALTER TABLE gpkg_spatial_ref_sys ADD COLUMN definition_12_063 TEXT", []).unwrap();
+    conn.execute(r#"UPDATE gpkg_spatial_ref_sys SET definition_12_063 = 'PROJCRS["x"]' WHERE srs_id = 990001"#, []).unwrap();
+    drop(conn);
+    let e = io::read_path(&path).unwrap_err().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
+    let e = mem(&path).err().unwrap().to_string();
+    assert!(e.contains(ANOTHER_BODY) && e.contains("planetographic"), "{e}");
     let east = with_axes(MARS_OGRAPHIC_ESRI, east_north);
     let path = geopackage(dir.path(), "ographic_east", LONLAT, ("IAU_2015", 49901, &east));
     let (ds, report) = io::read_path(&path).unwrap();
