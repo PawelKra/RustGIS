@@ -271,7 +271,9 @@ pub fn read_wkt(text: &str) -> Result<(Crs, Option<String>), String> {
 /// GeoPackage row's, a File Geodatabase's WKID):
 /// - `None`: the code is used. The text gives no shift to WGS 84, or the code's own, or it isn't
 ///   WKT.
-/// - `Some(Ok(..))`: the system read from the text in place of the code, with its note.
+/// - `Some(Ok(..))`: the system read from the text in place of the code, with its note. A text
+///   that gives another shift but can't be read with it gives the code's system, and the note
+///   says that the text's shift is set aside.
 /// - `Some(Err(..))`: the text comes first but is refused: another body's system that can't be
 ///   read.
 ///
@@ -283,12 +285,30 @@ pub fn read_wkt_over_code(text: &str, code: u32) -> Option<Result<(Crs, Option<S
     if planetary_datum(text).is_some() {
         return Some(read_wkt(text));
     }
-    let root = tree(text).ok()?;
+    let root = match tree(text) {
+        Ok(root) => root,
+        // A bound system that can't be read (its target's shift to WGS 84 isn't known, say)
+        // still gives a transformation. The code is used without it, which is said. Other text
+        // that can't be read gives no shift to set aside.
+        Err(e) => {
+            let by_code = Crs::from_epsg(code)?;
+            let transformed = parse(text).is_ok_and(|n| has_bound_transformation(&n, 0));
+            return transformed.then(|| Ok((by_code, Some(set_aside_note(code, by_code, &e)))));
+        }
+    };
     let files_shift = towgs84(geogcs(&root).and_then(|g| g.child("DATUM")));
     if files_shift.is_none_or(|shift| matches_bundled_shift(code, &shift)) {
         return None;
     }
     Some(read_tree(&root, Some(code)))
+}
+
+/// Whether a parsed WKT2 text holds a `BOUNDCRS` with a transformation of its own, whether or not
+/// [`bound`] can read it. The bound system may be nested: a compound system's horizontal part,
+/// or another bound system's source. A transformation outside a `BOUNDCRS` shifts no system.
+fn has_bound_transformation(n: &Node, depth: usize) -> bool {
+    let bound = n.name.eq_ignore_ascii_case("BOUNDCRS") && n.child("ABRIDGEDTRANSFORMATION").is_some();
+    depth <= MAX_DEPTH && (bound || n.nodes().any(|c| has_bound_transformation(c, depth + 1)))
 }
 
 /// [`read_wkt`] of a WKT1 tree. `code`, an EPSG code that comes with the text, replaces the tree's
@@ -405,20 +425,7 @@ fn read_root(root: &Node, code: Option<u32>) -> Result<(Crs, Option<String>), St
     // A system that can't be read from its parameters is still read by its EPSG code, with the
     // code's shift in place of the file's, which is said.
     match read_system(root) {
-        Err(e) => {
-            // A code whose shift is none (WGS 84's, or a WGS 84-like datum's) doesn't replace the
-            // file's either.
-            let codes_shift = !matches!(by_code, Crs::LonLat | Crs::WebMercator)
-                && u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift).is_some_and(|s| s.iter().any(|v| *v != 0.0));
-            let note = if codes_shift {
-                format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {e}")
-            } else {
-                format!(
-                    "the file's own shift to WGS 84 is set aside, because {e}, and EPSG:{code} is read without it, so positions may be off by as much as that shift"
-                )
-            };
-            Ok((by_code, with_projection_note(Some(note), root, by_code)))
-        }
+        Err(e) => Ok((by_code, with_projection_note(Some(set_aside_note(code, by_code, &e)), root, by_code))),
         // A shift of zero, where the code has one, may be a writer's placeholder: said, as the
         // positions then differ from the code's by that shift.
         Ok((crs, note)) if files_shift.is_some_and(|s| s.iter().all(|v| *v == 0.0)) => {
@@ -426,6 +433,22 @@ fn read_root(root: &Node, code: Option<u32>) -> Result<(Crs, Option<String>), St
             Ok((crs, Some(note.map_or(zero.clone(), |n| format!("{n}; {zero}")))))
         }
         read => read,
+    }
+}
+
+/// What is said of a file's shift to WGS 84 when its system is read by EPSG `code` (`by_code`)
+/// without it, because of `why`.
+fn set_aside_note(code: u32, by_code: Crs, why: &str) -> String {
+    // A code whose shift is none (WGS 84's, or a WGS 84-like datum's) doesn't replace the file's
+    // either.
+    let codes_shift = !matches!(by_code, Crs::LonLat | Crs::WebMercator)
+        && u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift).is_some_and(|s| s.iter().any(|v| *v != 0.0));
+    if codes_shift {
+        format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {why}")
+    } else {
+        format!(
+            "the file's own shift to WGS 84 is set aside, because {why}, and EPSG:{code} is read without it, so positions may be off by as much as that shift"
+        )
     }
 }
 
@@ -3844,6 +3867,59 @@ pub(crate) mod tests {
                 "the file's own shift to WGS 84 is set aside for EPSG:5514's, because the Krovak (North Orientated) projection isn't supported"
             )
         );
+    }
+
+    /// A `BOUNDCRS` that can't be read with its transformation leaves the code beside it, and says
+    /// that the shift it gives is set aside (#1677). Alone, as in a `.prj`, the same text is
+    /// refused. Text that can't be read and gives no transformation leaves the code with nothing
+    /// to say.
+    #[test]
+    fn a_bound_wkt_that_cant_be_read_leaves_the_code_beside_it_and_says_so() {
+        let rows = corpus();
+        let wkt2 = |code: &str| rows.iter().find(|r| r.0 == code).unwrap().2;
+        // A target whose shift to WGS 84 isn't known: NAD 27's is a grid.
+        let nad27 = wkt2("EPSG:4267");
+        let bound = bound_crs(wkt2("EPSG:27700"), nad27, &[375.0, -111.0, 431.0]);
+        let why = "the shift from NAD27 to WGS 84 isn't known";
+        assert_eq!(read_wkt(&bound), Err(why.to_string()));
+        assert_eq!(
+            read_wkt_over_code(&bound, 27700),
+            Some(Ok((Crs::Epsg(27700), Some(format!("the file's own shift to WGS 84 is set aside for EPSG:27700's, because {why}")))))
+        );
+        // A code without a shift of its own (NAD 27's) is read without the text's.
+        let lost = bound_crs(BESSEL_WKT2, nad27, &BESSEL_SHIFT);
+        assert_eq!(
+            read_wkt_over_code(&lost, 4267),
+            Some(Ok((
+                Crs::Epsg(4267),
+                Some(format!(
+                    "the file's own shift to WGS 84 is set aside, because {why}, and EPSG:4267 is read without it, so positions may be off by as much as that shift"
+                ))
+            )))
+        );
+        // The same systems bound to WGS 84 are read with their shift, with nothing to say.
+        assert!(matches!(
+            read_wkt_over_code(&bound_crs(wkt2("EPSG:27700"), WGS84_WKT2, &[375.0, -111.0, 431.0]), 27700),
+            Some(Ok((_, None)))
+        ));
+        // So is a bound system that is a compound system's horizontal part.
+        let compound = format!(r#"COMPOUNDCRS["with heights",{bound},VERTCRS["heights"]]"#);
+        assert_eq!(read_wkt(&compound), Err(why.to_string()));
+        assert!(matches!(read_wkt_over_code(&compound, 27700), Some(Ok((Crs::Epsg(27700), Some(note)))) if note.ends_with(why)));
+        // Nothing to set aside: a bound system that gives no transformation, and text cut short,
+        // which isn't WKT.
+        let no_source = format!("BOUNDCRS[TARGETCRS[{WGS84_WKT2}]]");
+        assert!(read_wkt(&no_source).is_err());
+        assert_eq!(read_wkt_over_code(&no_source, 27700), None);
+        let cut = bound.strip_suffix("]]").unwrap();
+        assert_eq!(read_wkt_over_code(cut, 27700), None);
+        // Nor is there in text that only holds a transformation, bound to no system: one alone, or
+        // in a compound system without a horizontal part, which can't be read.
+        let alone = r#"ABRIDGEDTRANSFORMATION["t",METHOD["Geocentric translations"],PARAMETER["X-axis translation",375]]"#;
+        assert_eq!(read_wkt_over_code(alone, 27700), None);
+        let unbound = format!(r#"COMPOUNDCRS["no horizontal part",{alone}]"#);
+        assert_eq!(read_wkt(&unbound), Err("the compound coordinate system has no horizontal part".into()));
+        assert_eq!(read_wkt_over_code(&unbound, 27700), None);
     }
 
     /// Another body's WKT is read, or refused, whatever the EPSG code beside it: EPSG's codes are

@@ -715,6 +715,20 @@ fn a_code_gives_way_to_its_wkts_shift_or_body() {
         report.messages,
         ["coordinate system: the file gives a shift of zero to WGS 84, which is used in place of EPSG:27700's transformation"]
     );
+    // A WKT bound to a system whose shift to WGS 84 isn't known (NAD 27's is a grid) can't be
+    // read: the code, and the WKT's shift is said to be set aside.
+    let nad27 = r#"GEOGCS["NAD27",DATUM["North_American_Datum_1927",SPHEROID["Clarke 1866",6378206.4,294.978698213898]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4267"]]"#;
+    let unknown = crate::raster::wkt::tests::bound_crs(&bng, nad27, &[375.0, -111.0, 431.0]);
+    let mut report = ReadReport::default();
+    let (crs, t) = esri_crs(Some(27700), Some(&unknown), &mut report).unwrap();
+    assert_eq!(crs, Some(Crs::Epsg(27700)));
+    assert!(t.is_some());
+    assert_eq!(
+        report.messages,
+        [
+            "coordinate system: the file's own shift to WGS 84 is set aside for EPSG:27700's, because the shift from NAD27 to WGS 84 isn't known"
+        ]
+    );
     // An Esri code (South America Albers) with a WKT giving a shift: the code.
     let albers = crs_of_code(102033).unwrap();
     let shifted = r#"PROJCS["South_America_Albers_Equal_Area_Conic",GEOGCS["GCS_South_American_1969",DATUM["D_South_American_1969",SPHEROID["GRS_1967_Truncated",6378160.0,298.25],TOWGS84[1,2,3,0,0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-60.0],PARAMETER["Standard_Parallel_1",-5.0],PARAMETER["Standard_Parallel_2",-42.0],PARAMETER["Latitude_Of_Origin",-32.0],UNIT["Meter",1.0]]"#;

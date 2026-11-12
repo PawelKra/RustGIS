@@ -49,6 +49,9 @@ fn explicit_method_1028_warns_for_known_geopackage_authorities() {
 /// PROJ 9.8.1's WKT2 for EPSG:23031 (ED50 / UTM zone 31N), without its usage.
 const ED50_UTM31: &str = r#"PROJCRS["ED50 / UTM zone 31N",BASEGEOGCRS["ED50",DATUM["European Datum 1950",ELLIPSOID["International 1924",6378388,297,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4230]],CONVERSION["UTM zone 31N",METHOD["Transverse Mercator",ID["EPSG",9807]],PARAMETER["Latitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",3,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.9996,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",500000,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],CS[Cartesian,2],AXIS["(E)",east,ORDER[1],LENGTHUNIT["metre",1]],AXIS["(N)",north,ORDER[2],LENGTHUNIT["metre",1]],ID["EPSG",23031]]"#;
 
+/// NAD 27 longitude/latitude in WKT2. Its shift to WGS 84 is a grid, so RustGIS knows none.
+const NAD27_WKT2: &str = r#"GEOGCRS["NAD27",DATUM["North American Datum 1927",ELLIPSOID["Clarke 1866",6378206.4,294.978698213898]],CS[ellipsoidal,2],AXIS["lat",north],AXIS["lon",east],ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",4267]]"#;
+
 /// [`ED50_UTM31`] bound to WGS 84 by Spain's NTv2 grid from ED50 (PROJ reads it).
 fn ed50_utm31_bound() -> String {
     format!(
@@ -163,11 +166,11 @@ fn a_geopackage_rows_code_gives_way_to_its_definitions_shift() {
     assert!(notes.is_empty(), "{notes:?}");
 }
 
-/// A GeoPackage row's WKT2 that can't be read, passed over for a WKT1 that is read in place of the
-/// row's code, is said as it is without a code (#1677). A WKT2 that is read says nothing of the
-/// kind.
+/// A GeoPackage row's WKT2 that can't be read, passed over for its WKT1, is said as it is without
+/// a code (#1677): when the WKT1 is read in place of the row's code, and when the code is used. A
+/// WKT2 that is read says nothing of the kind.
 #[test]
-fn a_geopackage_rows_unread_wkt2_is_said_when_its_wkt1_replaces_the_code() {
+fn a_geopackage_rows_unread_wkt2_is_said_beside_its_code() {
     use crate::raster::wkt::tests::{WGS84_WKT2, bound_crs};
     use crate::raster::wkt::{read_wkt, to_wkt};
     let row = |code: Option<i64>, definition: &str, wkt2: &str| GpkgSrs {
@@ -194,10 +197,75 @@ fn a_geopackage_rows_unread_wkt2_is_said_when_its_wkt1_replaces_the_code() {
     );
     // The same notice as without a code.
     assert_eq!(read(row(None, &other, "PROJCRS[")).1, notes);
+    // And when the WKT1 leaves the code in use: with the code's own shift, or none.
+    let bng = to_wkt(Crs::Epsg(27700)).unwrap();
+    for wkt1 in [bng.clone(), bng.replace(&format!(",{BNG_SHIFT}"), "")] {
+        let (r, used) = read(row(Some(27700), &wkt1, "PROJCRS["));
+        assert_eq!(r.crs, Crs::Epsg(27700));
+        assert_eq!(used, notes);
+    }
+    // A WKT2 bound to a system whose shift to WGS 84 isn't known can't be read either. Its
+    // transformation is passed over with it, which the notice says.
+    let unknown = bound_crs(ED50_UTM31, NAD27_WKT2, &[-100.0, -100.0, -100.0]);
+    let ed50 = to_wkt(Crs::Epsg(23031)).unwrap();
+    let (r, notes) = read(row(Some(23031), &ed50, &unknown));
+    assert_eq!(r.crs, Crs::Epsg(23031));
+    assert_eq!(
+        notes,
+        [
+            "its coordinate system (srs_id 100001): its WKT2 definition can't be read (the shift from NAD27 to WGS 84 isn't known), so its WKT1 definition is used"
+        ]
+    );
     // A WKT2 that is read, with another shift than the code's, says nothing of the WKT1.
     let bound = bound_crs(ED50_UTM31, WGS84_WKT2, &[-100.0, -100.0, -100.0]);
     let (r, notes) = read(row(Some(23031), &other, &bound));
     assert_eq!(Ok(r.crs), read_wkt(&bound).map(|r| r.0));
+    assert!(notes.is_empty(), "{notes:?}");
+    // Nor does one that leaves the code in use.
+    let (r, notes) = read(row(Some(23031), &ed50, ED50_UTM31));
+    assert_eq!(r.crs, Crs::Epsg(23031));
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+/// A GeoPackage row whose only definition is a `BOUNDCRS` that can't be read with its
+/// transformation (to a system whose shift to WGS 84 isn't known) is read by its code, and says
+/// that the definition's shift is set aside (#1677). Without a code it is read as
+/// longitude/latitude, said.
+#[test]
+fn a_geopackage_rows_unread_bound_definition_is_said_beside_its_code() {
+    use crate::raster::wkt::tests::bound_crs;
+    let row = |code: Option<i64>, definition: &str, wkt2: Option<&str>| GpkgSrs {
+        organization: code.map(|_| "EPSG".into()),
+        code,
+        definition: Some(definition.into()),
+        definition_12_063: wkt2.map(Into::into),
+    };
+    let read = |row: GpkgSrs| {
+        let mut notes = Vec::new();
+        let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
+        (read, notes)
+    };
+    let unknown = bound_crs(ED50_UTM31, NAD27_WKT2, &[-100.0, -100.0, -100.0]);
+    let set_aside = "its coordinate system (srs_id 100001): the file's own shift to WGS 84 is set aside for EPSG:23031's, because the shift from NAD27 to WGS 84 isn't known";
+    // As the WKT2 beside a `definition` that defines nothing, and as the `definition` itself.
+    for (definition, wkt2) in [("undefined", Some(unknown.as_str())), (unknown.as_str(), None)] {
+        let (r, notes) = read(row(Some(23031), definition, wkt2));
+        assert_eq!(r.crs, Crs::Epsg(23031));
+        assert_eq!(notes, [set_aside]);
+        let (r, notes) = read(row(None, definition, wkt2));
+        assert_eq!(r.crs, Crs::LonLat);
+        assert_eq!(
+            notes,
+            [
+                "its coordinate system (srs_id 100001) can't be read (the shift from NAD27 to WGS 84 isn't known); read as longitude/latitude"
+            ]
+        );
+    }
+    // A definition that can't be read and holds a transformation bound to no system gives no
+    // shift: the code, with nothing to say.
+    let unbound = r#"COMPOUNDCRS["no horizontal part",ABRIDGEDTRANSFORMATION["t",PARAMETER["X-axis translation",375]]]"#;
+    let (r, notes) = read(row(Some(23031), unbound, None));
+    assert_eq!(r.crs, Crs::Epsg(23031));
     assert!(notes.is_empty(), "{notes:?}");
 }
 
@@ -1228,6 +1296,19 @@ fn a_geopackage_definitions_shift_places_points_as_a_prj_does() {
     for (geometry, notes) in custom_srs_reads(&geopackage("ed50_bound", 23031, &ed50, Some(&bound), xy)) {
         assert_placed("a BOUNDCRS's shift", geometry.as_ref(), shifted);
         assert!(notes.is_empty(), "{notes:?}");
+    }
+    // A `BOUNDCRS` to a system whose shift to WGS 84 isn't known can't be read: the point is
+    // where the code puts it, and each reader says that the definition's shift isn't used.
+    let unknown = bound_crs(ED50_UTM31, NAD27_WKT2, &[-100.0, -100.0, -100.0]);
+    for (name, definition, said) in [
+        ("ed50_unknown", "undefined", "the file's own shift to WGS 84 is set aside for EPSG:23031's, because the shift from NAD27"),
+        ("ed50_unknown_wkt1", ed50.as_str(), "its WKT2 definition can't be read (the shift from NAD27"),
+    ] {
+        for (geometry, notes) in custom_srs_reads(&geopackage(name, 23031, definition, Some(&unknown), xy)) {
+            assert_placed(name, geometry.as_ref(), by_code);
+            assert_eq!(notes.len(), 1, "{name}: {notes:?}");
+            assert!(notes[0].contains(said), "{name}: {notes:?}");
+        }
     }
     // As RustGIS writes them: `definition` is the system's WKT, with the code's own shift.
     for code in [27700, 23031, 31467, 2056, 32631, 3857] {

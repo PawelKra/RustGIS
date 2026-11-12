@@ -111,7 +111,8 @@ or other WKT:
   as WGS 84 (such as RDN2008, IGM95 or NAD 83), else the built-in one. It is refused when there is
   none of these, when the target gives a zero transformation where its datum has another (a
   writer's placeholder, as for ED50 or NAD 27), or when combining the two transformations'
-  rotations could be off by a centimetre.
+  rotations could be off by a centimetre. Beside the EPSG code of a GeoPackage system or a File
+  Geodatabase, the code is used instead, with a notice.
 - A grid transformation (NTv2 or NADCON, a `BOUNDCRS`'s, or GDAL's WKT1 `PROJ4_GRIDS` or
   `+nadgrids` in its `PROJ4` extension), or another without Helmert translations, isn't applied:
   the system is read without it, with a notice naming it and its grid file, as positions may be
