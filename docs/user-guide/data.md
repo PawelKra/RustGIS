@@ -102,9 +102,10 @@ and S-JTSK, the same built-in Helmert datum transformation as the EPSG definitio
 or other WKT:
 
 - A transformation in the file (a `TOWGS84`, or a WKT2 `BOUNDCRS`'s) takes precedence, also over
-  the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. A system RustGIS can read
-  only by that code keeps the code's transformation, with a notice. Web Mercator is on WGS 84, so
-  a transformation its file gives is set aside, with a notice.
+  the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. It also takes precedence over
+  the EPSG code given beside the WKT in a GeoPackage system or a File Geodatabase. A system
+  RustGIS can read only by that code keeps the code's transformation, with a notice. Web Mercator
+  is on WGS 84, so a transformation its file gives is set aside, with a notice.
 - A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
   datum's own transformation to WGS 84: the one the file gives it, else none for a datum treated
   as WGS 84 (such as RDN2008, IGM95 or NAD 83), else the built-in one. It is refused when there is

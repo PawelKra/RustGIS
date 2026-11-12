@@ -83,6 +83,124 @@ fn a_geopackage_row_read_by_its_code_says_its_definitions_grid() {
     }
 }
 
+/// EPSG:27700's own shift to WGS 84, as RustGIS writes it in WKT1.
+const BNG_SHIFT: &str = "TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]";
+
+/// A GeoPackage row's EPSG code is used as a `.prj`'s own `AUTHORITY` is (#1677): when its
+/// definition gives no shift to WGS 84, or the code's own, with nothing to say. Another shift is
+/// read from the definition: a `TOWGS84`, a WKT2 `BOUNDCRS`'s over a WKT1 with the code's own, or
+/// a shift of zero, which is said. A definition that can't be read with its shift leaves the code,
+/// said; one that isn't WKT leaves it silently, as before.
+#[test]
+fn a_geopackage_rows_code_gives_way_to_its_definitions_shift() {
+    use crate::raster::wkt::tests::{WGS84_WKT2, bound_crs};
+    use crate::raster::wkt::{read_wkt, to_wkt};
+    let row = |code: i64, definition: &str, wkt2: Option<&str>| GpkgSrs {
+        organization: Some("EPSG".into()),
+        code: Some(code),
+        definition: Some(definition.into()),
+        definition_12_063: wkt2.map(Into::into),
+    };
+    let read = |row: GpkgSrs| {
+        let mut notes = Vec::new();
+        let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
+        (read, notes)
+    };
+    // Where a reading puts `xy`, and where a `.prj` of `wkt` would.
+    let at = |r: &Reproject, xy: Coord| match r.geometry(Geometry::Point(xy)) {
+        Some(Geometry::Point(c)) => c,
+        g => panic!("{g:?}"),
+    };
+    let prj = |wkt: &str, xy: Coord| read_wkt(wkt).unwrap().0.transformer().unwrap().to_lonlat(xy).unwrap();
+    // In England, in British National Grid metres.
+    let xy = Coord::new(450_000.0, 250_000.0);
+    let by_code = Crs::Epsg(27700).transformer().unwrap().to_lonlat(xy).unwrap();
+    let bng = to_wkt(Crs::Epsg(27700)).unwrap();
+    assert!(bng.contains(BNG_SHIFT), "{bng}");
+    let unshifted = bng.replace(&format!(",{BNG_SHIFT}"), "");
+    assert_ne!(unshifted, bng);
+    for definition in [&bng, &unshifted] {
+        let (r, notes) = read(row(27700, definition, None));
+        assert_eq!(r.crs, Crs::Epsg(27700));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    // Another `TOWGS84` puts the point some 4 m from where the code's does.
+    let other = bng.replace(BNG_SHIFT, "TOWGS84[375,-111,431,0,0,0,0]");
+    let (r, notes) = read(row(27700, &other, None));
+    assert!(metres_apart(at(&r, xy), prj(&other, xy)) < 0.001 && metres_apart(at(&r, xy), by_code) > 1.0, "{:?}", at(&r, xy));
+    assert!(notes.is_empty(), "{notes:?}");
+    // A WKT2 `BOUNDCRS` (ED50 / UTM zone 31N, near Barcelona) with another Helmert shift than
+    // EPSG:23031's counts over the code's own WKT1.
+    let xy = Coord::new(430_000.0, 4_580_000.0);
+    let bound = bound_crs(ED50_UTM31, WGS84_WKT2, &[-100.0, -100.0, -100.0]);
+    let (r, notes) = read(row(23031, &to_wkt(Crs::Epsg(23031)).unwrap(), Some(&bound)));
+    let by_code = Crs::Epsg(23031).transformer().unwrap().to_lonlat(xy).unwrap();
+    assert!(metres_apart(at(&r, xy), prj(&bound, xy)) < 0.001 && metres_apart(at(&r, xy), by_code) > 1.0, "{:?}", at(&r, xy));
+    assert!(notes.is_empty(), "{notes:?}");
+    // A shift of zero where the code has one.
+    let (r, notes) = read(row(27700, &bng.replace(BNG_SHIFT, "TOWGS84[0,0,0,0,0,0,0]"), None));
+    assert!(matches!(r.crs, Crs::Custom(_)), "{:?}", r.crs);
+    assert_eq!(
+        notes,
+        [
+            "its coordinate system (srs_id 100001): the file gives a shift of zero to WGS 84, which is used in place of EPSG:27700's transformation"
+        ]
+    );
+    // A projection that can't be read from its parameters, with its own shift: the code, said.
+    let unread = other.replace(r#"PROJECTION["Transverse_Mercator"]"#, r#"PROJECTION["Unheard_Of"]"#);
+    assert_ne!(unread, other);
+    let (r, notes) = read(row(27700, &unread, None));
+    assert_eq!(r.crs, Crs::Epsg(27700));
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0]
+            .starts_with("its coordinate system (srs_id 100001): the file's own shift to WGS 84 is set aside for EPSG:27700's, because"),
+        "{notes:?}"
+    );
+    // Text that isn't WKT.
+    let (r, notes) = read(row(27700, "PROJCS[", None));
+    assert_eq!(r.crs, Crs::Epsg(27700));
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+/// A GeoPackage row's WKT2 that can't be read, passed over for a WKT1 that is read in place of the
+/// row's code, is said as it is without a code (#1677). A WKT2 that is read says nothing of the
+/// kind.
+#[test]
+fn a_geopackage_rows_unread_wkt2_is_said_when_its_wkt1_replaces_the_code() {
+    use crate::raster::wkt::tests::{WGS84_WKT2, bound_crs};
+    use crate::raster::wkt::{read_wkt, to_wkt};
+    let row = |code: Option<i64>, definition: &str, wkt2: &str| GpkgSrs {
+        organization: code.map(|_| "EPSG".into()),
+        code,
+        definition: Some(definition.into()),
+        definition_12_063: Some(wkt2.into()),
+    };
+    let read = |row: GpkgSrs| {
+        let mut notes = Vec::new();
+        let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
+        (read, notes)
+    };
+    let other = to_wkt(Crs::Epsg(27700)).unwrap().replace(BNG_SHIFT, "TOWGS84[375,-111,431,0,0,0,0]");
+    assert!(other.contains("TOWGS84[375,"), "{other}");
+    let (r, notes) = read(row(Some(27700), &other, "PROJCRS["));
+    assert_eq!(Ok(r.crs), read_wkt(&other).map(|r| r.0));
+    assert!(matches!(r.crs, Crs::Custom(_)), "{:?}", r.crs);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with("its coordinate system (srs_id 100001): its WKT2 definition can't be read (")
+            && notes[0].ends_with("), so its WKT1 definition is used"),
+        "{notes:?}"
+    );
+    // The same notice as without a code.
+    assert_eq!(read(row(None, &other, "PROJCRS[")).1, notes);
+    // A WKT2 that is read, with another shift than the code's, says nothing of the WKT1.
+    let bound = bound_crs(ED50_UTM31, WGS84_WKT2, &[-100.0, -100.0, -100.0]);
+    let (r, notes) = read(row(Some(23031), &other, &bound));
+    assert_eq!(Ok(r.crs), read_wkt(&bound).map(|r| r.0));
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
 /// A database layer's `crs` is read by its EPSG code. WKT whose system has one but binds it to WGS
 /// 84 by a grid (ED50 / UTM zone 31N, by Spain's) says the grid isn't applied; a code, or the
 /// system alone, says nothing; text without a code is refused, as before (#1678).
@@ -1047,6 +1165,86 @@ fn a_gpkg_system_defined_in_wkt2_is_read_from_it() {
         .execute("UPDATE gpkg_spatial_ref_sys SET organization = 'EPSG', organization_coordsys_id = 9377", [])
         .unwrap();
     placed(&p);
+}
+
+/// #1677: a GeoPackage row naming EPSG:27700 whose definition gives another shift to WGS 84 places
+/// its point where the same WKT in a Shapefile's `.prj` does, on the desktop and in the browser,
+/// not where the code alone would. So does one whose WKT2 is a `BOUNDCRS` with another shift. A
+/// GeoPackage RustGIS writes is read back by its code, with nothing to say.
+#[test]
+fn a_geopackage_definitions_shift_places_points_as_a_prj_does() {
+    use crate::raster::wkt::tests::{WGS84_WKT2, bound_crs};
+    use crate::raster::wkt::to_wkt;
+    let d = dir().join("code_and_shift");
+    std::fs::create_dir_all(&d).unwrap();
+    // Where a Shapefile with `prj` puts `xy`.
+    let from_prj = |name: &str, prj: &str, xy: Coord| {
+        let p = d.join(format!("{name}.shp"));
+        let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        ds.push(Some(Geometry::Point(xy)), vec![Value::Text(name.into())]);
+        write_shapefile(&ds, &p);
+        std::fs::write(p.with_extension("prj"), prj).unwrap();
+        let src = open_path(&p, None).unwrap();
+        assert!(src.info().notes.is_empty(), "{name}: {:?}", src.info().notes);
+        match src.read(&Request::all()).unwrap().features.first().and_then(|f| f.geometry.clone()) {
+            Some(Geometry::Point(c)) => c,
+            g => panic!("{name}: {g:?}"),
+        }
+    };
+    // A GeoPackage whose row names EPSG `code`, with its point at `xy`.
+    let geopackage = |name: &str, code: i64, definition: &str, wkt2: Option<&str>, xy: Coord| {
+        let p = d.join(format!("{name}.gpkg"));
+        write_wkt2_srs_gpkg(&p, definition, wkt2, xy);
+        rusqlite::Connection::open(&p)
+            .unwrap()
+            .execute("UPDATE gpkg_spatial_ref_sys SET organization = 'EPSG', organization_coordsys_id = ?1", [code])
+            .unwrap();
+        p
+    };
+    let bng = to_wkt(Crs::Epsg(27700)).unwrap();
+    let other = bng.replace(BNG_SHIFT, "TOWGS84[375,-111,431,0,0,0,0]");
+    assert_ne!(other, bng);
+    let xy = Coord::new(450_000.0, 250_000.0);
+    let by_code = Crs::Epsg(27700).transformer().unwrap().to_lonlat(xy).unwrap();
+    // Some 4 m from where the code puts it.
+    let shifted = from_prj("bng_other", &other, xy);
+    assert!(metres_apart(shifted, by_code) > 1.0, "{shifted:?} {by_code:?}");
+    for (geometry, notes) in custom_srs_reads(&geopackage("bng_other", 27700, &other, None, xy)) {
+        assert_placed("another TOWGS84", geometry.as_ref(), shifted);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    assert!(metres_apart(from_prj("bng", &bng, xy), by_code) < 0.001);
+    for (geometry, notes) in custom_srs_reads(&geopackage("bng", 27700, &bng, None, xy)) {
+        assert_placed("the code's own TOWGS84", geometry.as_ref(), by_code);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    // ED50 / UTM zone 31N, near Barcelona.
+    let xy = Coord::new(430_000.0, 4_580_000.0);
+    let bound = bound_crs(ED50_UTM31, WGS84_WKT2, &[-100.0, -100.0, -100.0]);
+    let shifted = from_prj("ed50_bound", &bound, xy);
+    let by_code = Crs::Epsg(23031).transformer().unwrap().to_lonlat(xy).unwrap();
+    assert!(metres_apart(shifted, by_code) > 1.0, "{shifted:?} {by_code:?}");
+    let ed50 = to_wkt(Crs::Epsg(23031)).unwrap();
+    for (geometry, notes) in custom_srs_reads(&geopackage("ed50_bound", 23031, &ed50, Some(&bound), xy)) {
+        assert_placed("a BOUNDCRS's shift", geometry.as_ref(), shifted);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    // As RustGIS writes them: `definition` is the system's WKT, with the code's own shift.
+    for code in [27700, 23031, 31467, 2056, 32631, 3857] {
+        let crs = Crs::from_epsg(code).unwrap();
+        let p = d.join(format!("written_{code}.gpkg"));
+        let _ = std::fs::remove_file(&p);
+        let xy = crs.transformer().unwrap().from_lonlat(Coord::new(5.0, 47.0)).unwrap();
+        let mut ds = Dataset::new("written", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        ds.push(Some(Geometry::Point(xy)), vec![Value::Text("p".into())]);
+        gpkg::write_in(&ds, &p, crs).unwrap();
+        let desktop = open_path(&p, None).unwrap();
+        let browser = gpkg_mem::GpkgMemSource::open_shared(Shared(Arc::new(std::fs::read(&p).unwrap())), None).unwrap();
+        for src in [desktop.as_ref(), &browser as &dyn FeatureSource] {
+            assert_eq!(src.info().coordinate_system(), Some(crs), "EPSG:{code}");
+            assert!(src.info().notes.is_empty(), "EPSG:{code}: {:?}", src.info().notes);
+        }
+    }
 }
 
 #[test]
