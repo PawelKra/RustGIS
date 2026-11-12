@@ -212,6 +212,8 @@ fn wkids(t: &[u8], x: &[u8]) -> Vec<(String, u32)> {
 /// The coordinate system Esri data names: by its EPSG or Esri `code` (a WKID), else from its `wkt`,
 /// with the transformer to longitude/latitude. The WKT comes before the code when it gives another
 /// shift to WGS 84 than an EPSG code's, or is another body's system ([`esri_wkt_over_code`]).
+/// A system read by its code says a grid shift its WKT gives, which the code doesn't apply, and for
+/// an Esri code another Helmert shift its WKT gives, which is set aside.
 /// `(None, None)` for longitude/latitude, and for a system that can't be read, which `report`
 /// says; coordinates are then read as longitude/latitude. Another body's system that can't be read
 /// is an error instead, because its coordinates would land in the wrong place as
@@ -230,7 +232,25 @@ pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadRe
         })
     };
     Ok(match (by_code, wkt) {
-        (Some(by_code), _) => by_code,
+        (Some(by_code), _) => {
+            // A grid the WKT gives isn't applied by the code, which is said for any code, as for a
+            // GeoPackage's (#1678). An Esri code is read without its WKT's own Helmert shift,
+            // which is said too.
+            if let (Some(wkt), (Some(crs), _)) = (wkt, &by_code)
+                && let Some(note) = crate::raster::wkt::unapplied_note(wkt, *crs)
+            {
+                report.messages.push(format!("coordinate system: {note}"));
+            } else if let (Some(code), Some(wkt)) = (code, wkt)
+                && Crs::from_epsg(code).is_none()
+                && let Some(note) = crate::raster::crs::esri_proj4(code).and_then(|def| {
+                    let why = "ArcGIS keeps transformations apart from the system";
+                    crate::raster::wkt::set_aside_shift_note(wkt, &format!("ESRI:{code}"), def, why)
+                })
+            {
+                report.messages.push(format!("coordinate system: {note}"));
+            }
+            by_code
+        }
         (None, Some(wkt)) => match over_code.unwrap_or_else(|| crate::raster::wkt::read_wkt(wkt)) {
             Ok((c, note)) => {
                 if let Some(n) = note {
@@ -260,9 +280,9 @@ pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadRe
 /// Esri data's `wkt` read in place of its `code`, as a `.prj` is read in place of its own
 /// `AUTHORITY` ([`read_wkt_over_code`](crate::raster::wkt::read_wkt_over_code), which gives the
 /// three cases): when it gives another shift to WGS 84 than an EPSG code's, or is another body's
-/// system. For an Esri (non-EPSG) code the WKT's shift is ignored, as ArcGIS keeps
-/// transformations apart from the system. Only another body's WKT replaces an Esri code, as
-/// Esri's codes are the Earth's too.
+/// system. For an Esri (non-EPSG) code the WKT's shift is set aside, as ArcGIS keeps
+/// transformations apart from the system, and [`esri_crs`] says so. Only another body's WKT
+/// replaces an Esri code, as Esri's codes are the Earth's too.
 pub(crate) fn esri_wkt_over_code(code: Option<u32>, wkt: Option<&str>) -> Option<std::result::Result<(Crs, Option<String>), String>> {
     let (code, wkt) = (code?, wkt?);
     if Crs::from_epsg(code).is_some() {

@@ -303,6 +303,24 @@ pub fn read_wkt_over_code(text: &str, code: u32) -> Option<Result<(Crs, Option<S
     Some(read_tree(&root, Some(code)))
 }
 
+/// What is said when WKT `text` gives a shift to WGS 84 other than PROJ definition `def`'s, and
+/// the system is read by `def` (named `name`) all the same, because of `why`. `None` when the
+/// text gives no shift, or `def`'s, as [`read_wkt_over_code`] tells them apart.
+///
+/// A definition that gives no shift counts as a shift of zero only on WGS 84 or GRS 1980
+/// ([`bundled_shift`]). On another ellipsoid it matches no shift the text gives, not even zero:
+/// proj4rs then changes no datum, where a shift of zero still changes the ellipsoid.
+pub(crate) fn set_aside_shift_note(text: &str, name: &str, def: &str, why: &str) -> Option<String> {
+    let defs_shift = bundled_shift(def);
+    let another = match tree(text) {
+        Ok(root) => towgs84(geogcs(&root).and_then(|g| g.child("DATUM"))).is_some_and(|shift| !matches_shift(defs_shift, &shift)),
+        // A bound system that can't be read still gives a transformation.
+        Err(_) => parse(text).is_ok_and(|n| has_bound_transformation(&n, 0)),
+    };
+    let codes_shift = defs_shift.is_some_and(|s| s.iter().any(|v| *v != 0.0));
+    another.then(|| set_aside_wording(name, codes_shift, why))
+}
+
 /// Whether a parsed WKT2 text holds a `BOUNDCRS` with a transformation of its own, whether or not
 /// [`bound`] can read it. The bound system may be nested: a compound system's horizontal part,
 /// or another bound system's source. A transformation outside a `BOUNDCRS` shifts no system.
@@ -443,11 +461,16 @@ fn set_aside_note(code: u32, by_code: Crs, why: &str) -> String {
     // either.
     let codes_shift = !matches!(by_code, Crs::LonLat | Crs::WebMercator)
         && u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift).is_some_and(|s| s.iter().any(|v| *v != 0.0));
+    set_aside_wording(&format!("EPSG:{code}"), codes_shift, why)
+}
+
+/// [`set_aside_note`] for the system `name`, which has a shift of its own (`codes_shift`) or none.
+fn set_aside_wording(name: &str, codes_shift: bool, why: &str) -> String {
     if codes_shift {
-        format!("the file's own shift to WGS 84 is set aside for EPSG:{code}'s, because {why}")
+        format!("the file's own shift to WGS 84 is set aside for {name}'s, because {why}")
     } else {
         format!(
-            "the file's own shift to WGS 84 is set aside, because {why}, and EPSG:{code} is read without it, so positions may be off by as much as that shift"
+            "the file's own shift to WGS 84 is set aside, because {why}, and {name} is read without it, so positions may be off by as much as that shift"
         )
     }
 }
@@ -1098,10 +1121,6 @@ fn compose(first: &[f64], second: [f64; 7]) -> Result<Vec<f64>, String> {
 /// the datums taken for it and Web Mercator. A datum with no bundled shift (NAD 27's is a grid)
 /// matches none.
 fn matches_bundled_shift(code: u32, shift: &[f64]) -> bool {
-    // Writers round the last digit differently: GDAL writes Hong Kong 1980's rotations as
-    // -2.243648″ and -1.158828″, the bundled shift has -2.243649″ and -1.158827″. Differences
-    // under 1e-5 (metres, arc-seconds or parts per million) move a point less than a millimetre.
-    const ROUNDING: f64 = 1e-5;
     // Web Mercator's datum is WGS 84, so its shift is none. (It projects as if on a sphere, which
     // EPSG:3785 gives as its datum's ellipsoid.)
     let bundled = if Crs::from_epsg(code) == Some(Crs::WebMercator) {
@@ -1109,6 +1128,16 @@ fn matches_bundled_shift(code: u32, shift: &[f64]) -> bool {
     } else {
         u16::try_from(code).ok().and_then(epsg_proj4).and_then(bundled_shift)
     };
+    matches_shift(bundled, shift)
+}
+
+/// Whether `shift` (three or seven parameters) is `bundled`, a definition's shift
+/// ([`bundled_shift`]). `None` matches none.
+fn matches_shift(bundled: Option<[f64; 7]>, shift: &[f64]) -> bool {
+    // Writers round the last digit differently: GDAL writes Hong Kong 1980's rotations as
+    // -2.243648″ and -1.158828″, the bundled shift has -2.243649″ and -1.158827″. Differences
+    // under 1e-5 (metres, arc-seconds or parts per million) move a point less than a millimetre.
+    const ROUNDING: f64 = 1e-5;
     let Some(bundled) = bundled else { return false };
     bundled.iter().enumerate().all(|(i, b)| (shift.get(i).copied().unwrap_or(0.0) - b).abs() < ROUNDING)
 }
