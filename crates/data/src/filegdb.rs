@@ -233,20 +233,21 @@ pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadRe
     };
     Ok(match (by_code, wkt) {
         (Some(by_code), _) => {
-            // A grid the WKT gives isn't applied by the code, which is said for any code, as for a
-            // GeoPackage's (#1678). An Esri code is read without its WKT's own Helmert shift,
-            // which is said too.
-            if let (Some(wkt), (Some(crs), _)) = (wkt, &by_code)
-                && let Some(note) = crate::raster::wkt::unapplied_note(wkt, *crs)
-            {
-                report.messages.push(format!("coordinate system: {note}"));
-            } else if let (Some(code), Some(wkt)) = (code, wkt)
-                && Crs::from_epsg(code).is_none()
-                && let Some(note) = crate::raster::crs::esri_proj4(code).and_then(|def| {
+            // A grid the WKT gives isn't applied by the code, which is said for any code (as for a
+            // GeoPackage's, #1678), longitude/latitude's too; the code's own shift, an Esri
+            // code's as an EPSG code's, is used in its place. An Esri code is read without its
+            // WKT's own Helmert shift, which is said too.
+            let esri =
+                code.filter(|c| Crs::from_epsg(*c).is_none()).and_then(|c| Some((format!("ESRI:{c}"), crate::raster::crs::esri_proj4(c)?)));
+            let note = wkt.and_then(|wkt| match &esri {
+                Some((name, def)) => crate::raster::wkt::unapplied_note_beside(wkt, name, def).or_else(|| {
                     let why = "ArcGIS keeps transformations apart from the system";
-                    crate::raster::wkt::set_aside_shift_note(wkt, &format!("ESRI:{code}"), def, why)
-                })
-            {
+                    crate::raster::wkt::set_aside_shift_note(wkt, name, def, why)
+                }),
+                // `None` is longitude/latitude.
+                None => crate::raster::wkt::unapplied_note(wkt, by_code.0.unwrap_or(Crs::LonLat)),
+            });
+            if let Some(note) = note {
                 report.messages.push(format!("coordinate system: {note}"));
             }
             by_code

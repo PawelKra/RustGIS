@@ -309,16 +309,28 @@ pub fn read_wkt_over_code(text: &str, code: u32) -> Option<Result<(Crs, Option<S
 ///
 /// A definition that gives no shift counts as a shift of zero only on WGS 84 or GRS 1980
 /// ([`bundled_shift`]). On another ellipsoid it matches no shift the text gives, not even zero:
-/// proj4rs then changes no datum, where a shift of zero still changes the ellipsoid.
+/// proj4rs then changes no datum, where a shift of zero still changes the ellipsoid, which the
+/// note says.
 pub(crate) fn set_aside_shift_note(text: &str, name: &str, def: &str, why: &str) -> Option<String> {
     let defs_shift = bundled_shift(def);
-    let another = match tree(text) {
-        Ok(root) => towgs84(geogcs(&root).and_then(|g| g.child("DATUM"))).is_some_and(|shift| !matches_shift(defs_shift, &shift)),
+    let (another, zero) = match tree(text) {
+        Ok(root) => {
+            let shift = towgs84(geogcs(&root).and_then(|g| g.child("DATUM")));
+            (shift.as_ref().is_some_and(|s| !matches_shift(defs_shift, s)), shift.is_some_and(|s| s.iter().all(|v| *v == 0.0)))
+        }
         // A bound system that can't be read still gives a transformation.
-        Err(_) => parse(text).is_ok_and(|n| has_bound_transformation(&n, 0)),
+        Err(_) => (parse(text).is_ok_and(|n| has_bound_transformation(&n, 0)), false),
     };
     let codes_shift = defs_shift.is_some_and(|s| s.iter().any(|v| *v != 0.0));
-    another.then(|| set_aside_wording(name, codes_shift, why))
+    another.then(|| {
+        if zero && !codes_shift {
+            format!(
+                "the file's shift of zero to WGS 84 is set aside, because {why}, and {name} is read on its own ellipsoid without it, so positions may be off by the difference between that ellipsoid and WGS 84's"
+            )
+        } else {
+            set_aside_wording(name, codes_shift, why)
+        }
+    })
 }
 
 /// Whether a parsed WKT2 text holds a `BOUNDCRS` with a transformation of its own, whether or not
@@ -385,14 +397,20 @@ fn code_with_shift(crs: Crs) -> Option<u16> {
 /// ([`unapplied`]), or of a bound system without a transformation ([`untransformed`]); `whose`
 /// says whose it is (`the file's`), and `crs` is the system it is read as.
 fn dropped_note(root: &Node, whose: &str, crs: Crs) -> Option<String> {
+    dropped_note_by(root, whose, code_with_shift(crs).map(|code| format!("EPSG:{code}")).as_deref())
+}
+
+/// [`dropped_note`] for a system read by `by`, a code whose own shift to WGS 84 is used in place
+/// of one the file gives that isn't applied, or by none.
+fn dropped_note_by(root: &Node, whose: &str, by: Option<&str>) -> Option<String> {
     let datum = geogcs(root).and_then(|g| g.child("DATUM"));
     // On the source's datum, or on the source itself when it has none ([`put_mark`]).
     if let Some(what) = unapplied(datum).or_else(|| mark(Some(root), UNAPPLIED)) {
         let what = clip(&what);
-        // Read by an EPSG code whose own shift is applied in its place: off by the difference.
-        return Some(match code_with_shift(crs) {
+        // Read by a code whose own shift is applied in its place: off by the difference.
+        return Some(match by {
             Some(code) => format!(
-                "{whose} {what} isn't applied; EPSG:{code}'s own shift to WGS 84 is used in its place, so positions may be off by the difference between the two"
+                "{whose} {what} isn't applied; {code}'s own shift to WGS 84 is used in its place, so positions may be off by the difference between the two"
             ),
             None => format!("{whose} {what} isn't applied, so positions may be off by as much as that shift"),
         });
@@ -406,6 +424,13 @@ fn dropped_note(root: &Node, whose: &str, crs: Crs) -> Option<String> {
 /// note. `None` for text that isn't WKT.
 pub fn unapplied_note(text: &str, crs: Crs) -> Option<String> {
     dropped_note(&tree(text).ok()?, "the definition's", crs)
+}
+
+/// [`unapplied_note`] for a system read by PROJ definition `def`, named `name` (an Esri code), whose
+/// own shift to WGS 84, when it has one, is used in place of the one the text gives.
+pub(crate) fn unapplied_note_beside(text: &str, name: &str, def: &str) -> Option<String> {
+    let by = bundled_shift(def).is_some_and(|s| s.iter().any(|v| *v != 0.0)).then_some(name);
+    dropped_note_by(&tree(text).ok()?, "the definition's", by)
 }
 
 /// The notes a coordinate system given as text keeps when [`Crs::parse`] reads it as `crs`: its

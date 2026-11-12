@@ -762,12 +762,25 @@ fn a_code_gives_way_to_its_wkts_shift_or_body() {
         assert_eq!(esri_crs(Some(102003), Some(&wkt), &mut report).unwrap().0, crs_of_code(102003), "{wkt}");
         assert_eq!(report.messages, Vec::from_iter(said), "{wkt}");
     }
-    // On a sphere, a code without a shift changes no datum, which even a shift of zero would.
+    // On a sphere, a code without a shift changes no datum, which even a shift of zero would: the
+    // notice says the ellipsoid, not the shift. Another shift is said as on any ellipsoid.
     let mollweide = r#"PROJCS["Sphere_Mollweide",GEOGCS["GCS_Sphere",DATUM["D_Sphere",SPHEROID["Sphere",6371000.0,0.0],TOWGS84[0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Mollweide"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",0.0],UNIT["Meter",1.0]]"#;
     let mut report = ReadReport::default();
     assert_eq!(esri_crs(Some(53009), Some(mollweide), &mut report).unwrap().0, crs_of_code(53009));
-    assert_eq!(report.messages.len(), 1, "{:?}", report.messages);
-    assert!(report.messages.iter().all(|m| m.contains("ESRI:53009 is read without it")), "{:?}", report.messages);
+    assert_eq!(
+        report.messages,
+        [
+            "coordinate system: the file's shift of zero to WGS 84 is set aside, because ArcGIS keeps transformations apart from the system, and ESRI:53009 is read on its own ellipsoid without it, so positions may be off by the difference between that ellipsoid and WGS 84's"
+        ]
+    );
+    let mut report = ReadReport::default();
+    esri_crs(Some(53009), Some(&mollweide.replace("TOWGS84[0,0,0]", "TOWGS84[1,2,3]")), &mut report).unwrap();
+    assert_eq!(
+        report.messages,
+        [
+            "coordinate system: the file's own shift to WGS 84 is set aside, because ArcGIS keeps transformations apart from the system, and ESRI:53009 is read without it, so positions may be off by as much as that shift"
+        ]
+    );
     let mut report = ReadReport::default();
     esri_crs(Some(53009), Some(&mollweide.replace(",TOWGS84[0,0,0]", "")), &mut report).unwrap();
     assert!(report.messages.is_empty(), "{:?}", report.messages);
@@ -794,16 +807,18 @@ fn a_code_gives_way_to_its_wkts_shift_or_body() {
 }
 
 /// #1678: a grid shift the WKT gives (a WKT2 `BOUNDCRS`'s NTv2 file, or GDAL's WKT1
-/// `PROJ4_GRIDS`) isn't applied when the code is read, for an EPSG code and an Esri one alike, and
-/// is said once. Without the grid nothing is said. (An EPSG code without a shift of its own, such
-/// as NAD 27's, gives way to the WKT, whose grid `read_wkt` says.)
+/// `PROJ4_GRIDS`) isn't applied when the code is read, for an EPSG code, longitude/latitude's and
+/// an Esri one alike, and is said once, with the code's own shift used in its place when it has
+/// one. Without the grid nothing is said. (An EPSG code without a shift of its own, such as
+/// NAD 27's, gives way to the WKT, whose grid `read_wkt` says.)
 #[test]
 fn a_code_says_a_grid_its_wkt_gives() {
     use crate::raster::wkt::tests::BOUND_BY_A_GRID;
     use crate::source::tests::{ED50_UTM31, ed50_utm31_bound};
-    let conus = "coordinate system: the definition's NTv2 transformation to WGS 84 (conus) isn't applied, so positions may be off by as much as that shift";
+    let conus = "coordinate system: the definition's NTv2 transformation to WGS 84 (conus) isn't applied; ESRI:102033's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two";
     let spain = "coordinate system: the definition's NTv2 transformation to WGS 84 (SPED2ETV2.gsb) isn't applied; EPSG:23031's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two";
-    let ntv2 =
+    let ntv2 = "coordinate system: the definition's grid shift (ntv2_0.gsb) isn't applied; ESRI:102033's own shift to WGS 84 is used in its place, so positions may be off by the difference between the two";
+    let unshifted =
         "coordinate system: the definition's grid shift (ntv2_0.gsb) isn't applied, so positions may be off by as much as that shift";
     // South America Albers (an Esri code), plain and with GDAL's WKT1 grid on its datum; with a
     // Helmert shift beside the grid only the grid is said.
@@ -811,6 +826,13 @@ fn a_code_says_a_grid_its_wkt_gives() {
     let gridded = albers.replace("298.25]]", r#"298.25],EXTENSION["PROJ4_GRIDS","ntv2_0.gsb"]]"#);
     let both = albers.replace("298.25]]", r#"298.25],TOWGS84[1,2,3,0,0,0,0],EXTENSION["PROJ4_GRIDS","ntv2_0.gsb"]]"#);
     assert!(gridded != albers && both != albers);
+    // USA Contiguous Albers (an Esri code on NAD 83, without a shift of its own) and
+    // longitude/latitude (EPSG:4326) with a grid on their datum.
+    let usa = r#"PROJCS["USA_Contiguous_Albers_Equal_Area_Conic",GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Albers"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-96.0],PARAMETER["Standard_Parallel_1",29.5],PARAMETER["Standard_Parallel_2",45.5],PARAMETER["Latitude_Of_Origin",37.5],UNIT["Meter",1.0]]"#;
+    let usa_gridded = usa.replace("298.257222101]]", r#"298.257222101],EXTENSION["PROJ4_GRIDS","ntv2_0.gsb"]]"#);
+    let wgs84 = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    let wgs84_gridded = wgs84.replace("298.257223563]]", r#"298.257223563],EXTENSION["PROJ4_GRIDS","ntv2_0.gsb"]]"#);
+    assert!(usa_gridded != usa && wgs84_gridded != wgs84);
     for (code, wkt, said) in [
         // ED50 / UTM zone 31N, an EPSG code with a Helmert shift of its own, bound by Spain's
         // grid from ED50.
@@ -820,9 +842,15 @@ fn a_code_says_a_grid_its_wkt_gives() {
         (102033, gridded.as_str(), Some(ntv2)),
         (102033, both.as_str(), Some(ntv2)),
         (102033, albers, None),
+        (102003, usa_gridded.as_str(), Some(unshifted)),
+        (102003, usa, None),
+        (4326, wgs84_gridded.as_str(), Some(unshifted)),
+        (4326, wgs84, None),
     ] {
         let mut report = ReadReport::default();
-        assert_eq!(esri_crs(Some(code), Some(wkt), &mut report).unwrap().0, crs_of_code(code), "{code} {wkt}");
+        // Longitude/latitude is `None`.
+        let read = crs_of_code(code).filter(|c| *c != Crs::LonLat);
+        assert_eq!(esri_crs(Some(code), Some(wkt), &mut report).unwrap().0, read, "{code} {wkt}");
         assert_eq!(report.messages, Vec::from_iter(said), "{code} {wkt}");
     }
 }
