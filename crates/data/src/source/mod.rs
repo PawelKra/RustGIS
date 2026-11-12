@@ -857,17 +857,22 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
         // WKT2 is used even then, so its system is caught as it is without a code (below).
         let wkt2_named = wkt2.filter(|d| crate::raster::wkt::parses(d) || crate::raster::wkt::planetary_datum(d).is_some());
         let named = wkt2_named.or(wkt1).or(wkt2);
-        // A WKT2 passed over for the WKT1 is said, as it is without a code (below): a shift it
-        // gives isn't read, whether the WKT1 or the code is then used.
-        let passed_over = match wkt2.filter(|_| wkt2_named.is_none() && wkt1.is_some()).map(crate::raster::wkt::read_wkt) {
-            Some(Err(e)) => Some(format!("{what}: its WKT2 definition can't be read ({e}), so its WKT1 definition is used")),
-            _ => None,
+        // The definition that counts (the WKT2 when there is one) is said when it can't be parsed,
+        // as it is without a code (below), with what is `used` in its place. One that parses has
+        // its shift compared with the code's, and the code names its system.
+        let which = if wkt2.is_some() { "WKT2 definition" } else { "definition" };
+        let passed_over = |used: &str| {
+            let e = definition.filter(|d| !crate::raster::wkt::parses(d)).and_then(|d| crate::raster::wkt::read_wkt(d).err())?;
+            Some(format!("{what}: its {which} can't be read ({e}), so {used} is used"))
         };
         // The definition is read in place of the code when it gives another shift to WGS 84, or is
         // another body's system, as a `.prj` is read in place of its own `AUTHORITY` (#1677).
         match named.and_then(|d| crate::raster::wkt::read_wkt_over_code(d, code)) {
             Some(Ok((crs, note))) => {
-                notes.extend(passed_over);
+                // Read from the WKT1, in place of a WKT2 that can't be parsed.
+                if wkt2.is_some() && named != wkt2 {
+                    notes.extend(passed_over("its WKT1 definition"));
+                }
                 notes.extend(note.map(|n| format!("{what}: {n}")));
                 return Ok(Reproject::from_crs(crs, notes));
             }
@@ -875,7 +880,7 @@ pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<
             // below refuses it, and says a WKT2 it passes over.
             Some(Err(_)) => {}
             None => {
-                notes.extend(passed_over);
+                notes.extend(passed_over(&format!("EPSG:{code}")));
                 if let Some(note) = named.and_then(|d| crate::raster::wkt::projection_compatibility_note(d, crs)) {
                     notes.push(format!("{what}: using EPSG:{} parameters in preference to the WKT definition; {note}", crs.epsg()));
                 }

@@ -93,7 +93,8 @@ const BNG_SHIFT: &str = "TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.48
 /// definition gives no shift to WGS 84, or the code's own, with nothing to say. Another shift is
 /// read from the definition: a `TOWGS84`, a WKT2 `BOUNDCRS`'s over a WKT1 with the code's own, or
 /// a shift of zero, which is said. A definition that can't be read with its shift leaves the code,
-/// said; one that isn't WKT leaves it silently, as before.
+/// said; so does one that can't be parsed, as it is without a code. One that parses but whose
+/// system can't be read from its parameters leaves the code silently: its shift is the code's.
 #[test]
 fn a_geopackage_rows_code_gives_way_to_its_definitions_shift() {
     use crate::raster::wkt::tests::{WGS84_WKT2, bound_crs};
@@ -160,15 +161,25 @@ fn a_geopackage_rows_code_gives_way_to_its_definitions_shift() {
             .starts_with("its coordinate system (srs_id 100001): the file's own shift to WGS 84 is set aside for EPSG:27700's, because"),
         "{notes:?}"
     );
-    // Text that isn't WKT.
+    // Text that isn't WKT, said as without a code.
     let (r, notes) = read(row(27700, "PROJCS[", None));
     assert_eq!(r.crs, Crs::Epsg(27700));
+    let e = read_wkt("PROJCS[").unwrap_err();
+    assert_eq!(notes, [format!("its coordinate system (srs_id 100001): its definition can't be read ({e}), so EPSG:27700 is used")]);
+    // Hungary's EOV (EPSG:23700) as ArcGIS writes it: the method isn't read from its parameters, but
+    // the code names the system.
+    let (r, notes) = read(row(23700, EOV_ESRI, None));
+    assert!(read_wkt(EOV_ESRI).is_err());
+    assert_eq!(r.crs, Crs::Epsg(23700));
     assert!(notes.is_empty(), "{notes:?}");
 }
 
-/// A GeoPackage row's WKT2 that can't be read, passed over for its WKT1, is said as it is without
-/// a code (#1677): when the WKT1 is read in place of the row's code, and when the code is used. A
-/// WKT2 that is read says nothing of the kind.
+/// EPSG:23700 in Esri's WKT, with no `AUTHORITY`, by a method `read_wkt` doesn't read.
+const EOV_ESRI: &str = r#"PROJCS["Hungarian_1972_Egyseges_Orszagos_Vetuleti",GEOGCS["GCS_Hungarian_1972",DATUM["D_Hungarian_1972",SPHEROID["GRS_1967",6378160.0,298.247167427]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Hotine_Oblique_Mercator_Azimuth_Center"],PARAMETER["False_Easting",650000.0],PARAMETER["False_Northing",200000.0],PARAMETER["Scale_Factor",0.99993],PARAMETER["Azimuth",90.0],PARAMETER["Longitude_Of_Center",19.0485717777778],PARAMETER["Latitude_Of_Center",47.1443937222222],UNIT["Meter",1.0]]"#;
+
+/// A GeoPackage row's WKT2 that can't be read is said as it is without a code (#1677), with what is
+/// used in its place: the WKT1 when it is read in place of the row's code, else the code. A WKT2
+/// that is read says nothing of the kind.
 #[test]
 fn a_geopackage_rows_unread_wkt2_is_said_beside_its_code() {
     use crate::raster::wkt::tests::{WGS84_WKT2, bound_crs};
@@ -197,12 +208,13 @@ fn a_geopackage_rows_unread_wkt2_is_said_beside_its_code() {
     );
     // The same notice as without a code.
     assert_eq!(read(row(None, &other, "PROJCRS[")).1, notes);
-    // And when the WKT1 leaves the code in use: with the code's own shift, or none.
+    // And when the code is used: the WKT1 gives the code's own shift, or none, or there is none.
+    let by_code = notes[0].replace("so its WKT1 definition is used", "so EPSG:27700 is used");
     let bng = to_wkt(Crs::Epsg(27700)).unwrap();
-    for wkt1 in [bng.clone(), bng.replace(&format!(",{BNG_SHIFT}"), "")] {
-        let (r, used) = read(row(Some(27700), &wkt1, "PROJCRS["));
+    for wkt1 in [Some(bng.clone()), Some(bng.replace(&format!(",{BNG_SHIFT}"), "")), None] {
+        let (r, used) = read(GpkgSrs { definition: wkt1, ..row(Some(27700), "", "PROJCRS[") });
         assert_eq!(r.crs, Crs::Epsg(27700));
-        assert_eq!(used, notes);
+        assert_eq!(used, [by_code.as_str()]);
     }
     // A WKT2 bound to a system whose shift to WGS 84 isn't known can't be read either. Its
     // transformation is passed over with it, which the notice says.
@@ -213,7 +225,7 @@ fn a_geopackage_rows_unread_wkt2_is_said_beside_its_code() {
     assert_eq!(
         notes,
         [
-            "its coordinate system (srs_id 100001): its WKT2 definition can't be read (the shift from NAD27 to WGS 84 isn't known), so its WKT1 definition is used"
+            "its coordinate system (srs_id 100001): its WKT2 definition can't be read (the shift from NAD27 to WGS 84 isn't known), so EPSG:23031 is used"
         ]
     );
     // A WKT2 that is read, with another shift than the code's, says nothing of the WKT1.
@@ -221,10 +233,12 @@ fn a_geopackage_rows_unread_wkt2_is_said_beside_its_code() {
     let (r, notes) = read(row(Some(23031), &other, &bound));
     assert_eq!(Ok(r.crs), read_wkt(&bound).map(|r| r.0));
     assert!(notes.is_empty(), "{notes:?}");
-    // Nor does one that leaves the code in use.
-    let (r, notes) = read(row(Some(23031), &ed50, ED50_UTM31));
-    assert_eq!(r.crs, Crs::Epsg(23031));
-    assert!(notes.is_empty(), "{notes:?}");
+    // Nor does one that leaves the code in use, whatever the WKT1 beside it.
+    for wkt1 in [ed50.as_str(), "PROJCS["] {
+        let (r, notes) = read(row(Some(23031), wkt1, ED50_UTM31));
+        assert_eq!(r.crs, Crs::Epsg(23031));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
 }
 
 /// A GeoPackage row whose only definition is a `BOUNDCRS` that can't be read with its
@@ -262,11 +276,16 @@ fn a_geopackage_rows_unread_bound_definition_is_said_beside_its_code() {
         );
     }
     // A definition that can't be read and holds a transformation bound to no system gives no
-    // shift: the code, with nothing to say.
+    // shift to set aside: the code, said only as a definition that can't be read.
     let unbound = r#"COMPOUNDCRS["no horizontal part",ABRIDGEDTRANSFORMATION["t",PARAMETER["X-axis translation",375]]]"#;
     let (r, notes) = read(row(Some(23031), unbound, None));
     assert_eq!(r.crs, Crs::Epsg(23031));
-    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(
+        notes,
+        [
+            "its coordinate system (srs_id 100001): its definition can't be read (the compound coordinate system has no horizontal part), so EPSG:23031 is used"
+        ]
+    );
 }
 
 /// A database layer's `crs` is read by its EPSG code. WKT whose system has one but binds it to WGS
