@@ -762,8 +762,9 @@ fn a_code_gives_way_to_its_wkts_shift_or_body() {
         assert_eq!(esri_crs(Some(102003), Some(&wkt), &mut report).unwrap().0, crs_of_code(102003), "{wkt}");
         assert_eq!(report.messages, Vec::from_iter(said), "{wkt}");
     }
-    // On a sphere, a code without a shift changes no datum, which even a shift of zero would: the
-    // notice says the ellipsoid, not the shift. Another shift is said as on any ellipsoid.
+    // On a sphere, a code without a shift changes no datum, not even the ellipsoid, which any shift
+    // would: the notice says the ellipsoid, and the shift when it isn't zero, also one that can't be
+    // read.
     let mollweide = r#"PROJCS["Sphere_Mollweide",GEOGCS["GCS_Sphere",DATUM["D_Sphere",SPHEROID["Sphere",6371000.0,0.0],TOWGS84[0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Mollweide"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",0.0],UNIT["Meter",1.0]]"#;
     let mut report = ReadReport::default();
     assert_eq!(esri_crs(Some(53009), Some(mollweide), &mut report).unwrap().0, crs_of_code(53009));
@@ -773,16 +774,23 @@ fn a_code_gives_way_to_its_wkts_shift_or_body() {
             "coordinate system: the file's shift of zero to WGS 84 is set aside, because ArcGIS keeps transformations apart from the system, and ESRI:53009 is read on its own ellipsoid without it, so positions may be off by the difference between that ellipsoid and WGS 84's"
         ]
     );
+    let unshifted_mollweide = mollweide.replace(",TOWGS84[0,0,0]", "");
+    for wkt in [
+        mollweide.replace("TOWGS84[0,0,0]", "TOWGS84[1,2,3]"),
+        crate::raster::wkt::tests::bound_crs(&unshifted_mollweide, nad27, &[1.0, 2.0, 3.0]),
+    ] {
+        let mut report = ReadReport::default();
+        assert_eq!(esri_crs(Some(53009), Some(&wkt), &mut report).unwrap().0, crs_of_code(53009), "{wkt}");
+        assert_eq!(
+            report.messages,
+            [
+                "coordinate system: the file's own shift to WGS 84 is set aside, because ArcGIS keeps transformations apart from the system, and ESRI:53009 is read on its own ellipsoid without it, so positions may be off by as much as that shift and the difference between that ellipsoid and WGS 84's"
+            ],
+            "{wkt}"
+        );
+    }
     let mut report = ReadReport::default();
-    esri_crs(Some(53009), Some(&mollweide.replace("TOWGS84[0,0,0]", "TOWGS84[1,2,3]")), &mut report).unwrap();
-    assert_eq!(
-        report.messages,
-        [
-            "coordinate system: the file's own shift to WGS 84 is set aside, because ArcGIS keeps transformations apart from the system, and ESRI:53009 is read without it, so positions may be off by as much as that shift"
-        ]
-    );
-    let mut report = ReadReport::default();
-    esri_crs(Some(53009), Some(&mollweide.replace(",TOWGS84[0,0,0]", "")), &mut report).unwrap();
+    esri_crs(Some(53009), Some(&unshifted_mollweide), &mut report).unwrap();
     assert!(report.messages.is_empty(), "{:?}", report.messages);
     // Esri's Web Mercator code is EPSG's too, whose shift is none: a shift of zero is its own.
     let web_mercator = r#"PROJCS["WGS_1984_Web_Mercator_Auxiliary_Sphere",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563],TOWGS84[0,0,0,0,0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Mercator_Auxiliary_Sphere"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",0.0],PARAMETER["Auxiliary_Sphere_Type",0.0],UNIT["Meter",1.0]]"#;

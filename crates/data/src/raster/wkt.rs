@@ -309,8 +309,8 @@ pub fn read_wkt_over_code(text: &str, code: u32) -> Option<Result<(Crs, Option<S
 ///
 /// A definition that gives no shift counts as a shift of zero only on WGS 84 or GRS 1980
 /// ([`bundled_shift`]). On another ellipsoid it matches no shift the text gives, not even zero:
-/// proj4rs then changes no datum, where a shift of zero still changes the ellipsoid, which the
-/// note says.
+/// proj4rs then changes no datum, not even the ellipsoid, which any shift, zero too, would change.
+/// The note then says the ellipsoid beside the shift.
 pub(crate) fn set_aside_shift_note(text: &str, name: &str, def: &str, why: &str) -> Option<String> {
     let defs_shift = bundled_shift(def);
     let (another, zero) = match tree(text) {
@@ -322,14 +322,15 @@ pub(crate) fn set_aside_shift_note(text: &str, name: &str, def: &str, why: &str)
         Err(_) => (parse(text).is_ok_and(|n| has_bound_transformation(&n, 0)), false),
     };
     let codes_shift = defs_shift.is_some_and(|s| s.iter().any(|v| *v != 0.0));
-    another.then(|| {
-        if zero && !codes_shift {
-            format!(
-                "the file's shift of zero to WGS 84 is set aside, because {why}, and {name} is read on its own ellipsoid without it, so positions may be off by the difference between that ellipsoid and WGS 84's"
-            )
-        } else {
-            set_aside_wording(name, codes_shift, why)
-        }
+    let ellipsoid = "is read on its own ellipsoid without it, so positions may be off by";
+    another.then(|| match (defs_shift, zero) {
+        (None, true) => format!(
+            "the file's shift of zero to WGS 84 is set aside, because {why}, and {name} {ellipsoid} the difference between that ellipsoid and WGS 84's"
+        ),
+        (None, false) => format!(
+            "the file's own shift to WGS 84 is set aside, because {why}, and {name} {ellipsoid} as much as that shift and the difference between that ellipsoid and WGS 84's"
+        ),
+        _ => set_aside_wording(name, codes_shift, why),
     })
 }
 
