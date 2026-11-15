@@ -48065,6 +48065,63 @@ fn a_report_name_made_from_a_long_layer_name_says_what_it_keeps() {
     );
 }
 
+#[test]
+fn a_report_title_made_from_a_long_layer_name_says_what_it_keeps() {
+    let mut s = world();
+    let title_said = |s: &Session, mark: u64| {
+        s.notices_since(mark)
+            .iter()
+            .filter(|n| n.text.starts_with("New Report: the report's title"))
+            .map(|n| n.text.clone())
+            .collect::<Vec<_>>()
+    };
+    // An imported layer's name isn't held to the 200 characters Rename takes.
+    for (long, kept) in [(format!("{}x", "é".repeat(500)), "é".repeat(500)), ("é".repeat(500), "é".repeat(500))] {
+        crate::cmd::layer::add_dataset(&mut s, rustgis_data::Dataset::new(&long, rustgis_data::GeometryType::Point, Vec::new()));
+        let mark = s.notice_mark();
+        s.run("report.new", &json!({"layer": long})).unwrap();
+        assert_eq!(s.project.reports.last().unwrap().title, kept);
+        let expected = if long.chars().count() > 500 {
+            vec!["New Report: the report's title is the layer's name and keeps its first 500 characters".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(title_said(&s, mark), expected, "{} characters", long.chars().count());
+    }
+}
+
+#[test]
+fn an_imported_name_cut_to_fit_its_number_says_it_came_from_the_file() {
+    let mut s = world();
+    let cut = |s: &Session, mark: u64| {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("has that name already")).map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    let imports = [
+        ("report.open", json!({"layer": "Countries"}), "Import Report: a report"),
+        ("presentation.import", json!({}), "Import Presentation: a presentation"),
+        ("notebook.open", json!({"cells": []}), "Add and Open Notebook: a notebook"),
+    ];
+    for (command, item, said) in imports {
+        let import = |s: &mut Session, name: &str| {
+            let mut text = item.clone();
+            text["name"] = json!(name);
+            s.run(command, &json!({"text": text.to_string()})).unwrap()["name"].as_str().unwrap().to_string()
+        };
+        let long = "é".repeat(200);
+        import(&mut s, &long);
+        let mark = s.notice_mark();
+        assert_eq!(import(&mut s, &long), format!("{} 2", "é".repeat(198)), "{command}");
+        assert_eq!(
+            cut(&s, mark),
+            [format!("{said} has that name already, so the name from the file is cut to 198 characters to fit \" 2\"")]
+        );
+        import(&mut s, "Tour");
+        let mark = s.notice_mark();
+        assert_eq!(import(&mut s, "Tour"), "Tour 2", "{command}");
+        assert!(cut(&s, mark).is_empty(), "{command}: {:?}", cut(&s, mark));
+    }
+}
+
 /// Serves each file by its path (others are 404) with byte ranges (`bytes=a-b`, `bytes=-n`)
 /// answered 206, keeping each request's path and range (empty for a whole file).
 #[cfg(not(target_arch = "wasm32"))]

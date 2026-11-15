@@ -452,7 +452,9 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
         });
     }
     let mut r = Report { name, layer: layer.name.clone(), ..Report::default() };
-    r.title = title.unwrap_or_else(|| layer.name.clone());
+    // A title made from a long layer name keeps its first 500 characters, as a title given must.
+    let title_cut = title.is_none() && layer.name.chars().count() > 500;
+    r.title = title.unwrap_or_else(|| layer.name.chars().take(500).collect());
     let ds = &layer.dataset;
     // A list given is refused past its limit (#1896), not cut.
     let fields_of = |key: &str, of: &str, limit: usize| -> Result<Vec<String>, String> {
@@ -502,6 +504,9 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some(cut) = cut {
         s.notify(cut, false);
+    }
+    if title_cut {
+        s.notify("New Report: the report's title is the layer's name and keeps its first 500 characters".to_string(), false);
     }
     Ok(json!({"report": i, "name": name}))
 }
