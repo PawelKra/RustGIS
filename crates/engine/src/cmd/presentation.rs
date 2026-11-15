@@ -28,7 +28,7 @@ pub fn commands() -> Vec<C> {
         C::new("presentation.new", "New Presentation", "Publish › Presentation", |s, p| {
             let given = super::within("name", "a presentation's name", ps(p, "name").unwrap_or("Presentation").trim(), 200)?;
             let title = page_title(ps(p, "title").unwrap_or(&s.project.name))?;
-            let (name, cut) = unique_name(s, "New Presentation", &given);
+            let (name, cut) = unique_name(s, "New Presentation", "the name given", &given);
             let mut pres = Presentation { name: name.clone(), ..Presentation::default() };
             // A title page to start from.
             pres.pages.push(Page {
@@ -53,7 +53,7 @@ pub fn commands() -> Vec<C> {
             let text = super::items::read_text(p)?;
             let mut pres: Presentation = serde_json::from_str(&text).map_err(|e| format!("not a RustGIS presentation: {e}"))?;
             let repairs = pres.clamp();
-            let (name, cut) = unique_name(s, "Import Presentation", &pres.name);
+            let (name, cut) = unique_name(s, "Import Presentation", "the name from the file", &pres.name);
             pres.name = name;
             let name = pres.name.clone();
             if s.project.presentations.len() >= crate::project::MAX_ITEMS {
@@ -240,11 +240,11 @@ fn page_of(input: &impl super::InputSource, p: &Value) -> Result<(usize, usize),
 
 /// A presentation's name told apart by a number (see [`super::numbered_saying`]), with the notice to
 /// give when the number cuts it.
-fn unique_name(s: &Session, command: &str, base: &str) -> (String, Option<String>) {
+fn unique_name(s: &Session, command: &str, whose: &str, base: &str) -> (String, Option<String>) {
     let base = base.trim();
     let base = if base.is_empty() { "Presentation" } else { base };
     let taken = |n: &str| s.project.presentations.iter().any(|r| r.name.eq_ignore_ascii_case(n));
-    super::numbered_saying(command, "a presentation", base, 200, taken)
+    super::numbered_saying(command, "a presentation", whose, base, 200, taken)
 }
 
 /// A page's title of at most [`MAX_TITLE`] characters. A longer one is refused, not cut.

@@ -123,7 +123,7 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("notebook.new", "New Notebook", "Analyze › Notebook", |s, p| {
             let given = super::within("name", "a notebook's name", ps(p, "name").unwrap_or("Notebook").trim(), 200)?;
-            let (name, cut) = unique_name(s, "New Notebook", &given);
+            let (name, cut) = unique_name(s, "New Notebook", "the name given", &given);
             let nb = Notebook {
                 name: name.clone(),
                 cells: vec![
@@ -149,7 +149,7 @@ pub fn commands() -> Vec<C> {
                 ps(p, "path").map(|x| Path::new(x).file_stem().map_or_else(|| x.to_string(), |n| n.to_string_lossy().into_owned()));
             let mut nb = parse(&text, fallback.as_deref().unwrap_or("Notebook"))?;
             let repairs = nb.clamp();
-            let (name, cut) = unique_name(s, "Add and Open Notebook", &nb.name);
+            let (name, cut) = unique_name(s, "Add and Open Notebook", "the name from the file", &nb.name);
             nb.name = name;
             // Trust left over from a removed or undone notebook of this name doesn't carry over.
             s.trusted_notebooks.remove(&nb.name.to_ascii_lowercase());
@@ -292,11 +292,11 @@ fn cell_of(s: &Session, p: &Value) -> Result<(usize, usize), String> {
 
 /// A notebook's name told apart by a number (see [`super::numbered_saying`]), with the notice to
 /// give when the number cuts it.
-fn unique_name(s: &Session, command: &str, base: &str) -> (String, Option<String>) {
+fn unique_name(s: &Session, command: &str, whose: &str, base: &str) -> (String, Option<String>) {
     let base = base.trim();
     let base = if base.is_empty() { "Notebook" } else { base };
     let taken = |n: &str| s.project.notebooks.iter().any(|r| r.name.eq_ignore_ascii_case(n));
-    super::numbered_saying(command, "a notebook", base, 200, taken)
+    super::numbered_saying(command, "a notebook", whose, base, 200, taken)
 }
 
 fn run(s: &mut Session, p: &Value) -> CmdResult {

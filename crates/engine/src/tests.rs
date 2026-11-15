@@ -48033,6 +48033,38 @@ fn names_cut_to_fit_their_number_are_said() {
     assert_eq!((s.project.name.clone(), said(&s, mark)), (at(200), 0));
 }
 
+#[test]
+fn a_report_name_made_from_a_long_layer_name_says_what_it_keeps() {
+    let mut s = world();
+    let at = |n: usize| "é".repeat(n);
+    let new_report = |s: &mut Session, layer: &str| {
+        let mark = s.notice_mark();
+        let name = s.run("report.new", &json!({"layer": layer})).unwrap()["name"].as_str().unwrap().to_string();
+        let said = s.notices_since(mark).iter().filter(|n| n.text.starts_with("New Report: ")).map(|n| n.text.clone()).collect::<Vec<_>>();
+        (name, said)
+    };
+    // "{layer} Report" is 207 characters, so the report's name keeps its first 200.
+    s.run("layer.rename", &json!({"layer": "Cities", "name": at(200)})).unwrap();
+    let (name, said) = new_report(&mut s, &at(200));
+    assert_eq!(name, at(200));
+    assert_eq!(said, ["New Report: the report's name is made from the layer's name and keeps its first 200 characters"]);
+    // A second one keeps fewer to fit its number, and one notice gives that count.
+    let (name, said) = new_report(&mut s, &at(200));
+    assert_eq!(name, format!("{} 2", at(198)));
+    assert_eq!(said, ["New Report: the report's name is made from the layer's name and keeps its first 198 characters before \" 2\""]);
+    // "{layer} Report" of exactly 200 characters is kept whole, without a word.
+    s.run("layer.rename", &json!({"layer": at(200), "name": at(193)})).unwrap();
+    let (name, said) = new_report(&mut s, &at(193));
+    assert_eq!((name, said), (format!("{} Report", at(193)), Vec::<String>::new()));
+    // Its number cuts it, and the notice doesn't call it a name given.
+    let (name, said) = new_report(&mut s, &at(193));
+    assert_eq!(name, format!("{} Repo 2", at(193)));
+    assert_eq!(
+        said,
+        ["New Report: a report has that name already, so the name made from the layer's name is cut to 198 characters to fit \" 2\""]
+    );
+}
+
 /// Serves each file by its path (others are 404) with byte ranges (`bytes=a-b`, `bytes=-n`)
 /// answered 206, keeping each request's path and range (empty for a whole file).
 #[cfg(not(target_arch = "wasm32"))]

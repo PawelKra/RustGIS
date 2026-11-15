@@ -226,13 +226,21 @@ pub(crate) fn numbered_within(base: &str, max: usize, taken: impl Fn(&str) -> bo
 /// [`numbered_within`] for an item's name, with the notice to give when the number that tells it
 /// apart cuts the name. It is the same notice `task.new` gives (#1888). `command` is the command's
 /// title, such as "New Report", and `item` is what has that name already, such as "a report".
-/// `base` is within `max` characters.
-pub(crate) fn numbered_saying(command: &str, item: &str, base: &str, max: usize, taken: impl Fn(&str) -> bool) -> (String, Option<String>) {
+/// `whose` says where the name came from: "the name given", or another phrase for a name the
+/// command made or read from a file. `base` is within `max` characters.
+pub(crate) fn numbered_saying(
+    command: &str,
+    item: &str,
+    whose: &str,
+    base: &str,
+    max: usize,
+    taken: impl Fn(&str) -> bool,
+) -> (String, Option<String>) {
     let name = numbered_within(base, max, taken);
     // The number cut the name when less of `base` is left before it than was given.
     let cut = match name.rsplit_once(' ') {
         Some((kept, number)) if name != base && kept.chars().count() < base.chars().count() => Some(format!(
-            "{command}: {item} has that name already, so the name given is cut to {} characters to fit \" {number}\"",
+            "{command}: {item} has that name already, so {whose} is cut to {} characters to fit \" {number}\"",
             kept.chars().count()
         )),
         _ => None,

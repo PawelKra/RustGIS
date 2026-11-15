@@ -407,16 +407,15 @@ fn join_key(ds: &rustgis_data::Dataset, row: usize, fi: Option<usize>) -> String
 }
 
 /// A report's name told apart by a number (see [`super::numbered_saying`]), with the notice to
-/// give when the number cuts it.
-fn unique_name(s: &Session, command: &str, base: &str, skip: Option<usize>) -> (String, Option<String>) {
+/// give when the number cuts it. `whose` says where the name came from, as that notice puts it.
+fn unique_name(s: &Session, command: &str, whose: &str, base: &str, skip: Option<usize>) -> (String, Option<String>) {
     // A name given was already checked by the command. A file's name was held to 200 characters
     // when the report was read, and that is said then. A name made from a layer's name
-    // ("{layer} Report") may be longer and keeps its first 200 characters. Nothing is said for it,
-    // because no name was given and the layer's own name is kept whole in the report.
+    // ("{layer} Report") may be longer and keeps its first 200 characters; `new_report` says so.
     let base: String = base.trim().chars().take(200).collect();
     let base = if base.is_empty() { "Report".to_string() } else { base };
     let taken = |n: &str| s.project.reports.iter().enumerate().any(|(j, r)| Some(j) != skip && r.name.eq_ignore_ascii_case(n));
-    super::numbered_saying(command, "a report", &base, 200, taken)
+    super::numbered_saying(command, "a report", whose, &base, 200, taken)
 }
 
 /// Page size from `page`/`orientation`/`width`/`height`, portrait by default.
@@ -438,7 +437,20 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     if layer.is_raster() {
         return Err("reports list a feature layer's records, not a raster's".into());
     }
-    let (name, cut) = unique_name(s, "New Report", &given.unwrap_or_else(|| format!("{} Report", layer.name)), None);
+    let made = format!("{} Report", layer.name);
+    let whose = if given.is_some() { "the name given" } else { "the name made from the layer's name" };
+    let (name, mut cut) = unique_name(s, "New Report", whose, given.as_deref().unwrap_or(&made), None);
+    // A name made from a long layer name keeps its first 200 characters. One notice says how many
+    // are kept, with the number when one follows, so two notices don't give two different counts.
+    if given.is_none() && made.trim().chars().count() > 200 {
+        cut = Some(match name.rsplit_once(' ').filter(|_| cut.is_some()) {
+            Some((kept, number)) => format!(
+                "New Report: the report's name is made from the layer's name and keeps its first {} characters before \" {number}\"",
+                kept.chars().count()
+            ),
+            None => "New Report: the report's name is made from the layer's name and keeps its first 200 characters".to_string(),
+        });
+    }
     let mut r = Report { name, layer: layer.name.clone(), ..Report::default() };
     r.title = title.unwrap_or_else(|| layer.name.clone());
     let ds = &layer.dataset;
@@ -539,7 +551,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     };
     let mut cut = None;
     if let Some(n) = new_name {
-        (r.name, cut) = unique_name(s, "Report Properties", &n, Some(i));
+        (r.name, cut) = unique_name(s, "Report Properties", "the name given", &n, Some(i));
         renamed = Some(r.name.clone());
     }
     if let Some(t) = new_title {
@@ -641,7 +653,7 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     import_layer(s, p, &mut r)?;
     // Drop what the layer lacks, so the report still draws.
     let fitted = find_layer(s, &r.layer).map(|l| fit_to_layer(&mut r, &l.dataset)).unwrap_or_default();
-    let (name, cut) = unique_name(s, "Import Report", &r.name, None);
+    let (name, cut) = unique_name(s, "Import Report", "the name from the file", &r.name, None);
     r.name = name;
     let name = r.name.clone();
     if s.project.reports.len() >= crate::project::MAX_ITEMS {
