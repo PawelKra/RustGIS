@@ -6786,7 +6786,14 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                 (ClassMethod::Manual, Some(b)) => Renderer::graduated_manual(&l.dataset, &rows()?, &field, &b, ramp, base)?,
                 // Manual with nothing to keep starts from the view's classes, open at both ends.
                 (ClassMethod::Manual, None) if l.is_streamed() => {
-                    let r = Renderer::graduated(&l.dataset, &rows()?, &field, classes, method, ramp, base)?;
+                    let r = Renderer::graduated(&l.dataset, &rows()?, &field, classes, method, ramp, base).map_err(|e| {
+                        // The file has values; the view read so far holds none.
+                        if e == format!("'{field}' has no numeric values") {
+                            format!("'{field}' has no values in the view read so far: give manual breaks, or read a view where it has some")
+                        } else {
+                            e
+                        }
+                    })?;
                     r.opened().unwrap_or(r)
                 }
                 _ => Renderer::graduated(&l.dataset, &rows()?, &field, classes, method, ramp, base)?,
