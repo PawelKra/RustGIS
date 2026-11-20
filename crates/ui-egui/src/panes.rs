@@ -5444,7 +5444,13 @@ fn manual_breaks(app: &mut RustGisApp, ui: &mut Ui, field: &str, breaks: &[f64],
     let typed = b.len().saturating_sub(usize::from(open_top));
     let lowest = if min <= OPEN_BELOW { b.first().copied().unwrap_or(0.0) } else { min };
     let highest = typed.checked_sub(1).and_then(|i| b.get(i)).copied().unwrap_or(lowest);
-    let speed = ((highest - lowest).abs() / 200.0).max(1e-9);
+    // With one bound left there is no span to drag over: its own size sets the pace.
+    let span = match (highest > lowest, lowest == 0.0) {
+        (true, _) => highest - lowest,
+        (false, false) => lowest.abs(),
+        (false, true) => 1.0,
+    };
+    let speed = (span / 200.0).max(1e-9);
     let mut apply = false;
     let mut remove = None;
     let (layer, last) = (app.session.active_layer, b.len().saturating_sub(1));

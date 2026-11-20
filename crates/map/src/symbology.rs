@@ -1299,6 +1299,10 @@ impl Renderer {
     /// they depend on where the map was when they were read.
     pub fn graduated_manual_open(ds: &Dataset, field: &str, breaks: &[f64], ramp: Ramp, base: Symbol) -> Result<Renderer, String> {
         let fi = numeric_field(ds, field)?;
+        // The lowest number is how the first class says it is open, so it can't be a bound too.
+        if breaks.contains(&OPEN_BELOW) {
+            return Err(format!("manual breaks must be above {OPEN_BELOW:e}"));
+        }
         // The layer's current bounds come with their open class: it is taken out and added back once.
         // The open class alone is one class of every value.
         let breaks = if !breaks.is_empty() && breaks.iter().all(|v| *v >= OPEN_ABOVE) {
@@ -1313,8 +1317,8 @@ impl Renderer {
     /// them: the open class takes the place of the bound that closed them, so every feature keeps
     /// its class. `None` for other renderers and for classes already open.
     pub fn opened(&self) -> Option<Renderer> {
-        let Renderer::Graduated { breaks, .. } = self else { return None };
-        if breaks.last().is_none_or(|v| *v >= OPEN_ABOVE) {
+        let Renderer::Graduated { breaks, min, .. } = self else { return None };
+        if *min <= OPEN_BELOW && breaks.last().is_none_or(|v| *v >= OPEN_ABOVE) {
             return None;
         }
         let mut open = self.clone();
@@ -4480,8 +4484,8 @@ mod tests {
         assert_eq!(b, [4.0, 25.0, OPEN_ABOVE]);
         // The layer's current bounds given back make the same classes, not a second open one.
         assert_eq!(breaks(open(&b).unwrap()), b);
-        // The lowest number is a bound like any other.
-        assert_eq!(breaks(open(&[0.0, f64::MIN]).unwrap()), [f64::MIN, 0.0, OPEN_ABOVE]);
+        // The lowest number marks the open first class, so as a bound it is refused, not dropped.
+        assert_eq!(open(&[0.0, f64::MIN]).unwrap_err(), "manual breaks must be above -1.7976931348623157e308");
         // The open class alone stays one class of every value.
         let one = open(&[OPEN_ABOVE]).unwrap();
         assert_eq!(labels_of(&one), ["every value"]);
@@ -4516,6 +4520,27 @@ mod tests {
         // No values is still refused.
         assert_eq!(manual(&heights(&[None]), &[4.0]).unwrap_err(), "'height' has no numeric values");
         assert_eq!(manual(&heights(&[]), &[4.0]).unwrap_err(), "'height' has no numeric values");
+    }
+
+    #[test]
+    fn classes_open_at_one_end_are_opened_at_both() {
+        let base = Symbol::default_for(GeometryType::Polygon, 0);
+        let d = heights(&[Some(1.0), Some(30.0)]);
+        let ends = |r: &Renderer| match r {
+            Renderer::Graduated { breaks, min, .. } => (breaks.clone(), *min),
+            r => panic!("{r:?}"),
+        };
+        // Closed at the largest value, or open only at the top: both come out open at both ends,
+        // the closing bound replaced, a bound past the largest kept.
+        let closed = Renderer::graduated_manual(&d, &[], "height", &[4.0], Ramp::Ember, base).unwrap();
+        assert_eq!(ends(&closed.opened().unwrap()), (vec![4.0, OPEN_ABOVE], OPEN_BELOW));
+        let top_only = Renderer::graduated_manual(&d, &[], "height", &[4.0, OPEN_ABOVE], Ramp::Ember, base).unwrap();
+        assert_eq!(ends(&top_only), (vec![4.0, OPEN_ABOVE], 1.0));
+        assert_eq!(ends(&top_only.opened().unwrap()), (vec![4.0, OPEN_ABOVE], OPEN_BELOW));
+        // Already open at both ends, or not Graduated Colors: nothing to open.
+        let open = Renderer::graduated_manual_open(&d, "height", &[4.0], Ramp::Ember, base).unwrap();
+        assert!(open.opened().is_none());
+        assert!(Renderer::Single(base).opened().is_none());
     }
 
     #[test]
