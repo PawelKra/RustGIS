@@ -5496,7 +5496,7 @@ fn manual_breaks(app: &mut RustGisApp, ui: &mut Ui, field: &str, breaks: &[f64],
         && let Some((i, lo, hi)) = widest
         && ui.button(tl!("Split the widest class")).clicked()
     {
-        b.insert(i, (lo + hi) / 2.0);
+        b.insert(i, lo.midpoint(hi));
         apply = true;
     }
     if apply
